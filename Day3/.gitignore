@@ -1,0 +1,56 @@
+# Terraform working directory
+.terraform/
+
+# Terraform state files may contain secrets and environment-specific values
+*.tfstate
+*.tfstate.*
+
+# Terraform crash logs
+crash.log
+crash.*.log
+
+# Terraform variable files often contain local or secret values
+*.tfvars
+*.tfvars.json
+
+# Local Terraform overrides
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI config
+.terraformrc
+terraform.rc
+
+# Environment and credential files
+.env
+.env.*
+*.pem
+*.key
+*.crt
+kubeconfig
+*.kubeconfig
+
+# Logs
+*.log
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Ignore Markdown documentation except the repository README
+/**/*.md
+!README.md
+!AGENTS.md
+
+# Distribute only the built wscmon executable
+tools/wscmon.ps1
+tools/wscmon/*
+!tools/wscmon/bin/
+tools/wscmon/bin/*
+!tools/wscmon/bin/wscmon.exe

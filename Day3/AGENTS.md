@@ -1,0 +1,208 @@
+# AGENTS.md
+
+## 역할
+
+이 저장소는 AWS/EKS 기반 API, Terraform, WAF, ALB/CloudFront 및 부하 테스트 도구를 관리한다.
+모든 변경은 재현 가능하고 대회 당일 재사용 가능해야 한다.
+
+- 사용자를 반드시 `주인님`이라고 부른다.
+- 답변은 한국어로 간결하게 작성한다.
+- 작업 전 관련 파일과 현재 Kubernetes/Terraform 상태를 확인한다.
+- 추측으로 AWS 리소스를 변경하지 말고, 변경 전후 상태를 확인한다.
+- 기능/API/DB 구조를 임의로 변경하지 않는다.
+- CloudFront Function 등 요청 변조 우회는 사용하지 않는다.
+
+## 2026 전국기능경기대회 제3과제 기준
+
+이 저장소는 클라우드컴퓨팅 직종 제3과제 `System operation`(경기시간 3시간)을 수행한다.
+목표는 제공된 애플리케이션을 EKS에 배포하고, 서비스 수준을 만족하면서 장애를 빠르게 감지·대응하며, 가능한 최소 비용과 최소 리소스로 운영하는 것이다.
+
+### 고정 제약
+
+- 기본 리전은 별도 지시가 없으면 `ap-northeast-2`, 모든 시간은 KST(UTC+9)를 사용한다.
+- 필수 스택은 VPC, EKS, EC2, ECR, RDS, S3이며 애플리케이션은 Golang/Gin 기반이다.
+- ELB, API Gateway, CloudFront, Route 53, CloudWatch, WAF, Docker를 사용할 수 있다.
+- 컨테이너 오케스트레이션은 EKS만 사용하며 ECS는 사용할 수 없다.
+- 컴퓨팅은 EC2만 사용한다. Fargate와 Lambda는 어떠한 목적으로도 사용하지 않는다.
+- 배포 전 과제지에서 허용한 트래픽 처리용 EC2 인스턴스 타입을 확인한다. 현재 과제지 기준은 `t3.medium`이지만 당일 `c5.large` 등으로 변경될 수 있다.
+- 인스턴스 타입은 코드나 스크립트에 고정하지 않고 `terraform.tfvars`의 `eks_node_instance_type`을 단일 기준으로 사용한다. Managed NodeGroup과 Karpenter NodePool 모두 같은 값을 전달받아야 한다.
+- 저장소 기본값은 `t3.medium`이며, 현재 리허설용 `terraform.tfvars` 값은 `c5.large`다. 당일 과제지와 `terraform.tfvars`가 다르면 적용 전에 `terraform.tfvars`를 수정하고 `terraform plan`으로 교체 범위와 노드 타입을 확인한다.
+- 지정된 인스턴스 타입, CPU, 메모리, 대수를 준수하며 미사용 리소스도 감점 대상이므로 불필요한 EC2, VPC, 타 리전 리소스를 만들지 않는다.
+- 계정에는 비용 제한이 있으므로 리소스 수와 비용을 변경 전후에 확인한다.
+- 경기 종료 시 모든 부하 테스트를 종료한다.
+
+### 데이터베이스 고정 조건
+
+- DB identifier: `apdev-rds-instance`
+- 엔진: MySQL Community 8.0
+- 클래스: `db.t3.micro`
+- 배포: Multi-AZ DB instance
+- 스토리지: General Purpose SSD `gp3`
+- DB 인스턴스는 최소 대수로 운영한다.
+- 논리 DB 이름은 `dev`이며 user/product 애플리케이션 모두 읽기·쓰기가 가능해야 한다.
+- `load_user.dump`를 적재하고, 적재된 데이터는 임의로 수정하거나 삭제하지 않는다.
+- 트래픽 외 임의 데이터를 삽입하지 않는다.
+- 테이블 재설계나 인덱스 변경은 실제 트래픽과 측정 근거가 있을 때만 수행하며 API 호환성을 깨지 않는다.
+- 기본 테이블 구조는 다음과 같다.
+
+```sql
+CREATE TABLE user (
+    id VARCHAR(255) NOT NULL,
+    username VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_username (username)
+);
+
+CREATE TABLE product (
+    id VARCHAR(255) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    price FLOAT(8) NOT NULL,
+    image_path VARCHAR(500) DEFAULT NULL,
+    PRIMARY KEY (id)
+);
+```
+
+### 애플리케이션 고정 조건
+
+- 제공 애플리케이션은 `user`, `product`, `stress` 3개다.
+- 제공 binary는 Go 1.22.2, linux/amd64, Amazon Linux 2023 환경이며 TCP/8080에 바인딩된다.
+- access log는 stdout/stderr로 출력된다.
+- 정상 Request/Response를 변조하지 않는다. 채점 응답시간과 상태 코드는 클라이언트 도착 기준이다.
+- 정상 요청에는 과제 형식에 맞는 `requestid`, `uuid`가 포함된다.
+- user/product DB 환경변수 `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DBNAME`은 모두 필수다.
+- `MYSQL_HOST`에는 읽기·쓰기가 가능한 IP 또는 DNS만 넣고 엔진명을 포함하지 않는다.
+
+### 서비스 수준 목표
+
+| 대상 | 최소 가용성 | 서비스 수준 목표 |
+|---|---:|---:|
+| user API | 5초 이하 | 0.2초 이하 |
+| product API | 5초 이하 | 0.2초 이하 |
+| stress API | 5초 이하 | 1초 이하 |
+| 이미지 다운로드 | 5초 이하 | 5초 이하 |
+
+- 응답시간, timeout, 5xx, Pod/노드 수, 비용을 함께 측정한다.
+- 노드 증설로 얻는 처리 점수와 추가 리소스 감점을 함께 계산하고, 처리량만을 위해 과도하게 확장하지 않는다.
+- 경기 시작 1시간 뒤부터 정상 트래픽, product 이미지 업로드, 이미지 다운로드 트래픽이 발생한다.
+
+### 엔드포인트와 트래픽 판정
+
+- 채점 플랫폼에는 프로토콜을 포함한 단일 엔드포인트만 입력하고 경로는 입력하지 않는다.
+- 정상 형식은 `https://example.org`, 잘못된 형식은 `example.org` 또는 `https://example.org/v1/`이다.
+- 제공된 실제 API 경로에 대한 악성 요청, 잘못된 메서드와 잘못된 형식은 `403`으로 차단한다.
+- 제공하지 않는 경로는 요청 내용이 비정상이더라도 항상 `404`를 반환한다.
+- 정상 요청과 응답을 프록시 계층에서 변조하여 성능이나 판정을 우회하지 않는다.
+
+### S3 이미지 제공
+
+- product 애플리케이션이 배포 리전의 S3 버킷에 이미지를 업로드할 수 있어야 한다.
+- S3 객체는 애플리케이션과 같은 외부 엔드포인트의 `/images/<object path>`로 다운로드할 수 있어야 한다.
+- 예: S3 객체 `/product50001.jpg`는 `<endpoint>/images/product50001.jpg`로 제공한다.
+- 이미지 업로드 후 반환된 실제 객체 경로를 사용해 다운로드 200과 5초 SLO를 검증한다.
+
+## API 및 HTTP 정책
+
+외부 경로는 `scripts/bastion_setup.sh`의 Ingress 설정을 기준으로 한다.
+
+| 메서드 | 경로 | 백엔드 | 정상 응답 |
+|---|---|---|---|
+| GET | `/healthcheck` | user | 200 |
+| GET | `/v1/user` | user | 200 |
+| GET | `/v1/product` | product | 200 |
+| POST | `/v1/product` | product | 정상 생성 응답 |
+| PUT | `/v1/product` | product | multipart 이미지 업로드 |
+| POST | `/v1/stress` | stress | 201 |
+| GET | `/images/*` | product/S3 | 이미지 200 |
+
+- 존재하지 않는 경로는 항상 `404`다.
+- 존재하는 API 경로의 잘못된 메서드, 형식 오류, 악성 요청은 WAF에서 `403`으로 차단한다.
+- `/v1/user`, `/v1/product`, `/v1/stress` 외 `/v1/*` 경로는 존재하지 않는 경로다.
+- PUT Product는 JSON이 아니라 `multipart/form-data`를 사용한다.
+- Product PUT의 필수 multipart 필드는 `requestid`, `uuid`, `id`, `image`다.
+- 이미지 다운로드는 PUT 응답의 `image_path`를 사용한다.
+
+## 주요 리소스
+
+- Terraform: `main.tf`, `modules/`
+- 애플리케이션/Ingress: `scripts/bastion_setup.sh`
+- 부하 도구: `tools/tune/`, `tools/tune.ps1`
+- 복구 도구: `tools/stabilize.ps1`
+- API/WAF 점검: `tools/check.ps1`
+- WAF 탐지/복구: `tools/detect-waf-vulnerabilities.ps1`, `tools/waf-rollback.ps1`
+
+## 운영 명령
+
+```powershell
+# Terraform 검증
+terraform validate
+terraform plan -var-file=terraform.tfvars
+
+# 부하 후 기본 상태 복구: 모든 앱 Pod 1개, HPA min/max 1
+.\tools\stabilize.ps1
+
+# 부하 후 안정화 대기 시간 변경
+.\tools\stabilize.ps1 -WaitSeconds 180
+
+# API/WAF 점검은 복구 스크립트와 분리해서 실행
+.\tools\check.ps1 -Api
+```
+
+`tools/stabilize.ps1`은 API 요청을 보내지 않는다. 부하로 늘어난 `user`, `product`, `stress` Deployment를 각각 1개 Pod로 줄이고 HPA를 `minReplicas=1`, `maxReplicas=1`로 고정한다. HPA가 다시 확장되는 것을 막기 위해 이 동작을 유지한다.
+
+## 성능 운영 원칙
+
+- 평상시에는 각 애플리케이션 Pod 1개로 유지한다.
+- 부하 중에는 Stress가 User/Product와 CPU를 공유하므로 5xx, timeout, P95를 함께 관찰한다.
+- 성능 채점 전에는 필요한 경우 User/Product 2개, Stress 3~4개를 pre-warm한다.
+- 반응형 HPA만 믿지 않는다. 노드와 Pod 확장 지연으로 초기 timeout이 발생할 수 있다.
+- Stress 전용 NodePool은 기본 설정으로 만들지 않는다. 비용/인스턴스 비율을 먼저 고려한다.
+- WAF rate limit은 사용하지 않는다.
+- 성능 변경 후 비용 영향과 Terraform 재생성 여부를 함께 확인한다.
+
+## WAF 원칙
+
+- AWS Managed Rules를 우선 사용하고 커스텀 규칙은 보완용으로만 추가한다.
+- 정상 User/Product 요청과 Product multipart PUT을 차단하지 않는다.
+- multipart PUT에 JSON Body 검사를 적용해 정상 이미지를 차단하지 않는다.
+- WAF 로그에는 요청 Body가 직접 포함되지 않으므로 CloudWatch Logs Insights와 점검 스크립트로 판단한다.
+- WAF 변경 후 정상 API는 200/201, 악성·비정상 실제 API는 403, unknown path는 404인지 확인한다.
+
+## 변경 및 검증 규칙
+
+- PowerShell 스크립트는 `tools/`에 둔다.
+- 기존 스크립트의 목적을 바꾸기 전에 호출 위치와 사용법을 확인한다.
+- 스크립트 변경 후 문법 검사와 dry-run 가능한 검증을 수행한다.
+- Terraform 변경 후 반드시 `terraform validate`를 실행한다.
+- Kubernetes 변경 후 rollout, Pod Ready, HPA 상태를 확인한다.
+- 운영 리소스 삭제/축소 전 현재 부하가 종료됐는지 확인한다.
+- 결과 파일과 부하 테스트 산출물은 임시 경로에 저장하며 저장소에 커밋하지 않는다.
+
+---
+
+## Git 워크플로 규칙
+
+- **`tools/tune.ps1` 등 스크립트에 변경점이 생기면 그 작업이 끝날 때마다 즉시 커밋 + push** 한다 (대회 중 재현성 보장).
+- commit message는 주인이 한눈에 이해하도록 한국어로 핵심 변경/이유를 요약한다.
+- 작업 기록은 이 파일(AGENTS.md)에 로그로 남긴다.
+
+## 최근 작업 로그
+
+| 날짜 | 커밋 | 변경 요약 |
+| 2026-08-18 | pending | `bastion_setup.sh`/EKS Launch Template에 38점 기준 반영 — CNI prefix+warm prefix, MNG/Karpenter maxPods=110, user/product 70m·256Mi, stress 600m·2CPU·dedicated NodePool, HPA 33/29/55 및 20/20/6 |
+| 2026-08-18 | pending | `tools/apply-38point.ps1` 추가 — CNI prefix delegation, maxPods=110, user/product/stress 38점 리소스/HPA, stress dedicated NodePool/taint/selector를 재현하고 MNG Launch Template 갱신은 명시적 opt-in |
+| 2026-08-18 | pending | tune BASE 분기 종료 시 GRADING_READY finalize 추가 — stress 전용 NodePool/selector 제거, shared placement, min replica warm(2/2/1), HPA max 유지, Karpenter 노드 예산 대기 |
+| 2026-08-18 | pending | CNI precondition의 잘못된 속성명(`Enabled/MaxPods`)을 `PrefixDelegation/WarmPrefixTarget`으로 수정하고 unavailable/false를 구분 — live `true/1` 검증 |
+| 2026-08-18 | e6950ac | `tools/tune.ps1` 기본 경로를 BASE-first로 고정하고 `-LegacyAdaptive`를 opt-in으로 제한, BASE(600m stress/isolated) → ONE DELTA → BEST verification 흐름 추가, main 오류에 line/position/stack trace 추가, self-test 11/11 통과 |
+| 2026-08-18 | `e2df10a` | **progressive warm min**: Balanced/CalculatedFinal 측정에 직전 측정 기반 warm min 반영 — cold-start(stress min=1)이 stress SLO를 0%로 붕괴시키는 것을 실측으로 규명(노드당 stress ≈2.2~3.6rps, same-node pod 무증가, 8 warm pods/4노드=61.5% vs cold start=2.6%) → Competition 25/36 달성 (기존 21.5/36) |
+| 2026-08-18 | `fb90289` | 최종 보고/저장 오류 시 적용 상태 유지(Save-Results/보고/요약 비파탈) + FINAL_WARM_NODE_BUDGET warning-only |
+| 2026-08-18 | `4d5d621` | pipeline integrity: Build-HpaBudgetModel placementDomain source-of-truth(dedicated domain 생성, .Cpu null 크래시 제거), Apply-StressPlacement NodePool stdin 파이프 수정, No-Scale fill fallback |
+| 2026-08-18 | `48b566e` | 측정 시작 상태=채점 시작 상태: 세션 시작 시 stress isolation artifact를 SHARED로 복귀 + Prepare-Test에서 k6 시작 전 min까지 warm prewarm |
+| 2026-08-18 | `594ac78` | CPU limit 제거 JSON patch가 limit 부재 시 server-rejected로 롤백 전체가 깨지는 문제 no-op 처리 |
+| 2026-08-18 | `abd2bfc` | self-test harness 동기화(stress cp=165m, Restore/Save 로드, ControlPointStateFile 초기화) |
+| 2026-08-18 | `5356ba5` | **`tools/tune.ps1` P0 안정화 패치**: ① stress CPU limit `request*2` cap 제거, ② user/product CPU limit optional ($null) 설정 및 OP remove json patch, ③ `Get-IdleCapacity` 내 CPU/MEM typo 수정 및 shared/dedicated topology fit 정확화, ④ CostWindowSeconds 기반으로 `CostNodeSeconds` clamp 적분 및 `AverageTotalNodes` score source 통일, ⑤ apply 전후 fingerprint gate 추가 및 런타임에 따른 재측정/롤백, ⑥ `BaselineMinVector` snapshot 기반 No-Scale min fill 위반(Node 증가, Pending, Unschedulable) 시 rollback 로직 구축 |
+| 2026-08-16 | `179ce1d` | HPA min optimizer crash fix: min=1 필수 floor가 min budget 초과 시 budget 확대(`HPA_MIN_BASELINE_BUDGET_INFEASIBLE` throw 제거), SPLIT 신호에 stress 자체 성능 추가(stress SLO<65% 또는 LOAD_GENERATOR_LIMIT+generated<80%면 SPLIT — foreground 무관) |
+| 2026-08-16 | `tune.sh-bash` | **tools/tune.sh를 bash 순수 이식본으로 교체 (pwsh 불필요)** — Amazon Linux 2023 Bastion 전용: 공통 경계 score(50/70/82.5/90/95→1.0/1.5/3.0/3.5/4.0) + 평균 EC2 cost tier, 3단계 측정(Minimum/Balanced/CalculatedFinal, k6-load.js 재사용), placement domain min/max budget optimizer(warm min 우선), best profile 선택+verification 없이 적용, 측정 준비/최종에서 Karpenter drain 없음 + max 축소 없음(P0 반영), 20분 deadline 관리, node polling 기반 avg nodes cost score |
+| 2026-08-17 | `hpa-model` | **HPA/PodDensity/Resource/Cost 모델 재설계 (38점 known-good reference를 empirical prior로)**: ① HPA Control Point 모델 — `T_abs=request×target/100` 보존/학습 (user 23.1m, product 20.3m, stress 330m prior; MEASURED_STABLE/SLO_RECOVERY 학습), request 변경 시 `target=100×cp/request` 재계산, bounds 15..90 clamp ② HardSafetyMax 앱별(20/20/12) — max는 capacity ceiling, node budget 무관 ③ Pod Density/VPC CNI 리포트 (maxPods/prefix delegation/slots/POD_SLOT_LIMIT) ④ user/product ELASTIC_DENSITY_REQUEST(70m prior) + CPU limit 제거 candidate, stress GUARANTEED+2CPU burst ⑤ FINAL CONFIG reference-vs-calculated 비교 표(실측 근거 필수) ⑥ self-tests 15건 (control point 공식, max 7/4/12 유지, warm fill 40% 초과 허용, placement rebuild, bounds) 전부 PASS |
+| 2026-08-17 | `hpa-max-invariant` | **HPA MAX HARD INVARIANT 적용**: ① finalMax에서 budget bin-pack 제거 — `finalMax=min(MaxAutoReplicas, capacityMax)` (budgetedMax는 no-scale diagnostic만), ② `MinCpuBudgetUtilization 0.40→0.80` — No-Scale Min Fill이 실제 노드 capacity까지 (40% hard ceiling 제거), ③ SHARED 결정 시 빈 dedicated domain 제거(Build-HpaBudgetModel 재계산), ④ POD_STARTUP_DELAY 관측 앱은 LIMIT_SCALE_UP 금지, ⑤ final warm node > OperatingNodeBudget → throw. self-test: capacityMax 7/4/12 유지 + min 5/1/2(공유/격리) 유지 + dedicated 제거 검증 |
+| 2026-08-16 | `ac9e060` | tune.ps1 대규모 개선 — HPA Node Budget Optimizer(CPU+Memory), Baseline/Warm min optimizer(dynamic minReplicas) + Node Cost Guard, Stress SPLIT persist + ISOLATED_DENSE/SPREAD(density-aware limit) + burst limit, 실측 기반 request right-sizing(Q75×adaptive headroom) + throttling+SLO 기반 limit tuning, REDUCE_CPU_LIMIT 안전 하한, HPA_CEILING 강화, RollingUpdate maxUnavailable=0, 평가 성적표 레이어, WAF(user POST 허용 복구 + JSON body SQLi 차단), aws-node/kube-proxy toleration 복구, wscmon 프로브 60s 제한, Calibration fallback 분리, Invoke-Kubectl 반환 버그 수정 |
