@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: unicorn
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         1
+        Log_Level     info
+        Parsers_File  parsers.conf
+
+    [INPUT]
+        Name              tail
+        Path              /var/log/containers/unicorn-book-app-deploy-*.log
+        Parser            cri
+        Tag               book.*
+        Refresh_Interval  5
+
+    [FILTER]
+        Name    grep
+        Match   book.*
+        Exclude log /health
+
+    [FILTER]
+        Name    grep
+        Match   book.*
+        Regex   log access
+
+    [FILTER]
+        Name    parser
+        Match   book.*
+        Key_Name log
+        Parser  book_app
+        Reserve_Data Off
+
+    [FILTER]
+        Name    lua
+        Match   book.*
+        script  /fluent-bit/etc/transform.lua
+        call    transform
+
+    [OUTPUT]
+        Name              cloudwatch_logs
+        Match             book.*
+        region            ap-northeast-2
+        log_group_name    /unicorn/eks/book-app
+        log_stream_prefix fluent-bit-
+        auto_create_group false
+        log_key           message
+
+  parsers.conf: |
+    [PARSER]
+        Name        cri
+        Format      regex
+        Regex       ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<log>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+
+    [PARSER]
+        Name        book_app
+        Format      regex
+        Regex       ^(?<timestamp>\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) access method=(?<method>\S+) path=(?<path>\S+) status=(?<status_code>\d+) duration=\S+ remote_addr=(?<client_ip>[^:]+):\d+ user_agent=.*$
+
+  transform.lua: |
+    function transform(tag, timestamp, record)
+      local ts = record["timestamp"]
+      if ts then
+        local y, m, d, H, M, S = ts:match("(%d+)/(%d+)/(%d+) (%d+):(%d+):(%d+)")
+        if y then
+          ts = string.format("%s-%s-%sT%s:%s:%sZ", y, m, d, H, M, S)
+        end
+      end
+      local sc = tonumber(record["status_code"]) or 0
+      local msg = string.format('{"timestamp":"%s","method":"%s","path":"%s","status_code":%d,"client_ip":"%s"}',
+        ts or "", record["method"] or "", record["path"] or "", sc, record["client_ip"] or "")
+      return 1, timestamp, {message=msg}
+    end
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: unicorn
+spec:
+  selector:
+    matchLabels:
+      name: fluent-bit
+  template:
+    metadata:
+      labels:
+        name: fluent-bit
+    spec:
+      serviceAccountName: unicorn-book-app-sa
+      containers:
+      - name: fluent-bit
+        image: public.ecr.aws/aws-observability/aws-for-fluent-bit:latest
+        volumeMounts:
+        - name: varlog
+          mountPath: /var/log
+        - name: config
+          mountPath: /fluent-bit/etc/
+      volumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: config
+        configMap:
+          name: fluent-bit-config

@@ -1,0 +1,79 @@
+# PLACEHOLDER 값 조회 명령어:
+# VPC_ID: aws ec2 describe-vpcs --filters Name=tag:Name,Values=unicorn-vpc --query "Vpcs[0].VpcId" --output text
+# SUBNET_A: aws ec2 describe-subnets --filters Name=tag:Name,Values=unicorn-subnet-priv-a --query "Subnets[0].SubnetId" --output text
+# SUBNET_B: aws ec2 describe-subnets --filters Name=tag:Name,Values=unicorn-subnet-priv-b --query "Subnets[0].SubnetId" --output text
+# SUBNET_C: aws ec2 describe-subnets --filters Name=tag:Name,Values=unicorn-subnet-priv-c --query "Subnets[0].SubnetId" --output text
+# PLATFORM_KEY_ARN: aws kms describe-key --key-id alias/unicorn-kms-platform --query "KeyMetadata.Arn" --output text
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: unicorn-eks-cluster
+  region: ap-northeast-2
+  version: "1.35"
+
+vpc:
+  id: VPC_ID
+  subnets:
+    private:
+      ap-northeast-2a: { id: SUBNET_A }
+      ap-northeast-2b: { id: SUBNET_B }
+      ap-northeast-2c: { id: SUBNET_C }
+  clusterEndpoints:
+    privateAccess: true
+    publicAccess: false
+
+accessConfig:
+  authenticationMode: API
+
+secretsEncryption:
+  keyARN: KEY_ARN
+
+cloudWatch:
+  clusterLogging:
+    enableTypes:
+      - api
+      - audit
+      - authenticator
+      - controllerManager
+      - scheduler
+
+managedNodeGroups:
+  - name: app-ng
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 3
+    privateNetworking: true
+    instanceName: unicorn-k8snode-app-node
+    labels:
+      unicorn: app
+    tags:
+      Name: unicorn-k8snode-app-node
+    volumeEncrypted: true
+    volumeSize: 20
+    preBootstrapCommands:
+      - "timedatectl set-timezone Asia/Seoul"
+
+  - name: addon-ng
+    instanceType: t3.medium
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 2
+    privateNetworking: true
+    instanceName: unicorn-k8snode-addon-node
+    labels:
+      unicorn: addon
+    tags:
+      Name: unicorn-k8snode-addon-node
+    volumeEncrypted: true
+    volumeSize: 20
+    preBootstrapCommands:
+      - "timedatectl set-timezone Asia/Seoul"
+
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: eks-pod-identity-agent
