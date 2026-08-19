@@ -1,0 +1,66 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: wskorea26-cluster
+  region: ap-northeast-2
+  version: "1.35"
+
+iam:
+  withOIDC: true
+
+vpc:
+  id: VPC_ID
+  subnets:
+    private:
+      ap-northeast-2c: { id: SUBNET_C }
+      ap-northeast-2d: { id: SUBNET_D }
+  clusterEndpoints:
+    privateAccess: true
+    publicAccess: true
+
+accessConfig:
+  authenticationMode: API
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+secretsEncryption:
+  keyARN: EKS_KEY_ARN
+
+managedNodeGroups:
+  - name: wskorea26-addon-ng
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 4
+    privateNetworking: true
+    instanceName: wskorea26-addon-node
+    labels:
+      node-type: addon
+    tags:
+      Name: wskorea26-addon-node
+    volumeSize: 20
+
+  - name: wskorea26-app-ng
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 4
+    privateNetworking: true
+    instanceName: wskorea26-app-node
+    labels:
+      node-type: app
+    taints:
+      - key: dedicated
+        value: app
+        effect: NoSchedule
+    tags:
+      Name: wskorea26-app-node
+    volumeSize: 20
+
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy

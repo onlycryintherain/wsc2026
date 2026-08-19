@@ -1,0 +1,143 @@
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb
+spec:
+  controller: ingress.k8s.aws/alb
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: book-ingress
+  namespace: wskorea26
+  annotations:
+    alb.ingress.kubernetes.io/group.name: wskorea26-book-ingress
+    alb.ingress.kubernetes.io/load-balancer-name: wskorea26-book-alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+    alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/tags: Name=wskorea26-book-alb,ManagedBy=aws-load-balancer-controller
+    alb.ingress.kubernetes.io/conditions.book-svc: |
+      [
+        {
+          "field": "http-header",
+          "httpHeaderConfig": {
+            "httpHeaderName": "X-Origin-Verify",
+            "values": ["wskorea26-cf"]
+          }
+        },
+        {
+          "field": "http-request-method",
+          "httpRequestMethodConfig": {
+            "values": ["POST"]
+          }
+        }
+      ]
+    alb.ingress.kubernetes.io/transforms.book-svc: |
+      [
+        {
+          "type": "url-rewrite",
+          "urlRewriteConfig": {
+            "rewrites": [
+              {
+                "regex": "^/book(.*)$",
+                "replace": "/v1/book$1"
+              }
+            ]
+          }
+        }
+      ]
+    alb.ingress.kubernetes.io/actions.book-get: |
+      {
+        "type": "forward",
+        "forwardConfig": {
+          "targetGroups": [
+            {
+              "targetGroupARN": "LAMBDA_TARGET_GROUP_ARN",
+              "weight": 1
+            }
+          ]
+        }
+      }
+    alb.ingress.kubernetes.io/conditions.book-get: |
+      [
+        {
+          "field": "http-header",
+          "httpHeaderConfig": {
+            "httpHeaderName": "X-Origin-Verify",
+            "values": ["wskorea26-cf"]
+          }
+        },
+        {
+          "field": "http-request-method",
+          "httpRequestMethodConfig": {
+            "values": ["GET"]
+          }
+        }
+      ]
+    alb.ingress.kubernetes.io/actions.default-403: |
+      {
+        "type": "fixed-response",
+        "fixedResponseConfig": {
+          "contentType": "text/plain",
+          "statusCode": "403",
+          "messageBody": "Forbidden"
+        }
+      }
+spec:
+  ingressClassName: alb
+  rules:
+  - http:
+      paths:
+      - path: /book
+        pathType: Prefix
+        backend:
+          service:
+            name: book-svc
+            port:
+              number: 80
+      - path: /book
+        pathType: Prefix
+        backend:
+          service:
+            name: book-get
+            port:
+              name: use-annotation
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: default-403
+            port:
+              name: use-annotation
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-ingress
+  namespace: monitoring
+  annotations:
+    alb.ingress.kubernetes.io/group.name: wskorea26-grafana-ingress
+    alb.ingress.kubernetes.io/load-balancer-name: wskorea26-grafana-alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /api/health
+    alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+    alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/tags: Name=wskorea26-grafana-alb,ManagedBy=aws-load-balancer-controller
+spec:
+  ingressClassName: alb
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: grafana
+            port:
+              number: 3000

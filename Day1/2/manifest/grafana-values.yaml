@@ -1,0 +1,80 @@
+adminUser: skills-${pin_number}-admin
+adminPassword: '\$korea26!!'
+service:
+  type: ClusterIP
+  port: 3000
+nodeSelector:
+  node-type: addon
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+    - name: wskorea26-prometheus
+      type: prometheus
+      url: http://prometheus-server.monitoring.svc:80
+      access: proxy
+      isDefault: true
+    - name: wskorea26-logs
+      type: cloudwatch
+      access: proxy
+      jsonData:
+        defaultRegion: ap-northeast-2
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+    - name: default
+      orgId: 1
+      folder: ''
+      type: file
+      disableDeletion: false
+      editable: true
+      options:
+        path: /var/lib/grafana/dashboards/default
+dashboards:
+  default:
+    wskorea26-monitoring:
+      json: |
+        {
+          "uid": "wskorea26",
+          "title": "wskorea26-monitoring",
+          "panels": [
+            {
+              "title": "Container CPU Usage",
+              "type": "timeseries",
+              "datasource": "wskorea26-prometheus",
+              "targets": [{"expr": "rate(container_cpu_usage_seconds_total{namespace=\"wskorea26\",container=\"book\"}[5m])"}],
+              "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+            },
+            {
+              "title": "Container Memory Usage",
+              "type": "timeseries",
+              "datasource": "wskorea26-prometheus",
+              "targets": [{"expr": "container_memory_working_set_bytes{namespace=\"wskorea26\",container=\"book\"}"}],
+              "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+            },
+            {
+              "title": "Running Pods",
+              "type": "stat",
+              "datasource": "wskorea26-prometheus",
+              "targets": [{"expr": "count(kube_pod_status_phase{namespace=\"wskorea26\",phase=\"Running\"})"}],
+              "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8}
+            },
+            {
+              "title": "Container Restart Count",
+              "type": "timeseries",
+              "datasource": "wskorea26-prometheus",
+              "targets": [{"expr": "kube_pod_container_status_restarts_total{namespace=\"wskorea26\",container=\"book\"}"}],
+              "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8}
+            },
+            {
+              "title": "Container Network Receive",
+              "type": "timeseries",
+              "datasource": "wskorea26-prometheus",
+              "targets": [{"expr": "rate(container_network_receive_bytes_total{namespace=\"wskorea26\"}[5m])"}],
+              "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8}
+            }
+          ],
+          "schemaVersion": 38,
+          "version": 1
+        }

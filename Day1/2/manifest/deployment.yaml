@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: book-deploy
+  namespace: wskorea26
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: book
+  template:
+    metadata:
+      labels:
+        app: book
+    spec:
+      serviceAccountName: book-sa
+      nodeSelector:
+        node-type: app
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: app
+        effect: NoSchedule
+      containers:
+      - name: book
+        image: ACCOUNT_ID.dkr.ecr.ap-northeast-2.amazonaws.com/wskorea26-book-repo:stable
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: AWS_REGION
+          value: "ap-northeast-2"
+        - name: TABLE_NAME
+          value: "wskorea26-data-table"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
