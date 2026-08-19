@@ -5,6 +5,9 @@
 *.tfstate
 *.tfstate.*
 
+# Ignore test output files
+test*
+
 # Ignore crash log files
 crash.log
 crash.*.log
