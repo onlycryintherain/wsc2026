@@ -43,35 +43,35 @@ dashboards:
               "title": "Container CPU Usage",
               "type": "timeseries",
               "datasource": "wskorea26-prometheus",
-              "targets": [{"expr": "rate(container_cpu_usage_seconds_total{namespace=\"wskorea26\",container=\"book\"}[5m])"}],
+              "targets": [{"expr": "rate(container_cpu_usage_seconds_total{namespace=\"wskorea26\",container=\"book\",pod!=\"\"}[5m]) and on(namespace,pod) kube_pod_container_info{namespace=\"wskorea26\",container=\"book\"}"}],
               "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
             },
             {
               "title": "Container Memory Usage",
               "type": "timeseries",
               "datasource": "wskorea26-prometheus",
-              "targets": [{"expr": "container_memory_working_set_bytes{namespace=\"wskorea26\",container=\"book\"}"}],
+              "targets": [{"expr": "container_memory_working_set_bytes{namespace=\"wskorea26\",container=\"book\",pod!=\"\"} and on(namespace,pod) kube_pod_container_info{namespace=\"wskorea26\",container=\"book\"}"}],
               "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
             },
             {
               "title": "Running Pods",
               "type": "stat",
               "datasource": "wskorea26-prometheus",
-              "targets": [{"expr": "count(kube_pod_status_phase{namespace=\"wskorea26\",phase=\"Running\"})"}],
+              "targets": [{"expr": "count(kube_pod_status_phase{namespace=\"wskorea26\",phase=\"Running\",pod!=\"\"} and on(namespace,pod) kube_pod_container_info{namespace=\"wskorea26\",container=\"book\"})"}],
               "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8}
             },
             {
               "title": "Container Restart Count",
               "type": "timeseries",
               "datasource": "wskorea26-prometheus",
-              "targets": [{"expr": "kube_pod_container_status_restarts_total{namespace=\"wskorea26\",container=\"book\"}"}],
+              "targets": [{"expr": "kube_pod_container_status_restarts_total{namespace=\"wskorea26\",container=\"book\",pod!=\"\"} and on(namespace,pod) kube_pod_container_info{namespace=\"wskorea26\",container=\"book\"}"}],
               "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8}
             },
             {
               "title": "Container Network Receive",
               "type": "timeseries",
               "datasource": "wskorea26-prometheus",
-              "targets": [{"expr": "rate(container_network_receive_bytes_total{namespace=\"wskorea26\"}[5m])"}],
+              "targets": [{"expr": "rate(container_network_receive_bytes_total{namespace=\"wskorea26\",pod!=\"\"}[5m]) and on(namespace,pod) kube_pod_container_info{namespace=\"wskorea26\",container=\"book\"}"}],
               "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8}
             }
           ],
