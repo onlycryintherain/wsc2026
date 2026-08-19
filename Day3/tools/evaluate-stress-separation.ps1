@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     stress 노드 분리 필요 여부를 평가합니다. stress 앱이 과한 부하를 발생시켜
     같은 노드의 user/product에 회귀를 주는지 진단합니다.

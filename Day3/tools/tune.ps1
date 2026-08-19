@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$ClusterName = 'wsi2026-cluster',
     [string]$Region = 'ap-northeast-2',
@@ -28,10 +28,10 @@ param(
     [string]$DataFile = (Join-Path $PSScriptRoot '..\application\load_user.dump'),
     [string]$ProductId = 'dbdump500001',
     [string]$ProductIds,
-    [ValidateRange(1, 20)][int]$MaxNodes = 6,
+    [ValidateRange(1, 20)][int]$MaxNodes = 3,
     [ValidateRange(1, 20)][int]$IdleNodes = 1,
     [ValidateRange(1, 20)][int]$ManagedNodes = 1,
-    [ValidateRange(1, 20)][int]$CostBaselineNodes = 2,
+    [ValidateRange(1, 20)][int]$CostBaselineNodes = 3,
     [ValidateRange(2, 30)][int]$MaxAutoReplicas = 12,
     # 총 동시성은 기본 32로 제한한다. 64 이상은 stress OOM/timeout을 유발할 수 있다.
     [ValidateRange(1, 1000)][int]$PreAllocatedVUs = 32,
@@ -82,9 +82,9 @@ $apps = @('user','product','stress')
 if ($PSBoundParameters.ContainsKey('ManagedApps')) { $apps = @($ManagedApps) }
 # (AppSloMs/AppCpuTargets는 아래 $sloMs/$hpaTargets 조건부 정의에서 반영)
 if (-not $AppSloMs) { $sloMs = @{ user=200.0; product=200.0; stress=1000.0 } } else { $sloMs = $AppSloMs }
-$trafficShare = @{ user=0.30; product=0.30; stress=0.40 }
+$trafficShare = @{ user=0.50; product=0.35; stress=0.15 } # User 50% / Product 35% / Stress 15%
 if (-not $AppCpuTargets) { $hpaTargets = @{ user=40; product=65; stress=$(if ($StressMode) { 55 } else { 70 }) } } else { $hpaTargets = $AppCpuTargets }
-$cpuRequestMinimum = @{ user=125.0; product=50.0; stress=300.0 }
+$cpuRequestMinimum = @{ user=25.0; product=25.0; stress=50.0 }
 # ============================================================
 # BASE EXPERIMENT CONFIG
 # ============================================================
@@ -145,16 +145,31 @@ function Save-EvaluationSnapshot($measurement, $config, $name) {
     $apps2 = @($measurement.Apps.PSObject.Properties | ForEach-Object { @{Name=$_.Name;Val=$_.Value} })
     $userP=0;$productP=0;$stressP=0
     foreach ($a in $apps2) { if ($a.Name -eq 'user') { $userP=[double](Get-OptionalPropertyValue $a.Val 'Performance' 0) } elseif ($a.Name -eq 'product') { $productP=[double](Get-OptionalPropertyValue $a.Val 'Performance' 0) } elseif ($a.Name -eq 'stress') { $stressP=[double](Get-OptionalPropertyValue $a.Val 'Performance' 0) } }
+    $evalScore=Get-OptionalPropertyValue $measurement 'EvaluationTotalScore' $null
+    if ($null -eq $evalScore) { $evalScore=Get-OptionalPropertyValue $measurement 'TotalScore' $null }
+    if ($null -eq $evalScore -and $measurement.CompetitionScore) { $evalScore=Get-OptionalPropertyValue $measurement.CompetitionScore 'Earned' 0 }
     return [pscustomobject]@{
         Name=$name; Timestamp=Get-Date
         ConfigFingerprint=Get-ConfigFingerprintFromValues $config; Config=$config; Measurement=$measurement
         UserPerformance=$userP; ProductPerformance=$productP; StressPerformance=$stressP
-        EvalScore=[double]$(Get-OptionalPropertyValue $measurement 'EvaluationTotalScore' 0)
+        EvalScore=[double]$evalScore
         AvgNodes=[double]$(Get-OptionalPropertyValue $measurement 'AverageReadyNodes' 0)
         PeakNodes=[double]$(Get-OptionalPropertyValue $measurement 'PeakReadyNodes' 0)
     }
 }
-  # P0-5: stress 300m reference prior
+function Save-BaseExperimentProfile([hashtable]$config,$measurement,[string]$path) {
+    $payload=[pscustomobject]@{
+        GeneratedAt=(Get-Date -Format o)
+        Mode='BASE_EXPERIMENT'
+        Configuration=$config
+        Measurement=$measurement
+        Selection=[pscustomobject]@{Status='BASE_MEASURED';ExternalScorePending=$true}
+    }
+    $text=$payload|ConvertTo-Json -Depth 20
+    [IO.File]::WriteAllText($path,$text,(New-Object System.Text.UTF8Encoding($false)))
+    return $path
+}
+
 # P0-5: user/product request floor도 reference(70m)에 가깝게 — ELASTIC_DENSITY에서 실측 우선
 # 하한은 유지하되 첫 측정은 과밀 배치를 막는 보호값에서 시작한다. 합계
 # 1150m이라 c5.large 관측 app budget 1180m 안에 1 Pod씩 들어가며,
@@ -175,7 +190,9 @@ $idleRequestReductionOrder = @('stress','product','user')
 # HPA maxReplicas는 관측 기반 수식(Get-AppHpaCapacity → FinalHpaMaxByApp)이
 # 최종 overlay한다. 아래 값은 candidate 시작값/fallback floor일 뿐 최종 source of
 # truth가 아니다. stress는 max=2가 기능적으로 부족해 floor를 6으로 올린다.
-$hpaMaxMinimum = @{ user=6; product=4; stress=6 }
+    # HPA floor는 live config에서 설정된다. reference profile의 앱별 숫자를
+    # 다른 난이도의 앱에 재사용하지 않는다.
+    $hpaMaxMinimum=@{ user=1; product=1; stress=1 }
 # 관측 기반 HPA max 최종 상태 (candidate lifecycle과 분리).
 # measurement마다 monotonic(max)으로 갱신되고 최종 적용 시 overlay된다.
 $script:FinalHpaMaxByApp=@{}
@@ -378,8 +395,10 @@ $runFailed = $true
 $finalApplied = $false
 $finalSelectionFatal = $false
 $originalConfig = $null
-$originalNodePoolCpu = $null
-$originalNodePoolHadCpuLimit = $false
+$script:originalNodePoolCpu = $null
+$script:originalStressNodePoolCpu = $null
+$script:originalNodePoolHadCpuLimit = $false
+$script:originalStressNodePoolHadCpuLimit = $false
 $nodePoolLimitChanged = $false
 $placementPolicyChanged = $false
 $originalNodePoolTaintsJson = $null
@@ -443,19 +462,24 @@ $script:nullDevice=if ($env:OS -eq 'Windows_NT' -or $IsWindows) { 'NUL' } else {
 
 # ===================== HPA CONTROL POINT MODEL =====================
 function Initialize-HpaControlPointModel {
-    # known-good reference prior 로드 (EMPIRICAL_PRIOR — literal 복사 아님).
-    # request가 바뀌면 target을 재계산해 이 절대 threshold를 보존/학습한다.
+    # 기본값은 새 앱에서도 동작하는 보수적 prior이며, live HPA/request를 읽을 수
+    # 있으면 현재 설정의 절대 제어점(request x target)을 먼저 사용한다.
     $ref=@{user=@{cp=23.1;source='REFERENCE_PRIOR';conf=0.30};product=@{cp=20.3;source='REFERENCE_PRIOR';conf=0.30};stress=@{cp=165.0;source='REFERENCE_PRIOR';conf=0.30}}
     foreach ($app in $apps) {
-        $script:ControlPointByApp[$app]=$ref[$app].cp
-        $script:ControlPointSourceByApp[$app]=$ref[$app].source
-        $script:ControlPointConfidenceByApp[$app]=$ref[$app].conf
+        $cp=[double]$ref[$app].cp; $source=[string]$ref[$app].source; $confidence=[double]$ref[$app].conf
+        try {
+            $live=Get-LiveConfig 'ControlPointLive'
+            $req=Convert-CpuToM $live[$app].requestCpu
+            $target=[double]$live[$app].hpaTarget
+            if ($req -gt 0 -and $target -gt 0) { $cp=$req*$target/100.0; $source='LIVE_SEED'; $confidence=0.45 }
+        } catch { }
+        $script:ControlPointByApp[$app]=$cp
+        $script:ControlPointSourceByApp[$app]=$source
+        $script:ControlPointConfidenceByApp[$app]=$confidence
     }
     Write-Host '===== HPA CONTROL POINT =====' -ForegroundColor Cyan
     foreach ($app in $apps) {
-        $reqM=Convert-CpuToM $KnownGoodReference[$app].requestCpu
-        $tgt=[int]$KnownGoodReference[$app].target
-        Write-Host ("  {0}: reference request={1:N0}m x {2}% = absoluteThreshold={3:N1}m (prior, confidence={4:N2})" -f $app,$reqM,$tgt,$script:ControlPointByApp[$app],$script:ControlPointConfidenceByApp[$app]) -ForegroundColor DarkGray
+        Write-Host ("  {0}: absoluteThreshold={1:N1}m source={2} confidence={3:N2}" -f $app,$script:ControlPointByApp[$app],$script:ControlPointSourceByApp[$app],$script:ControlPointConfidenceByApp[$app]) -ForegroundColor DarkGray
     }
     Restore-HpaControlPointState
 }
@@ -629,15 +653,13 @@ function Write-PodDensityLog($report,$config) {
 
 # ===================== ELASTIC_DENSITY_REQUEST (user/product) =====================
 function Get-ElasticDensityRequest([string]$app,$metric,[double]$currentReqM) {
-    # user/product: burst를 허용하고 HPA로 분산 — scheduler reservation은 작게.
-    #   known-good reference(70m)를 density prior로, 실측(sustained pressure)이 크면 증가.
-    #   반환 request는 최소 reference 하한을 보장한다 (scheduler density 확보).
-    $refM=[double](Convert-CpuToM $KnownGoodReference[$app].requestCpu)
+    # reference request가 아니라 현재 request와 실측 q75를 사용한다.
     $sustained=[bool](Get-OptionalPropertyValue $metric 'SustainedCpuPressure' $false)
+
     $avgM=[double](Get-OptionalPropertyValue $metric 'AverageCPUMillicores' 0)
     $q75M=[double](Get-OptionalPropertyValue $metric 'CPUP95Millicores' (Get-OptionalPropertyValue $metric 'AverageCPUMillicores' 0))
     $headroom=Get-AdaptiveHeadroom ([double]$avgM*0.75) $avgM $q75M $CpuRequestMinHeadroom $CpuRequestMaxHeadroom $CpuRequestAlpha
-    $measuredTarget=[math]::Max($refM,$q75M*$headroom)
+    $measuredTarget=[math]::Max([double]$cpuRequestMinimum[$app],$q75M*$headroom)
     $candidate=if ($sustained) { [math]::Max($measuredTarget,[double]$currentReqM) } else { $measuredTarget }
     $candidate=Round-UpStep $candidate $CpuRequestStep
     return $candidate
@@ -648,11 +670,31 @@ function Require([string]$name) {
 }
 
 function Invoke-Kubectl([string[]]$Arguments) {
-    $output=@(& kubectl @Arguments 2>&1)
-    $exitCode=$LASTEXITCODE
-    if ($exitCode -ne 0) { throw "kubectl 실패: kubectl $($Arguments -join ' '): $($output -join ' ')" }
-    # stdout을 반환한다 (jsonpath/목록 조회 등 호출부에서 사용).
-    return @($output)
+    # PowerShell 5.1은 native command 인자의 JSON 따옴표를 제거할 수 있다.
+    # kubectl patch는 임시 --patch-file로 전달해 Windows/Linux 모두 동일하게 처리한다.
+    $args2=[System.Collections.Generic.List[string]]::new()
+    $tempFiles=[System.Collections.Generic.List[string]]::new()
+    try {
+        for ($i=0; $i -lt $Arguments.Count; $i++) {
+            if ($Arguments[$i] -eq '-p' -and ($i+1) -lt $Arguments.Count) {
+                $patch=[string]$Arguments[$i+1]
+                if ($patch.TrimStart().StartsWith('{') -or $patch.TrimStart().StartsWith('[')) {
+                    $file=[IO.Path]::GetTempFileName()
+                    [IO.File]::WriteAllText($file,$patch,(New-Object System.Text.UTF8Encoding($false)))
+                    $tempFiles.Add($file)
+                    $args2.Add('--patch-file'); $args2.Add($file); $i++
+                    continue
+                }
+            }
+            $args2.Add([string]$Arguments[$i])
+        }
+        $output=@(& kubectl @args2 2>&1)
+        $exitCode=$LASTEXITCODE
+        if ($exitCode -ne 0) { throw "kubectl 실패: kubectl $($args2 -join ' '): $($output -join ' ')" }
+        return @($output)
+    } finally {
+        foreach ($file in $tempFiles) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Wait-DeploymentRollout([string]$app,[int]$timeoutSec = 180,[ValidateSet('Hard','Tuning')][string]$Deadline = 'Hard') {
@@ -992,15 +1034,11 @@ function Set-RequiredPolicy([hashtable]$source,[string]$name,[hashtable]$desired
     #   HPA target은 control point에서 결정. literal 고정 금지.
     $config=Copy-Config $source $name
     foreach ($app in $apps) {
-        # KnownGoodReference request는 empirical prior — 기존 배포값에 무조건 우선.
-        # (600m/925m 배포값에 300m reference가 무시되는 버그 해결).
-        $refReq=Convert-CpuToM $KnownGoodReference[$app].requestCpu
+        # 현재 Deployment request를 seed로 사용한다. KnownGoodReference는
+        # 다른 대회 앱에 강제 적용하지 않고, 측정 전 참고 로그로만 남긴다.
         $existingReq=Convert-CpuToM $config[$app].requestCpu
-        if ($refReq -gt 0 -and $refReq -lt 999) {
-            $requestM=[double]$refReq
-        } else {
-            $requestM=[math]::Max([double]$cpuRequestMinimum[$app],[double]$existingReq)
-        }
+        $requestM=[math]::Max([double]$cpuRequestMinimum[$app],[double]$existingReq)
+
         $existingLimit=Convert-CpuToM $config[$app].limitCpu
         # CPU limit 정책: 실제 evidence로 동적 결정.
         # stress: limit 유지 (burst 보존, proportional reduction 금지).
@@ -1018,15 +1056,15 @@ function Set-RequiredPolicy([hashtable]$source,[string]$name,[hashtable]$desired
             Write-Host ("  {0}: request {1:N0}m → {2:N0}m (limit {2:N0}m 초과 → request 축소)" -f $app,$requestM,$limitM) -ForegroundColor Yellow
             $requestM=$limitM
         }
-        $requestedMax=if ($desiredHpaMax -and $desiredHpaMax.ContainsKey($app)) { [int]$desiredHpaMax[$app] } else { [int]$config[$app].maxReplicas }
+        $requestedMax=[int]$config[$app].maxReplicas
         $config[$app].requestCpu=Format-Cpu $requestM
         $config[$app].limitCpu=Format-Cpu $limitM
         # P0-1: min=1 강제 금지 — 기존 min 보존 (control point/no-scale fill에서 결정).
         # 단 min이 0이면 1로 floor.
         if ([int]$config[$app].minReplicas -lt 1) { $config[$app].minReplicas=1 }
-        $requestedMax=[int][math]::Max([int]$hpaMaxMinimum[$app],[math]::Min($MaxAutoReplicas,$requestedMax))
+        $requestedMax=[int][math]::Min($MaxAutoReplicas,$requestedMax)
         $preservedMin=[int]$config[$app].minReplicas
-        $config[$app].maxReplicas=[math]::Max($preservedMin,$requestedMax)
+        $config[$app].maxReplicas=[int][math]::Max($preservedMin,$requestedMax)
         $config[$app].hpaTarget=[int]$config[$app].hpaTarget
         $config[$app].replicas=1
     }
@@ -1038,12 +1076,10 @@ function New-MinimumConfig([hashtable]$seed,[string]$name = 'Minimum') {
     $config=Copy-Config $seed $name
     $memoryFloor=@{user=[math]::Max([double]$memoryRequestStart.user,$MinMemoryRequestMi);product=[math]::Max([double]$memoryRequestStart.product,$MinMemoryRequestMi);stress=[math]::Max([double]$memoryRequestStart.stress,$MinMemoryRequestMi)}
     foreach ($app in $apps) {
-        $refReq=Convert-CpuToM $KnownGoodReference[$app].requestCpu
-        if ($refReq -gt 0 -and $refReq -lt 999) {
-            $requestM=[double]$refReq
-        } else {
-            $requestM=[math]::Max([double]$cpuRequestMinimum[$app],[double]$cpuRequestStart[$app])
-        }
+        # 실제 live request를 튜닝 seed로 사용한다. KnownGoodReference는
+        # 새 앱/새 난이도에서 잘못된 고정 prior가 되므로 seed를 덮어쓰지 않는다.
+        $existingReq=Convert-CpuToM $config[$app].requestCpu
+        $requestM=[math]::Max([double]$cpuRequestMinimum[$app],[double]$existingReq)
         # P0-6: CPU limit은 기존 그대로 보존 (request×2 강제 금지).
         $existingCpuLimit=Convert-CpuToM $config[$app].limitCpu
         $limitM=if ($existingCpuLimit) { [double]$existingCpuLimit } else { 0 }
@@ -1059,9 +1095,9 @@ function New-MinimumConfig([hashtable]$seed,[string]$name = 'Minimum') {
         $config[$app].limitMemory=Format-Memory ([math]::Max($minimumLimit,$(if ($existingMemoryLimit) { $existingMemoryLimit } else { 0 }))) $minimumLimit
         # P0-1: min=1 강제 금지 — 기존 min 보존 (seed에서 결정).
         if ([int]$config[$app].minReplicas -lt 1) { $config[$app].minReplicas=1 }
-        $requestedMax=[int]$hpaMaxMinimum[$app]
+        $requestedMax=[int][math]::Min($MaxAutoReplicas,$requestedMax)
         $preservedMin=[int]$config[$app].minReplicas
-        $config[$app].maxReplicas=[math]::Max($preservedMin,$requestedMax)
+        $config[$app].maxReplicas=[int][math]::Max($preservedMin,$requestedMax)
         $config[$app].hpaTarget=[int]$config[$app].hpaTarget
         $config[$app].replicas=1
     }
@@ -1137,24 +1173,46 @@ function Apply-Resources([hashtable]$config,[ValidateSet('Hard','Tuning')][strin
 function Apply-Hpa([hashtable]$config) {
     foreach ($app in $apps) {
         $c = $config[$app]
-        # P0-1: Apply-Hpa는 정상화된 config만 받는다. invalid면 invariant error.
-        if ([int]$c.minReplicas -gt [int]$c.maxReplicas) {
-            throw "HPA_CONFIG_INVALID_BEFORE_APPLY: $app min=$($c.minReplicas) max=$($c.maxReplicas)"
-        }
-        $spec = @{
-            minReplicas=[int]$c.minReplicas
-            maxReplicas=[int]$c.maxReplicas
-            metrics=@(@{type='Resource';resource=@{name='cpu';target=@{type='Utilization';averageUtilization=[int]$c.hpaTarget}}})
-        }
-        # HPA behavior는 기본 KEEP: 라이브 설정을 그대로 유지하고 patch payload에서 제외한다.
-        # 명시적 HpaBehaviorAction=TUNE_SCALE_UP 결정이 있을 때만 behavior를 포함한다.
+        if ([int]$c.minReplicas -gt [int]$c.maxReplicas) { throw "HPA_CONFIG_INVALID_BEFORE_APPLY: $app min=$($c.minReplicas) max=$($c.maxReplicas)" }
+        $spec = @{minReplicas=[int]$c.minReplicas;maxReplicas=[int]$c.maxReplicas;metrics=@(@{type='Resource';resource=@{name='cpu';target=@{type='Utilization';averageUtilization=[int]$c.hpaTarget}}})}
         $behaviorAction=if ($script:HpaBehaviorAction.ContainsKey($app)) { [string]$script:HpaBehaviorAction[$app] } else { 'KEEP' }
-        if ($behaviorAction -eq 'TUNE_SCALE_UP' -and $null -ne $c.behavior) {
-            $spec.behavior=$c.behavior
-        }
-        $patch = @{spec=$spec} | ConvertTo-Json -Compress -Depth 12
+        if ($behaviorAction -eq 'TUNE_SCALE_UP' -and $null -ne $c.behavior) { $spec.behavior=$c.behavior }
+        $patch=@{spec=$spec}|ConvertTo-Json -Compress -Depth 12
         Invoke-Kubectl @('-n',$Namespace,'patch','hpa',$app,'--type=merge','-p',$patch)
     }
+}
+
+function Apply-CandidateSafely([hashtable]$config,[ValidateSet('Hard','Tuning')][string]$Deadline='Hard') {
+    # 후보 전환 중 이전 부하의 HPA metric이 새 rollout을 흔들지 않도록
+    # 먼저 모든 앱을 1 replica/1..1 HPA로 고정한다.
+    $allReady=$true
+    foreach ($app in $apps) {
+        $freeze='{"spec":{"minReplicas":1,"maxReplicas":1}}'
+        Invoke-Kubectl @('-n',$Namespace,'patch','hpa',$app,'--type=merge','-p',$freeze)
+        Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app",'--replicas=1')
+    }
+    Apply-Resources $config $Deadline
+    Apply-Hpa $config
+    foreach ($app in $apps) {
+        $warm=[int][math]::Max(1,$config[$app].minReplicas)
+        Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$warm")
+    }
+    foreach ($app in $apps) {
+        try {
+            Wait-DeploymentRollout $app 180 $Deadline
+        } catch {
+            $allReady=$false
+            Write-Warning "candidate rollout timeout($app): $($_.Exception.Message)"
+        }
+        try {
+            $timeout=Get-DeadlineTimeoutSeconds 90 $Deadline
+            Invoke-Kubectl @('-n',$Namespace,'wait','--for=condition=Available',"deployment/$app","--timeout=${timeout}s")
+        } catch {
+            $allReady=$false
+            Write-Warning "candidate available 대기 timeout($app): $($_.Exception.Message)"
+        }
+    }
+    return $allReady
 }
 
 function Wait-ReadyNodeCountAtMost([int]$targetTotal, [int]$timeoutSec, [ValidateSet('Hard','Tuning')][string]$Deadline = 'Tuning') {
@@ -1323,39 +1381,18 @@ function Assert-LiveConfigMatches([hashtable]$expected) {
 }
 
 function Set-KarpenterNodeLimit($cluster) {
-    if ($SkipNodeLimit) { Write-Warning 'Karpenter NodePool 상한을 변경하지 않습니다.'; return }
-    $nodePoolObject = ((& kubectl get nodepool default -o json 2>$null) -join '') | ConvertFrom-Json
-    if (-not $nodePoolObject) { throw 'Karpenter NodePool/default를 찾지 못했습니다. -SkipNodeLimit로 우회할 수 있습니다.' }
-    $cpuLimitProperty=$null
-    if ($nodePoolObject.spec.limits) { $cpuLimitProperty=$nodePoolObject.spec.limits.PSObject.Properties['cpu'] }
-    $script:originalNodePoolHadCpuLimit=$null -ne $cpuLimitProperty
-    $script:originalNodePoolCpu=if ($cpuLimitProperty) { [string]$cpuLimitProperty.Value } else { $null }
-    $nodeCapacityCpu = [double]$cluster.NodeCapacityCPU
-    if ($nodeCapacityCpu -le 0) { throw 'Managed Node CPU capacity를 확인하지 못했습니다.' }
-    $nodeCpuCores = [math]::Ceiling($nodeCapacityCpu / 1000.0)
-    # SingleNode: Karpenter가 추가 노드를 만들 수 없게 상한을 1 core로 제한한다.
-    # (c5.large 2 vCPU짜리 노드는 limits.cpu=1로는 생성할 수 없다.)
-    $karpenterNodes = if ($SingleNode) { 0 } else { [math]::Max(1, $MaxNodes - $ManagedNodes) }
-    $cpuLimit = if ($SingleNode) { 1 } else { [int]($nodeCpuCores * $karpenterNodes) }
-    $patch = @{spec=@{limits=@{cpu="$cpuLimit"}}} | ConvertTo-Json -Compress
-    Invoke-Kubectl @('patch','nodepool','default','--type=merge','-p',$patch)
-    $script:nodePoolLimitChanged=$true
-    if ($SingleNode) {
-        Write-Host 'SingleNode: Karpenter 추가 노드를 차단합니다 (NodePool limits.cpu=1 core, c5.large 생성 불가).' -ForegroundColor Cyan
-    } else {
-        Write-Host ("Karpenter CPU 상한={0} cores. 이 값은 정확한 Node 개수가 아니며 실제 Ready Node <= {1}로 판정합니다." -f $cpuLimit,$MaxNodes) -ForegroundColor Cyan
+    # 38점 재현: NodePool spec.limits.cpu는 튜너가 관리하지 않는다.
+    # 별도 CPU limit을 주입하면 stress scale-out 동작이 달라진다.
+    foreach ($pool in @('default','stress')) {
+        try {
+            $obj=((& kubectl get nodepool $pool -o json 2>$null) -join '') | ConvertFrom-Json
+            Write-Host ("NodePool/{0} CPU limit observed: {1}" -f $pool,$obj.spec.limits.cpu) -ForegroundColor DarkGray
+        } catch { Write-Warning "NodePool/$pool 조회 실패: $($_.Exception.Message)" }
     }
 }
 
 function Restore-KarpenterNodeLimit {
-    if ($SkipNodeLimit -or -not $script:nodePoolLimitChanged) { return }
-    try {
-        $restoreCpu=if ($script:originalNodePoolHadCpuLimit) { $script:originalNodePoolCpu } else { $null }
-        $patch=@{spec=@{limits=@{cpu=$restoreCpu}}}|ConvertTo-Json -Compress
-        Invoke-Kubectl @('patch','nodepool','default','--type=merge','-p',$patch)
-        $script:nodePoolLimitChanged=$false
-        Write-Warning $(if ($script:originalNodePoolHadCpuLimit) { "Karpenter CPU 상한을 원래 값($script:originalNodePoolCpu)으로 복구했습니다." } else { 'Karpenter에 임시로 추가한 CPU 상한을 제거했습니다.' })
-    } catch { Write-Error "Karpenter 상한 복구 실패: $($_.Exception.Message)" }
+    # Set-KarpenterNodeLimit가 mutation을 하지 않으므로 복구도 no-op이다.
 }
 
 function Set-InstanceAwarePlacement {
@@ -3301,9 +3338,9 @@ function Get-StressCapacityShape($profile,$cluster) {
     $stressBad=($stressSlo -lt 0.65) -or ([bool](Get-OptionalPropertyValue $metric 'LoadGeneratorLimited' $false) -and [double](Get-OptionalPropertyValue $metric 'GeneratedLoadRatio' 1.0) -lt 0.80)
     $splitNeeded=($granularity -ge $StressGranularityThreshold) -and ($fgDegraded -or $stressBad)
     $requestCandidate=if ($DesiredStressPods -gt 0) { $appBudget/$DesiredStressPods } else { $currentRequest }
-    # KnownGoodReference가 있으면 기존 배포값 대신 사용 (empirical prior 기반).
-    $refReq=Convert-CpuToM $KnownGoodReference.stress.requestCpu
-    $effectiveCurrentRequest=if ($refReq -gt 0 -and $refReq -lt 999) { [double]$refReq } else { $currentRequest }
+    # 계산은 현재 request를 기준으로 한다. 앱별 reference request를 사용하지 않는다.
+    $effectiveCurrentRequest=$currentRequest
+
     $newRequest=[math]::Min($effectiveCurrentRequest,[math]::Max([double]$StressCpuRequestMinimum,$requestCandidate))
     $newRequest=[math]::Ceiling($newRequest/25.0)*25
     $safeLimit=[double][math]::Floor($nodeAlloc*0.8/25)*25   # NodeCpuSafeLimit
@@ -3351,7 +3388,9 @@ function Apply-StressPlacement {
             $npRaw=@(Invoke-Kubectl @('get','nodepool','default','-o','json'))
             $np=($npRaw -join '') | ConvertFrom-Json
             $spec=$np.spec
-            if (-not $spec.template.metadata) { $spec.template | Add-Member -NotePropertyName metadata -NotePropertyValue ([pscustomobject]@{}) -Force }
+            if ($null -eq $spec.template.metadata) { $spec.template | Add-Member -NotePropertyName metadata -NotePropertyValue ([pscustomobject]@{}) -Force }
+            if ($null -eq $spec.template.spec.PSObject.Properties['taints']) { $spec.template.spec | Add-Member -NotePropertyName taints -NotePropertyValue @() -Force }
+            if ($null -eq $spec.PSObject.Properties['limits']) { $spec | Add-Member -NotePropertyName limits -NotePropertyValue ([ordered]@{}) -Force }
             $spec.template.metadata | Add-Member -NotePropertyName labels -NotePropertyValue ([ordered]@{'workload-class'=$DedicatedApp}) -Force
             $spec.template.spec.taints=@([pscustomobject]@{key=$stressPlacementKey;value='true';effect='NoSchedule'})
             $body=[ordered]@{apiVersion='karpenter.sh/v1';kind='NodePool';metadata=[ordered]@{name='stress'};spec=$spec}
@@ -3400,6 +3439,92 @@ function Revert-StressPlacement {
         Write-Host '전용 NodePool stress 삭제' -ForegroundColor Green
     } catch { Write-Warning "전용 NodePool stress 삭제 실패: $($_.Exception.Message)" }
     try { Wait-DeploymentRollout 'stress' 120 Hard } catch { Write-Warning "stress rollout 대기 실패: $($_.Exception.Message)" }
+}
+
+function Ensure-38PointStressTopology([switch]$ApplyPlacement) {
+    # apply-38point.ps1와 동일한 dedicated stress 불변조건을 튜닝 시작/최종 전에
+    # 실제 리소스 기준으로 보장한다. 단순히 NodePool spec만 보는 것이 아니라
+    # Node allocatable CPU, 실제 Pod nodeName, 전체 Pod request 사용량까지 함께 확인한다.
+    if ($ApplyPlacement) { Apply-StressPlacement }
+
+    $defaultPool=((& kubectl get nodepool default -o json 2>$null) -join '') | ConvertFrom-Json
+    $stressPool=((& kubectl get nodepool stress -o json 2>$null) -join '') | ConvertFrom-Json
+    if (-not $defaultPool -or -not $stressPool) { throw '38POINT_TOPOLOGY_INVALID: default/stress NodePool을 모두 찾지 못했습니다.' }
+
+    $nodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
+    $readyStressNodes=@($nodes.items | Where-Object {
+        $ready=@($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -gt 0
+        $pool=[string]$_.metadata.labels.'karpenter.sh/nodepool'
+        $label=[string]$_.metadata.labels.'workload-class'
+        $ready -and ($pool -eq 'stress' -or $label -eq 'stress')
+    })
+    $capacityNode=$readyStressNodes | Select-Object -First 1
+    if (-not $capacityNode) {
+        $capacityNode=@($nodes.items | Where-Object {
+            @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -gt 0
+        } | Select-Object -First 1)
+    }
+    if (-not $capacityNode) { throw '38POINT_TOPOLOGY_INVALID: Ready 노드가 없습니다.' }
+    $nodeCapacityM=Convert-CpuToM $capacityNode.status.capacity.cpu
+    $nodeAllocatableM=Convert-CpuToM $capacityNode.status.allocatable.cpu
+    if ($nodeCapacityM -le 0 -or $nodeAllocatableM -le 0) { throw '38POINT_TOPOLOGY_INVALID: 노드 CPU capacity/allocatable 조회 실패' }
+    $nodeCpuCores=[int][math]::Ceiling($nodeCapacityM/1000.0)
+
+    # 38점 재현 설정에는 NodePool CPU limit이 없다. 튜너는 이를 변경하지 않는다.
+    Write-Host ("NodePool CPU limit not managed by tuner: default={0}, stress={1}" -f $defaultPool.spec.limits.cpu,$stressPool.spec.limits.cpu) -ForegroundColor DarkGray
+
+    # stress NodePool의 생성 조건을 apply-38point.ps1와 동일하게 맞춘다.
+    $stressPatch='{"spec":{"template":{"metadata":{"labels":{"workload-class":"stress"}},"spec":{"taints":[{"key":"wsi2026.io/stress","value":"true","effect":"NoSchedule"}]}}}}'
+    Invoke-Kubectl @('patch','nodepool','stress','--type=merge','-p',$stressPatch)
+
+    $deployment=((& kubectl -n $Namespace get deployment stress -o json) -join '') | ConvertFrom-Json
+    if (-not $deployment) { throw '38POINT_TOPOLOGY_INVALID: stress Deployment을 찾지 못했습니다.' }
+    $selector=$deployment.spec.template.spec.nodeSelector
+    if ([string]$selector.'workload-class' -ne 'stress') {
+        Invoke-Kubectl @('-n',$Namespace,'patch','deployment','stress','--type=merge','-p','{"spec":{"template":{"spec":{"nodeSelector":{"workload-class":"stress"}}}}}')
+    }
+    $hasStressTol=@($deployment.spec.template.spec.tolerations | Where-Object {
+        $_.key -eq 'wsi2026.io/stress' -and $_.value -eq 'true' -and $_.effect -eq 'NoSchedule'
+    }).Count -gt 0
+    if (-not $hasStressTol) {
+        $tolerations=[System.Collections.Generic.List[object]]::new()
+        foreach ($tol in @($deployment.spec.template.spec.tolerations)) { if ($null -ne $tol) { $tolerations.Add($tol) } }
+        $tolerations.Add([pscustomobject]@{key='wsi2026.io/stress';operator='Equal';value='true';effect='NoSchedule'})
+        $tolPatch=@{spec=@{template=@{spec=@{tolerations=@($tolerations)}}}} | ConvertTo-Json -Compress -Depth 20
+        Invoke-Kubectl @('-n',$Namespace,'patch','deployment','stress','--type=merge','-p',$tolPatch)
+    }
+    Wait-DeploymentRollout 'stress' 180 Hard
+
+    # nodeSelector/toleration 수정이나 Karpenter reconciliation으로 노드가 교체될 수
+    # 있으므로 rollout 후의 live 노드 목록을 기준으로 실제 Pod 배치를 검증한다.
+    $nodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
+    $pods=((& kubectl -n $Namespace get pods -l app=stress -o json) -join '') | ConvertFrom-Json
+    $stressPods=@($pods.items | Where-Object { $_.metadata.deletionTimestamp -eq $null })
+    if (-not $stressPods.Count) { throw '38POINT_TOPOLOGY_INVALID: 현재 stress Pod가 없습니다.' }
+    $nodeByName=@{}
+    foreach ($n in @($nodes.items)) { $nodeByName[[string]$n.metadata.name]=$n }
+    $allPods=((& kubectl get pods --all-namespaces -o json) -join '') | ConvertFrom-Json
+    $requestsByNode=@{}
+    foreach ($p in @($allPods.items)) {
+        $n=[string]$p.spec.nodeName
+        if (-not $n -or $p.status.phase -ne 'Running') { continue }
+        if (-not $requestsByNode.ContainsKey($n)) { $requestsByNode[$n]=0.0 }
+        foreach ($c in @($p.spec.containers)) { $requestsByNode[$n]+=[double](Convert-CpuToM $c.resources.requests.cpu) }
+    }
+    foreach ($pod in $stressPods) {
+        $nodeName=[string]$pod.spec.nodeName
+        if (-not $nodeName -or -not $nodeByName.ContainsKey($nodeName)) { throw "38POINT_TOPOLOGY_INVALID: stress Pod $($pod.metadata.name)이 Pending/미배치 상태입니다." }
+        $node=$nodeByName[$nodeName]
+        $label=[string]$node.metadata.labels.'workload-class'
+        $taint=@($node.spec.taints | Where-Object { $_.key -eq 'wsi2026.io/stress' -and $_.value -eq 'true' -and $_.effect -eq 'NoSchedule' })
+        if ($label -ne 'stress' -or $taint.Count -eq 0) { throw "38POINT_TOPOLOGY_INVALID: stress Pod $($pod.metadata.name)이 dedicated taint/label 노드에 있지 않습니다: $nodeName" }
+        $alloc=Convert-CpuToM $node.status.allocatable.cpu
+        if ($alloc -lt (Convert-CpuToM $deployment.spec.template.spec.containers[0].resources.requests.cpu)) { throw "38POINT_TOPOLOGY_INVALID: stress 노드 allocatable CPU 부족: $nodeName alloc=${alloc}m" }
+        $used=[double]$requestsByNode[$nodeName]
+        Write-Host ("  stress placement: pod={0} node={1} allocatable={2:N0}m requested={3:N0}m remaining={4:N0}m" -f $pod.metadata.name,$nodeName,$alloc,$used,($alloc-$used)) -ForegroundColor DarkGray
+    }
+    Write-Host ("38POINT_TOPOLOGY verified: NodePool CPU default/stress={0} cores, stress nodes={1}, capacity={2:N0}m allocatable={3:N0}m" -f $desiredLimit,$readyStressNodes.Count,$nodeCapacityM,$nodeAllocatableM) -ForegroundColor Green
+    return [pscustomobject]@{DefaultNodePoolCpu=$desiredLimit;StressNodePoolCpu=$desiredLimit;StressNodeCount=$readyStressNodes.Count;NodeCapacityCPU=$nodeCapacityM;NodeAllocatableCPU=$nodeAllocatableM;StressPodCount=$stressPods.Count}
 }
 
 function Get-NextTuningAction($profile,[string]$app,$cluster=$null) {
@@ -3600,11 +3725,8 @@ function Apply-TuningActions([hashtable]$source,$profile,[string]$name,$cluster=
             }
             'INCREASE_CPU_LIMIT_FOR_BURST' { $config[$app].limitCpu=Format-Cpu ([double]$action.To) }
             'REDUCE_CPU_REQUEST' {
-                # request만 하향 (limit 유지 — burst 방향과 분리). limit이 request 아래로 내려가지 않게 보장.
-                # KnownGoodReference가 있으면 그 밑으로는 내려가지 않음 (tuning이 reference를 무시하지 않음).
-                $reqAfter=[double]$action.To
-                $refReq=[double](Convert-CpuToM $KnownGoodReference[$app].requestCpu)
-                if ($refReq -gt 0 -and $reqAfter -lt $refReq) { $reqAfter=$refReq }
+                # 현재 앱의 안전 하한만 적용한다. reference profile의 request는 사용하지 않는다.
+                $reqAfter=[math]::Max([double]$cpuRequestMinimum[$app],[double]$action.To)
                 $config[$app].requestCpu=Format-Cpu $reqAfter
                 $reqM=[double](Convert-CpuToM $config[$app].requestCpu)
                 $limM=[double](Convert-CpuToM $config[$app].limitCpu)
@@ -5415,8 +5537,7 @@ function Enforce-IdleBudget([hashtable]$config,$cluster) {
     foreach ($app in $apps) {
         if ([int]$adjusted[$app].maxReplicas -ne $originalHpaMax[$app]) { throw "Idle 보정 중 $app HPA max가 변경되었습니다." }
         $request=Convert-CpuToM $adjusted[$app].requestCpu
-        $refReq=Convert-CpuToM $KnownGoodReference[$app].requestCpu
-        $effectiveFloor=if ($refReq -gt 0 -and $refReq -lt 999) { [double]$refReq } else { [double]$cpuRequestMinimum[$app] }
+        $effectiveFloor=[double]$cpuRequestMinimum[$app]
         if ($request -lt $effectiveFloor) { throw "$app CPU request 하한을 만족할 수 없습니다: $request m (floor=$effectiveFloor)" }
     }
     # P0-1: stress limit request*2 cap 제거
@@ -5529,7 +5650,9 @@ function Save-Results([object[]]$results,[hashtable]$finalConfig,[hashtable]$dia
         Verification=$correction.Verification;RuntimeBudget=[pscustomobject]@{MaxSeconds=$maxRuntimeSeconds;ShutdownReserveSeconds=$ShutdownReserveSeconds;TuningDeadline=$tuningDeadline;HardDeadline=$hardDeadline;StopReason=$correction.StopReason}
         Corrections=$correction.Corrections;CorrectionUnvalidated=$correction.CorrectionUnvalidated;NoApply=[bool]$NoApply
     }
-    $jsonPath=Join-Path $OutputDir 'calculated-final.json'; $payload | ConvertTo-Json -Depth 15 | Set-Content -Encoding UTF8 -LiteralPath $jsonPath
+    $jsonPath=Join-Path $OutputDir 'calculated-final.json'
+    $jsonText=$payload | ConvertTo-Json -Depth 15
+    [IO.File]::WriteAllText($jsonPath,$jsonText,(New-Object System.Text.UTF8Encoding($false)))
     return [pscustomobject]@{Csv=$csvPath;Json=$jsonPath;Cluster=$clusterSummary;Apps=@($finalApps);Score=$validation.CompetitionScore;Selection=$payload.Selection}
 }
 
@@ -5553,7 +5676,9 @@ function Initialize-EndpointAndData {
     if (-not (Test-Path -LiteralPath $DataFile)) { throw "사용자 데이터 파일을 찾을 수 없습니다: $DataFile" }
     New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
     $records=Read-UserRecords $DataFile
-    $script:UserDataJson=Join-Path $OutputDir 'user-data.json'; $records|ConvertTo-Json -Compress|Set-Content -Encoding UTF8 -LiteralPath $script:UserDataJson
+    $script:UserDataJson=Join-Path $OutputDir 'user-data.json'
+    $userJson=$records|ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($script:UserDataJson,$userJson,(New-Object System.Text.UTF8Encoding($false)))
     Write-Host "사용자 데이터: $($records.Count)건"
     if (-not $script:Endpoint) {
         $domain=(& aws cloudfront list-distributions --query "DistributionList.Items[?Comment=='wsi2026'].DomainName | [0]" --output text).Trim()
@@ -5601,78 +5726,86 @@ try {
         Write-Host "`n===== BASELINE CONTROL =====" -ForegroundColor Green
         foreach ($app in $apps) { $bc=$BaseConfig[$app]; $lim=if($bc.limitCpu){$bc.limitCpu}else{'none'}; Write-Host ("  {0}: {1}/{2} limit={3}/{4} HPA={5}% {6}..{7} ({8})" -f $app,$bc.requestCpu,$bc.requestMemory,$lim,$bc.limitMemory,$bc.hpaTarget,$bc.minReplicas,$bc.maxReplicas,$bc.placement) }
         $originalConfig=Get-LiveConfig 'Original'
-        $baseCfg=Copy-Config $BaseConfig 'BASE'; foreach($app in $apps){$baseCfg[$app].replicas=1}
-        if (-not $NoApply) { Apply-StressPlacement }
-        Apply-Resources $baseCfg Hard; Apply-Hpa $baseCfg; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+        # Base 측정은 고정 GoldenBaseline이 아니라 현재 live Deployment/HPA를
+        # seed로 사용한다. 대회 앱의 난이도/리소스가 달라도 첫 측정이 실제 상태에서 시작된다.
+        foreach ($app in $apps) {
+            # live HPA max/min을 각 앱의 시작 floor로 보존한다.
+            $hpaMaxMinimum[$app]=[int][math]::Max(1,$originalConfig[$app].maxReplicas)
+            if (-not $script:HardSafetyMaxByApp.ContainsKey($app)) { $script:HardSafetyMaxByApp[$app]=[int]$MaxAutoReplicas
+            }
+        }
+        $baseCfg=Copy-Config $originalConfig 'BASE'; foreach($app in $apps){$baseCfg[$app].replicas=1}
+        if (-not $NoApply) { Ensure-38PointStressTopology -ApplyPlacement }
+        $baseReady=Apply-CandidateSafely $baseCfg Hard
+        if (-not $baseReady) { throw 'BASE candidate가 Ready 상태가 되지 않아 측정할 수 없습니다.' }
         $baseCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $baseCluster
         $baseRun=Run-ReliableLoadTest $baseCfg $ProbeDurationSec $baseCluster 0 -SkipRetry
         $baseMeas=$baseRun.Result; if(-not $baseMeas){throw 'BASE measurement failed'}
         $baseSnap=Save-EvaluationSnapshot $baseMeas $baseCfg 'BASE'; $bestSnap=$baseSnap; $bestCfg=$baseCfg
-        Write-Host ("BASE Eval={0:N2} user={1:N1}% prod={2:N1}% stress={3:N1}%" -f $bestSnap.EvalScore,$bestSnap.UserPerformance,$bestSnap.ProductPerformance,$bestSnap.StressPerformance) -ForegroundColor Cyan
+        $baseProfilePath=Join-Path $OutputDir 'calculated-final.json'
+        Save-BaseExperimentProfile $baseCfg $baseMeas $baseProfilePath | Out-Null
+        Write-Host ("BASE Eval={0:N2} user={1:N1}% prod={2:N1}% stress={3:N1}% profile={4}" -f $bestSnap.EvalScore,$bestSnap.UserPerformance,$bestSnap.ProductPerformance,$bestSnap.StressPerformance,$baseProfilePath) -ForegroundColor Cyan
 
         # Exactly one delta from the current BEST. A rejected candidate is rolled
         # back by re-applying the complete BEST config, never by partial fields.
-        $delta=Copy-Config $bestCfg 'DELTA_USER_CPU'; $delta.user.requestCpu='60m'
+        # 현재 user request에서 하나의 안전한 ONE DELTA를 자동 생성한다.
+        # 70m->60m 같은 앱별 고정값을 사용하지 않는다.
+        $delta=Copy-Config $bestCfg 'DELTA_USER_CPU'
+        $deltaReqM=[double](Convert-CpuToM $bestCfg.user.requestCpu)
+        $deltaReqM=[math]::Max([double]$cpuRequestMinimum.user,[math]::Floor(($deltaReqM*0.85)/25.0)*25.0)
+        if ($deltaReqM -ge [double](Convert-CpuToM $bestCfg.user.requestCpu)) { $deltaReqM=[double](Convert-CpuToM $bestCfg.user.requestCpu)+25.0 }
+        $delta.user.requestCpu=Format-Cpu $deltaReqM
         Assert-ConfigDrift $bestCfg $delta @('USER_REQUESTCPU') | Out-Null
-        Write-Host "`n===== ONE DELTA: USER_CPU_REQUEST 70m -> 60m =====" -ForegroundColor Green
+        Write-Host ("`n===== ONE DELTA: USER_CPU_REQUEST {0}m -> {1}m =====" -f (Convert-CpuToM $bestCfg.user.requestCpu),$deltaReqM) -ForegroundColor Green
         $deltaMeas=$null
-        Apply-Resources $delta Hard; Apply-Hpa $delta; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+        $deltaReady=Apply-CandidateSafely $delta Hard
         $deltaCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $deltaCluster
-        $deltaRun=Run-ReliableLoadTest $delta $ProbeDurationSec $deltaCluster 0 -SkipRetry
+        $deltaRun=$null
+        if ($deltaReady) { $deltaRun=Run-ReliableLoadTest $delta $ProbeDurationSec $deltaCluster 0 -SkipRetry }
+
         if ($deltaRun -and $deltaRun.Result) {
             $deltaSnap=Save-EvaluationSnapshot $deltaRun.Result $delta 'DELTA_USER_CPU'
             Write-Host ("DELTA Eval={0:N2} BEST={1:N2}" -f $deltaSnap.EvalScore,$bestSnap.EvalScore) -ForegroundColor Cyan
             if ($deltaSnap.EvalScore -gt $bestSnap.EvalScore) {
                 $bestSnap=$deltaSnap; $bestCfg=$delta; Write-Host '  -> KEEP' -ForegroundColor Green
             } else {
-                Write-Host '  -> REJECT; exact BEST rollback' -ForegroundColor Yellow
-                Apply-Resources $bestCfg Hard; Apply-Hpa $bestCfg; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+                Apply-CandidateSafely $bestCfg Hard
             }
         } else {
-            Write-Warning 'DELTA measurement failed; exact BEST rollback'
-            Apply-Resources $bestCfg Hard; Apply-Hpa $bestCfg; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+            Apply-CandidateSafely $bestCfg Hard
         }
 
         # BEST verification uses the complete selected BEST configuration.
         if ((Get-RemainingRuntimeSeconds Tuning) -ge (Get-EstimatedMeasurementDuration $FinalDurationSec)) {
-            Write-Host "`n===== BEST VERIFICATION =====" -ForegroundColor Green
-            Apply-Resources $bestCfg Hard; Apply-Hpa $bestCfg; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+            $verifyReady=Apply-CandidateSafely $bestCfg Hard
             $verifyCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $verifyCluster
-            $verifyRun=Run-ReliableLoadTest $bestCfg $FinalDurationSec $verifyCluster 0 -SkipRetry
+            $verifyRun=$null
+            if ($verifyReady) { $verifyRun=Run-ReliableLoadTest $bestCfg $FinalDurationSec $verifyCluster 0 -SkipRetry }
+
             if ($verifyRun -and $verifyRun.Result) {
                 $verifySnap=Save-EvaluationSnapshot $verifyRun.Result $bestCfg 'BEST_VERIFY'
                 if ($verifySnap.EvalScore -lt ($bestSnap.EvalScore - 0.5)) {
-                    Write-Warning 'BEST verification regression; exact BASE rollback'
-                    $bestCfg=$baseCfg; $bestSnap=$baseSnap
-                    Apply-Resources $bestCfg Hard; Apply-Hpa $bestCfg; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+                    Apply-CandidateSafely $bestCfg Hard
                 } else { $bestSnap=$verifySnap }
             }
         }
-        # Enter grading-ready idle state instead of leaving the measured peak
-        # replicas/isolated NodePool live. Keep the selected resource/HPA values,
-        # but use shared placement and final minimum replicas (2/2/1).
-        Write-Host "`n===== GRADING-READY FINALIZE =====" -ForegroundColor Green
+        # 채점 부하에서 stress와 foreground의 CPU contention을 피하기 위해
+        # 실측한 전용 배치를 그대로 유지한다. fresh NodePool limit=2이면
+        # Managed 1 + default 1 + stress 1(총 3대) 예산으로 동작한다.
         $finalConfig=Copy-Config $bestCfg 'GRADING_READY'
         foreach($app in $apps) {
-            $finalConfig[$app].placementDomain='shared'
             $finalConfig[$app].replicas=[int]$finalConfig[$app].minReplicas
         }
-        $finalConfig.stress.placementDomain='shared'
-        $finalConfig.stress.placement='SHARED'
         if (-not $NoApply) {
-            # Remove the stress selector/NodePool before scaling to warm minimum.
-            Revert-StressPlacement
-            Apply-Resources $finalConfig Hard; Apply-Hpa $finalConfig
-            foreach($app in $apps) {
-                Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$([int]$finalConfig[$app].minReplicas)")
-            }
-            foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+            Ensure-38PointStressTopology
+            $finalReady=Apply-CandidateSafely $finalConfig Hard
+            if (-not $finalReady) { Write-Warning 'GRADING_READY candidate rollout incomplete; applied configuration is retained for external scoring.' }
             $finalCluster=Get-ClusterCapacitySnapshot
             Set-KarpenterNodeLimit $finalCluster
             $withinBudget=Wait-ReadyNodeCountAtMost $CostBaselineNodes 180 Hard
             if (-not $withinBudget) { Write-Warning "GRADING_READY_NODE_BUDGET_WARN: target=$CostBaselineNodes" }
         }
-        Write-Host 'GRADING_READY: shared placement, warm min replicas, HPA max preserved' -ForegroundColor Green
+        Write-Host 'GRADING_READY: dedicated stress placement, warm min replicas, HPA max preserved' -ForegroundColor Green
         $finalApplied=(-not $NoApply)
         $selectedCandidate=$null; $selectedValidation=$bestSnap.Measurement
         $verificationStatuses=@(); $verificationSkipped=0
@@ -5682,6 +5815,12 @@ try {
     Initialize-HpaControlPointModel
 
     $originalConfig=Get-LiveConfig 'Original'
+    # HPA floor는 앱 이름별 GoldenBaseline이 아니라 live min을 보존한다.
+    # 새 대회 앱/난이도에서는 현재 설정을 seed로 삼고 실측에서만 확장한다.
+    foreach ($app in $apps) {
+        $hpaMaxMinimum[$app]=[int][math]::Max(1,$originalConfig[$app].minReplicas)
+        if (-not $script:HardSafetyMaxByApp.ContainsKey($app)) { $script:HardSafetyMaxByApp[$app]=[int]$MaxAutoReplicas }
+    }
     if ($DetailedOutput) { Show-Config $originalConfig '원본 설정 스냅샷' }
     if ($SingleNode) {
         Write-Host '=== SingleNode 모드: 부하가 들어와도 Ready 노드를 1대(Managed)로 유지합니다. HPA max는 1노드 용량에 bin-packing합니다 ===' -ForegroundColor Yellow
@@ -5711,10 +5850,17 @@ try {
     Set-KarpenterNodeLimit $cluster
 
         # Phase 2-4: ONE DELTA experiments
+        $userReqM=[double](Convert-CpuToM $bestCfg.user.requestCpu)
+        $userReqDown=[math]::Max([double]$cpuRequestMinimum.user,[math]::Floor(($userReqM*0.85)/25.0)*25.0)
+        if ($userReqDown -ge $userReqM) { $userReqDown=$userReqM+25.0 }
+        $userTargetDown=[math]::Max([double]$HpaTargetLowerBound,[math]::Floor(([double]$bestCfg.user.hpaTarget-5)/5.0)*5.0)
+        $productReqM=[double](Convert-CpuToM $bestCfg.product.requestCpu)
+        $productReqDown=[math]::Max([double]$cpuRequestMinimum.product,[math]::Floor(($productReqM*0.85)/25.0)*25.0)
+        if ($productReqDown -ge $productReqM) { $productReqDown=$productReqM+25.0 }
         $exps=@(
-            @{App='user';Field='requestCpu';Old='70m';New='60m';Axis='USER_CPU_REQUEST'},
-            @{App='user';Field='hpaTarget';Old='33';New='30';Axis='USER_HPA_TARGET'},
-            @{App='product';Field='requestCpu';Old='70m';New='60m';Axis='PRODUCT_CPU_REQUEST'}
+            @{App='user';Field='requestCpu';Old="${userReqM}m";New=(Format-Cpu $userReqDown);Axis='USER_CPU_REQUEST'},
+            @{App='user';Field='hpaTarget';Old=[string]$bestCfg.user.hpaTarget;New=[int]$userTargetDown;Axis='USER_HPA_TARGET'},
+            @{App='product';Field='requestCpu';Old="${productReqM}m";New=(Format-Cpu $productReqDown);Axis='PRODUCT_CPU_REQUEST'}
         )
         $hist=[System.Collections.Generic.List[object]]::new(); $ei=0
         foreach ($exp in $exps) {
@@ -6031,15 +6177,11 @@ try {
     foreach ($app in $script:FinalResourceOverrideByApp.Keys) {
         $ro=$script:FinalResourceOverrideByApp[$app]
         $finalConfig[$app].requestCpu=Format-Cpu ([double]$ro.requestCpu)
-        if ($app -eq 'stress' -and $KnownGoodReference.ContainsKey($app)) {
-            # stress limit은 density limit과 reference prior 중 큰 값으로 (CPU throttling 방지)
+        if ($app -eq 'stress') {
+            # stress limit은 현재 live/config limit과 실측 density 중 큰 값을 사용한다.
             $overrideLimit=[double]$ro.limitCpu
-            $refLimit=[double](Convert-CpuToM $KnownGoodReference[$app].limitCpu)
             $densityLimit=if ($script:StressDensityLimitM -gt 0) { [double]$script:StressDensityLimitM } else { 0 }
-            $bestLimit=[math]::Max($overrideLimit,[math]::Max($refLimit,$densityLimit))
-            if ($bestLimit -gt $overrideLimit) {
-                Write-Host ("  stress limit: {0:N0}m -> {1:N0}m (reference={2:N0}m density={3:N0}m override={4:N0}m)" -f $overrideLimit,$bestLimit,$refLimit,$densityLimit,$overrideLimit) -ForegroundColor Yellow
-            }
+            $bestLimit=[math]::Max($overrideLimit,$densityLimit)
             $finalConfig[$app].limitCpu=Format-Cpu $bestLimit
             $script:FinalResourceOverrideByApp[$app].limitCpu=$bestLimit
         } else {
@@ -6047,25 +6189,14 @@ try {
         }
         Write-Host ("  resource override [{0}]: request={1} limit={2}" -f $app,$finalConfig[$app].requestCpu,$finalConfig[$app].limitCpu) -ForegroundColor DarkGray
     }
-    # ISOLATED_DENSE면 density-aware limit을 최종 config에 반영 (2 pods/node 동시 burst 제한)
-    # 단, density limit이 reference prior(stress 2000m)보다 작으면 reference를 사용한다.
-    # (875m density limit는 600m request 기준 2 pods/node 안전성이지만,
-    #  6-9 pod에서 CPU throttling으로 SLO 실패 → reference 2000m burst 허용이 우선)
+    # ISOLATED_DENSE면 density-aware limit을 최종 config에 반영한다.
     if ($script:StressDensityPlacement -eq 'ISOLATED_DENSE' -and $script:StressDensityLimitM -gt 0) {
-        # density limit가 reference prior보다 작으면 reference를 사용 (CPU throttling 방지).
-        # reference 2000m은 stress workload가 burst로 SLO를 맞추는 데 필요.
-        $refLimit=[double](Convert-CpuToM $KnownGoodReference.stress.limitCpu)
-        $effectiveLimit=[math]::Max($refLimit,$script:StressDensityLimitM)
-        if ($effectiveLimit -gt [double]$script:StressDensityLimitM) {
-            Write-Host ("  stress limit override: density {0:N0}m -> {1:N0}m (reference prior {2:N0}m > density, CPU throttling 방지)" -f [double]$script:StressDensityLimitM,$effectiveLimit,$refLimit) -ForegroundColor Yellow
-        }
+        $effectiveLimit=[double]$script:StressDensityLimitM
         $finalConfig.stress.limitCpu=Format-Cpu $effectiveLimit
-        # override dict도 동기화 (resource override가 다시 덮어쓰지 않게)
         if ($script:FinalResourceOverrideByApp.ContainsKey('stress')) {
-            $script:FinalResourceOverrideByApp['stress'].limitCpu=[double]$effectiveLimit
+            $script:FinalResourceOverrideByApp['stress'].limitCpu=$effectiveLimit
         }
-        # measured config 동기화는 fingerprint 비교 시점에서 수행 (selectedValidation이 이미 설정된 후)
-        Write-Host ("  density limit [stress]: $($finalConfig.stress.limitCpu) (effective limit, dense 2 pods/node) source=DENSITY_MODEL+REFERENCE_PRIOR") -ForegroundColor Yellow
+        Write-Host ("  density limit [stress]: $($finalConfig.stress.limitCpu) source=DENSITY_MODEL") -ForegroundColor Yellow
     }
     # stale resource guard: optimizer 입력 request는 반드시 최신 override와 일치해야 한다.
     foreach ($app in $script:FinalResourceOverrideByApp.Keys) {

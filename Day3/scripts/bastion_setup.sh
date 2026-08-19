@@ -238,7 +238,6 @@ spec:
         name: default
       expireAfter: 720h
   limits:
-    cpu: 1000
     memory: 1000Gi
   disruption:
     # 채점/부하 중 노드 회수로 인한 Pod 재배치와 timeout을 방지한다.
@@ -278,7 +277,6 @@ spec:
         name: default
       expireAfter: 720h
   limits:
-    cpu: 1000
     memory: 1000Gi
   disruption:
     consolidationPolicy: WhenEmpty

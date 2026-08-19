@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     2026 전국기능경기대회 Cloud 최종 점검 스크립트
 .DESCRIPTION

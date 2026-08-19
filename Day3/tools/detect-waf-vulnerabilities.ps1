@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$LogGroup = 'aws-waf-logs-wsi2026-cluster',
     [int]$Minutes = 15,

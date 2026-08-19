@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Cluster = 'wsi2026-cluster',
     [string]$Namespace = 'app',

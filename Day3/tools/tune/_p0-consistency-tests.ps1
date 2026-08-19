@@ -1,4 +1,4 @@
-# P0 Consistency Tests — 최종 테스트 스위트
+﻿# P0 Consistency Tests — 최종 테스트 스위트
 $ErrorActionPreference='Stop'
 $src=(Resolve-Path (Join-Path $PSScriptRoot '..\tune.ps1')).Path
 $tok=$null;$errs=$null

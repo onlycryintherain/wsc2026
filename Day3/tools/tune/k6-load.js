@@ -69,8 +69,8 @@ for (const app of ['user', 'product', 'stress']) {
 const upstream5xx = new Counter('upstream_5xx');
 
 function rateFor(app, totalRate) {
-  const userRate = Math.max(1, Math.round(totalRate * 0.30));
-  const productRate = Math.max(1, Math.round(totalRate * 0.30));
+  const userRate = Math.max(1, Math.round(totalRate * 0.50));
+  const productRate = Math.max(1, Math.round(totalRate * 0.35));
   if (app === 'user') return userRate;
   if (app === 'product') return productRate;
   return Math.max(1, totalRate - userRate - productRate);
@@ -110,9 +110,9 @@ function scenario(app, share) {
 export const options = {
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
   scenarios: {
-    user_api: scenario('user', 0.30),
-    product_api: scenario('product', 0.30),
-    stress_api: scenario('stress', 0.40),
+    user_api: scenario('user', 0.50),
+    product_api: scenario('product', 0.35),
+    stress_api: scenario('stress', 0.15),
   },
   thresholds: {
     http_req_failed: ['rate<=0.10'],

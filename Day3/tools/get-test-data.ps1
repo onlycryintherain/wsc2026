@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   load_user.dump가 SQL/JSON/CSV/텍스트로 바뀌어도 첫 사용자 정보를 추출한다.
 #>

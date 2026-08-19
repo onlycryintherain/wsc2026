@@ -188,6 +188,8 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-19 | pending | `tune.ps1` 범용화 — GoldenBaseline/앱별 request·HPA floor를 강제하지 않고 live Deployment/HPA를 seed로 사용, 실측 CPU/HPA 제어점·stress limit·노드 예산을 앱 난이도에 맞춰 재계산 |
+
 | 날짜 | 커밋 | 변경 요약 |
 | 2026-08-18 | pending | `bastion_setup.sh`/EKS Launch Template에 38점 기준 반영 — CNI prefix+warm prefix, MNG/Karpenter maxPods=110, user/product 70m·256Mi, stress 600m·2CPU·dedicated NodePool, HPA 33/29/55 및 20/20/6 |
 | 2026-08-18 | pending | `tools/apply-38point.ps1` 추가 — CNI prefix delegation, maxPods=110, user/product/stress 38점 리소스/HPA, stress dedicated NodePool/taint/selector를 재현하고 MNG Launch Template 갱신은 명시적 opt-in |
