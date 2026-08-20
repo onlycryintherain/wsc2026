@@ -1068,7 +1068,8 @@ function Get-LiveConfig([string]$name = 'original') {
         $config[$app] = @{
             requestCpu=[string]$resources.requests.cpu
             requestMemory=[string]$resources.requests.memory
-            limitCpu=$(if ($resources.limits.cpu) { [string]$resources.limits.cpu } else { $null })
+            # Kubernetes canonicalizes 2000m as "2"; normalize before fingerprint comparison.
+            limitCpu=$(if ($resources.limits.cpu) { Format-Cpu (Convert-CpuToM $resources.limits.cpu) } else { $null })
             limitMemory=$(if ($resources.limits.memory) { [string]$resources.limits.memory } else { $null })
             minReplicas=[int]$hpa.spec.minReplicas
             maxReplicas=[int]$hpa.spec.maxReplicas
@@ -5880,10 +5881,12 @@ try {
             if (-not $script:HardSafetyMaxByApp.ContainsKey($app)) { $script:HardSafetyMaxByApp[$app]=[int]$MaxAutoReplicas }
         }
         $baseCfg=Copy-Config $baseSeed 'BASE'; foreach($app in $apps){$baseCfg[$app].replicas=[int]$baseCfg[$app].minReplicas}
+        foreach($app in $apps){ Write-Host ("BASE candidate {0}: req={1}/{2} limit={3}/{4} HPA={5}..{6}" -f $app,$baseCfg[$app].requestCpu,$baseCfg[$app].requestMemory,$baseCfg[$app].limitCpu,$baseCfg[$app].limitMemory,$baseCfg[$app].minReplicas,$baseCfg[$app].maxReplicas) -ForegroundColor DarkGray }
         if (-not $NoApply) { Ensure-38PointStressTopology -ApplyPlacement }
         $baseReady=Apply-CandidateSafely $baseCfg Hard
         if (-not $baseReady) { throw 'BASE candidate가 Ready 상태가 되지 않아 측정할 수 없습니다.' }
         $baseLive=Get-LiveConfig 'BASE_LIVE_VERIFY'
+        foreach($app in $apps){ Write-Host ("BASE live {0}: req={1}/{2} limit={3}/{4} HPA={5}..{6}" -f $app,$baseLive[$app].requestCpu,$baseLive[$app].requestMemory,$baseLive[$app].limitCpu,$baseLive[$app].limitMemory,$baseLive[$app].minReplicas,$baseLive[$app].maxReplicas) -ForegroundColor DarkGray }
         $baseDiff=@(Compare-Config $baseCfg $baseLive @())
         if ($baseDiff.Count -ne 0) { throw "BASE_CONFIG_DRIFT: $([string]::Join(',',@($baseDiff | ForEach-Object { $_.App+'.'+$_.Field })))" }
         Write-Host 'BASE_CONFIG_EXACT: live fingerprint matches immutable BaseConfig' -ForegroundColor Green
