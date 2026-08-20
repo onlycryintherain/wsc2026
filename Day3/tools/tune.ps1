@@ -1265,6 +1265,9 @@ function Apply-CandidateSafely([hashtable]$config,[ValidateSet('Hard','Tuning')]
             Write-Warning "candidate available 대기 timeout($app): $($_.Exception.Message)"
         }
     }
+    # HPA controllers and the freeze phase can race during rollout. Re-apply the
+    # candidate after readiness so the exact candidate fingerprint is what is measured.
+    Apply-Hpa $config
     return $allReady
 }
 
