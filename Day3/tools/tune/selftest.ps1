@@ -26,7 +26,7 @@ if ($BaseExperiment) {
         if ($st.requestCpu -ne '600m') { throw 'stress req' }
         if ($null -ne $st.limitCpu) { throw 'stress CPU limit not null' }
         if ($st.hpaTarget -ne 55) { throw 'stress target' }
-        if ($st.maxReplicas -ne 12) { throw 'stress max' }
+        if ($st.maxReplicas -ne 8) { throw 'stress max' }
     }
 
     # TEST 2: hpaMaxMinimum does not mutate BaseConfig
