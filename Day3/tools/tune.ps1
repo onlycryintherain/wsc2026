@@ -4275,9 +4275,14 @@ function Run-LoadTest([hashtable]$config,[int]$durationSec,$cluster,[switch]$Pre
         $appDropped=$appDroppedIterations[$app]
         $appDenominator=[double]$appResults[$app].Requests+$(if ($null -ne $appDropped) { [double]$appDropped } else { 0.0 })
         $appLoadRate=if ($appDenominator -gt 0) { [double]$appResults[$app].SuccessfulRequests/$appDenominator } else { 0 }
+        # k6-load.js와 동일한 trafficShare( user 50%, product 35%, stress 잔여 )를
+        # 사용한다. 기존 30% 고정식은 stress를 24rps로 잘못 계산해 실제 9rps를
+        # 720/270=37%로 오판하는 LOAD_GENERATOR_LIMIT 버그를 만들었다.
         $expectedAppRate=if ($app -eq 'stress') {
-            [math]::Max(1,$TargetRate-[math]::Max(1,[math]::Round($TargetRate*0.30))*2)
-        } else { [math]::Max(1,[math]::Round($TargetRate*0.30)) }
+            $userRate=[math]::Max(1,[math]::Round($TargetRate*[double]$trafficShare.user))
+            $productRate=[math]::Max(1,[math]::Round($TargetRate*[double]$trafficShare.product))
+            [math]::Max(1,$TargetRate-$userRate-$productRate)
+        } else { [math]::Max(1,[math]::Round($TargetRate*[double]$trafficShare[$app])) }
         # 분자(steady 실제 생성)와 분모(steady target)는 반드시 같은 window를 쓴다.
         # retry warmup이 steady 시작을 밀었으면 실제 steady window로 보정한다(30s 고정 금지).
         $effectiveSteadyWindow=[math]::Max(0,[math]::Min([double]$SteadyDurationSec,[double]$loadWindowSec-$steadyStartSec))
