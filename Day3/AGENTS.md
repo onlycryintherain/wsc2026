@@ -190,6 +190,7 @@ terraform plan -var-file=terraform.tfvars
 
 | 2026-08-21 | pending | `tune.ps1 -PerformanceGateOnly`를 통해 HPA/request/limit을 스크립트로만 적용하고, CNI IP 할당 실패 대응으로 10.0.4.0/22·10.0.8.0/22 pod-capacity subnet을 추가. Node Type/RDS Instance Type은 유지. Default-spike2 10분 실측: 성능 11/12, user 89.39%, product 112.14%, stress 88.32%, 총 27/40(평균 EC2 9.45로 비용 0). | 
 | 2026-08-21 | pending | 저트래픽 min=2, 빠른 HPA scale-up(15초), 5분 scale-down stabilization을 `tune.ps1`에 반영. 동일 프로필 Default/Default-spike2/순차증가를 수용하며, 리소스 소실 시 즉시 중지·JSON 기록하는 `RESOURCE_LOSS_STOP` guard 추가. Adaptive Default-spike2 15분: 성능 10.5/12, user 89.46%, product 111.88%, stress 85.64%, 총 26.5/40. |
+| 2026-08-21 | pending | `skills-server:8003` 3개 프로필 실측 완료 — Default 28/40(성능 12/12, user 99.21%, stress 90.93%), Default-spike2 26/40(성능 10/12, user 90.19%, stress 80.56%), 순차증가 27/40(성능 11/12, user 88.12%, stress 87.85%). 리소스 소실 없음. `-ProfileSweepOnly`에 3개 프로필 순차 실행·조기중지 재시작·소실 기록을 추가. |
 | 2026-08-20 | superseded | 3대 프로필 실측 — stress 성능 4.69%, user 8.51%로 성능 게이트 실패. 600m stress 6개를 안정적으로 수용하려면 stress NodePool 3대분(CPU 6)이 필요함을 확인 |
 | 2026-08-20 | pending | 안정 프로필로 전환 — default CPU 2, stress CPU 6(전용 3대), HPA user/product 2~20·stress 1~6, 저부하 consolidation 5m 유지 |
 | 2026-08-20 | pending | spike2 결과 반영 — stress HPA 6개 중 3개만 Ready, stress 5xx 175건·P95 30초로 확인되어 NodePool stress 한도를 4 CPU(2대분)로 확대해 총 4대까지 허용하고 request 500m 기준을 소스에 반영 |

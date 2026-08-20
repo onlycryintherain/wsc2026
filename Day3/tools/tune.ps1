@@ -80,7 +80,10 @@ param(
     [switch]$SelfTestOnly,
     # Apply only the measured performance-gate profile. All app HPA/resource
     # values are still changed through this script (never ad-hoc kubectl).
-    [switch]$PerformanceGateOnly
+    [switch]$PerformanceGateOnly,
+    # Run the external grading server's three named profiles sequentially.
+    [switch]$ProfileSweepOnly,
+    [string]$LoadServer = 'http://skills-server:8003'
 )
 
 # Safe default: BASE-first pipeline is the normal path. Legacy adaptive behavior
@@ -5913,6 +5916,40 @@ function New-ExperimentCandidate([hashtable]$bestConfig,$recommendation,[string]
     return $candidate
 }
 
+function Invoke-ExternalProfileSweep {
+    $profiles=@('Default','Default-spike2','순차증가')
+    $results=[System.Collections.Generic.List[object]]::new()
+    foreach ($profileName in $profiles) {
+        Write-Host "`n===== EXTERNAL PROFILE: $profileName =====" -ForegroundColor Cyan
+        $body=@{template=$profileName} | ConvertTo-Json -Compress
+        $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
+        $runId=[string]$run.run_id; $started=Get-Date; $expected=[int]([double](Get-OptionalPropertyValue $run 'expected_end_min' 15)*60)
+        $restarts=0
+        while (((Get-Date)-$started).TotalSeconds -lt ($expected+120)) {
+            Start-Sleep -Seconds 30
+            $status=Invoke-RestMethod -Uri ("$LoadServer/api/load/status") -TimeoutSec 20
+            $score=Invoke-RestMethod -Uri ("$LoadServer/api/score") -TimeoutSec 20
+            try { Assert-RequiredResourcesPresent } catch {
+                try { Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/stop") -Body '{}' -ContentType 'application/json' -TimeoutSec 20 | Out-Null } catch { }
+                Stop-AndRecordResourceLoss ("profile=$profileName; run=$runId; $($_.Exception.Message)") ([pscustomobject]@{Status=$status;Score=$score})
+            }
+            Write-Host ("{0}: elapsed={1}s score={2} performance={3}" -f $profileName,$status.elapsed_sec,$score.total40,$score.performance.score) -ForegroundColor DarkGray
+            if ([string]$status.run_id -ne $runId) { throw "PROFILE_RUN_CHANGED: $profileName" }
+            if (-not [bool]$status.running) {
+                if ([int]$status.elapsed_sec -lt [math]::Max(120,$expected-60) -and $restarts -lt 1) {
+                    $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
+                    $runId=[string]$run.run_id; $started=Get-Date; $restarts++; Write-Warning "조기 중지 감지: $profileName 재시작($restarts)"; continue
+                }
+                $results.Add([pscustomobject]@{Profile=$profileName;RunId=$runId;Score=$score;Status=$status;Restarts=$restarts}); break
+            }
+        }
+    }
+    New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+    $path=Join-Path $OutputDir 'profile-sweep-results.json'
+    $results | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $path -Encoding UTF8
+    Write-Host "PROFILE_SWEEP_COMPLETE: $path" -ForegroundColor Green
+}
+
 Require kubectl;Require k6;Require $script:curlCmd;Require aws
 if (-not $SkipKubeconfig) {
     Write-Host "[tune] kubeconfig 갱신: aws eks update-kubeconfig --name $ClusterName --region $Region" -ForegroundColor Cyan
@@ -5931,9 +5968,9 @@ if ($ProbeDurationSec -lt $minimumProfileDuration -or $FinalDurationSec -lt $min
 try {
     Initialize-EndpointAndData
     if (-not [string]::IsNullOrWhiteSpace($ExternalResultDir)) { Import-ExternalEvidence | Out-Null }
-    if ($PerformanceGateOnly) {
+    if ($PerformanceGateOnly -or $ProfileSweepOnly) {
         if (-not $script:Is38PointAppSet) { throw 'PERFORMANCE_GATE_PROFILE requires user/product/stress app set' }
-        Write-Host "`n========== PERFORMANCE GATE ONLY ==========" -ForegroundColor Green
+        Write-Host "`n========== PERFORMANCE GATE PROFILE ==========" -ForegroundColor Green
         # This is the sole source of HPA/request/limit values for this mode.
         # Keep enough replicas warm before the external peak profile starts.
         $gate=Copy-Config $BaseConfig 'PERFORMANCE_GATE'
@@ -5955,6 +5992,7 @@ try {
             Assert-MeasurementReady 180
         }
         Write-Host 'PERFORMANCE_GATE_READY: HPA/resources applied by tune.ps1; capacity retained.' -ForegroundColor Green
+        if ($ProfileSweepOnly) { Invoke-ExternalProfileSweep }
         return
     }
     if ($BaseExperiment -and -not $LegacyAdaptive) {
