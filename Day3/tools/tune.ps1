@@ -37,10 +37,11 @@ param(
     [ValidateRange(1, 20)][int]$ManagedNodes = 1,
     [ValidateRange(1, 20)][int]$CostBaselineNodes = 3,
     [ValidateRange(2, 30)][int]$MaxAutoReplicas = 12,
-    # 총 동시성은 기본 32로 제한한다. 64 이상은 stress OOM/timeout을 유발할 수 있다.
-    [ValidateRange(1, 1000)][int]$PreAllocatedVUs = 32,
-    [ValidateRange(1, 2000)][int]$MaxVUs = 32,
-    [ValidateRange(32, 2000)][int]$MaxGeneratorVUs = 512,
+    # arrival-rate 목표를 생성할 수 있도록 VU 여유를 확보한다.
+    # 요청률/Stress length는 변경하지 않고 k6 generator saturation만 방지한다.
+    [ValidateRange(1, 1000)][int]$PreAllocatedVUs = 128,
+    [ValidateRange(1, 2000)][int]$MaxVUs = 512,
+    [ValidateRange(32, 2000)][int]$MaxGeneratorVUs = 600,
     [ValidateRange(1.0, 3.0)][double]$VUSafetyFactor = 1.30,
     [ValidateRange(15, 60)][int]$WarmupDurationSec = 20,
     [ValidateRange(20, 60)][int]$SteadyDurationSec = 30,
