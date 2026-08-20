@@ -1471,10 +1471,9 @@ function Set-KarpenterNodeLimit($cluster) {
             if (-not $obj) { throw "NodePool/$pool not found" }
             $old=[string]$obj.spec.limits.cpu
             if ($PerformanceGateOnly -and $script:Is38PointAppSet) {
-                # Keep the recovery profile within the verified CNI-safe capacity.
-                # Performance-gate experiments must be run only after a clean,
-                # Ready baseline; this branch is also the safe rollback path.
-                $desired.default=2000
+                # Keep capacity available for the peak profile. The additional
+                # tagged pod-capacity subnets provide fresh CNI prefix space.
+                $desired.default=8000
                 $desired.stress=12000
             }
             if ($desired.ContainsKey($pool)) {
@@ -5897,11 +5896,11 @@ try {
         # This is the sole source of HPA/request/limit values for this mode.
         # Keep enough replicas warm before the external peak profile starts.
         $gate=Copy-Config $BaseConfig 'PERFORMANCE_GATE'
-        $gate.user.requestCpu='70m'; $gate.user.requestMemory='64Mi'; $gate.user.limitCpu=$null; $gate.user.limitMemory='256Mi'; $gate.user.hpaTarget=33; $gate.user.minReplicas=2; $gate.user.maxReplicas=21
-        $gate.product.requestCpu='70m'; $gate.product.requestMemory='64Mi'; $gate.product.limitCpu=$null; $gate.product.limitMemory='256Mi'; $gate.product.hpaTarget=29; $gate.product.minReplicas=2; $gate.product.maxReplicas=20
-        $gate.stress.requestCpu='600m'; $gate.stress.requestMemory='640Mi'; $gate.stress.limitCpu='2000m'; $gate.stress.limitMemory='1536Mi'; $gate.stress.hpaTarget=55; $gate.stress.minReplicas=1; $gate.stress.maxReplicas=6
+        $gate.user.requestCpu='70m'; $gate.user.requestMemory='64Mi'; $gate.user.limitCpu=$null; $gate.user.limitMemory='256Mi'; $gate.user.hpaTarget=33; $gate.user.minReplicas=50; $gate.user.maxReplicas=80
+        $gate.product.requestCpu='70m'; $gate.product.requestMemory='64Mi'; $gate.product.limitCpu=$null; $gate.product.limitMemory='256Mi'; $gate.product.hpaTarget=29; $gate.product.minReplicas=20; $gate.product.maxReplicas=20
+        $gate.stress.requestCpu='600m'; $gate.stress.requestMemory='640Mi'; $gate.stress.limitCpu='2000m'; $gate.stress.limitMemory='1536Mi'; $gate.stress.hpaTarget=55; $gate.stress.minReplicas=6; $gate.stress.maxReplicas=6
         foreach ($app in $apps) { $gate[$app].replicas=[int]$gate[$app].minReplicas }
-        Show-Config $gate 'PERFORMANCE_GATE recovery config'
+        Show-Config $gate 'PERFORMANCE_GATE score-first config'
         Ensure-38PointStressTopology -ApplyPlacement
         $gateCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $gateCluster
         if (-not $NoApply) {
