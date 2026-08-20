@@ -1662,7 +1662,48 @@ function Test-ToleratesTaint($template, $taint) {
     return $false
 }
 
+function Stop-AndRecordResourceLoss([string]$Reason, [object]$Snapshot = $null) {
+    $stamp=Get-Date -Format 'yyyyMMdd-HHmmss'
+    try {
+        New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+        $payload=[pscustomobject]@{
+            Timestamp=(Get-Date -Format o); Reason=$Reason; Snapshot=$Snapshot
+            Cluster=$ClusterName; Namespace=$Namespace; ProfileSweep=$true
+        }
+        $path=Join-Path $OutputDir "resource-loss-$stamp.json"
+        $payload | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $path -Encoding UTF8
+        Write-Error "RESOURCE_LOSS_STOP: $Reason (기록=$path)"
+    } catch { Write-Error "RESOURCE_LOSS_STOP: $Reason (기록 실패: $($_.Exception.Message))" }
+    throw "RESOURCE_LOSS_STOP: $Reason"
+}
+
+function Assert-RequiredResourcesPresent {
+    try {
+        $nodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
+        $ready=@($nodes.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count })
+        $deploy=((& kubectl -n $Namespace get deploy -o json) -join '') | ConvertFrom-Json
+        $hpa=((& kubectl -n $Namespace get hpa -o json) -join '') | ConvertFrom-Json
+        $pools=((& kubectl get nodepool -o json) -join '') | ConvertFrom-Json
+        $missing=[System.Collections.Generic.List[string]]::new()
+        foreach ($app in $apps) {
+            if (@($deploy.items | Where-Object { $_.metadata.name -eq $app }).Count -eq 0) { $missing.Add("deployment/$app") }
+            if (@($hpa.items | Where-Object { $_.metadata.name -eq $app }).Count -eq 0) { $missing.Add("hpa/$app") }
+        }
+        foreach ($pool in @('default','stress')) {
+            if (@($pools.items | Where-Object { $_.metadata.name -eq $pool }).Count -eq 0) { $missing.Add("nodepool/$pool") }
+        }
+        if ($ready.Count -lt [math]::Max(1,$ManagedNodes)) { $missing.Add("ready-nodes<$ManagedNodes") }
+        if ($missing.Count -gt 0) { Stop-AndRecordResourceLoss ($missing -join ',') }
+    } catch {
+        if ($_.Exception.Message -like 'RESOURCE_LOSS_STOP:*') { throw }
+        Stop-AndRecordResourceLoss $_.Exception.Message
+    }
+}
+
 function Get-ClusterCapacitySnapshot {
+    # Called before every measurement/capacity decision. If AWS/Kubernetes
+    # resources disappear mid-sweep, stop immediately and leave a JSON record.
+    Assert-RequiredResourcesPresent
     $nodes = (& kubectl get nodes -o json) | ConvertFrom-Json
     $readyNodes = @($nodes.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count })
     if (-not $readyNodes.Count) { throw 'Ready Node가 없습니다.' }
@@ -5896,10 +5937,13 @@ try {
         # This is the sole source of HPA/request/limit values for this mode.
         # Keep enough replicas warm before the external peak profile starts.
         $gate=Copy-Config $BaseConfig 'PERFORMANCE_GATE'
-        $gate.user.requestCpu='70m'; $gate.user.requestMemory='64Mi'; $gate.user.limitCpu=$null; $gate.user.limitMemory='256Mi'; $gate.user.hpaTarget=33; $gate.user.minReplicas=50; $gate.user.maxReplicas=80
-        $gate.product.requestCpu='70m'; $gate.product.requestMemory='64Mi'; $gate.product.limitCpu=$null; $gate.product.limitMemory='256Mi'; $gate.product.hpaTarget=29; $gate.product.minReplicas=20; $gate.product.maxReplicas=20
-        $gate.stress.requestCpu='600m'; $gate.stress.requestMemory='640Mi'; $gate.stress.limitCpu='2000m'; $gate.stress.limitMemory='1536Mi'; $gate.stress.hpaTarget=55; $gate.stress.minReplicas=6; $gate.stress.maxReplicas=6
-        foreach ($app in $apps) { $gate[$app].replicas=[int]$gate[$app].minReplicas }
+        $gate.user.requestCpu='70m'; $gate.user.requestMemory='64Mi'; $gate.user.limitCpu=$null; $gate.user.limitMemory='256Mi'; $gate.user.hpaTarget=33; $gate.user.minReplicas=2; $gate.user.maxReplicas=80
+        $gate.product.requestCpu='70m'; $gate.product.requestMemory='64Mi'; $gate.product.limitCpu=$null; $gate.product.limitMemory='256Mi'; $gate.product.hpaTarget=29; $gate.product.minReplicas=2; $gate.product.maxReplicas=20
+        $gate.stress.requestCpu='600m'; $gate.stress.requestMemory='640Mi'; $gate.stress.limitCpu='2000m'; $gate.stress.limitMemory='1536Mi'; $gate.stress.hpaTarget=55; $gate.stress.minReplicas=1; $gate.stress.maxReplicas=8
+        $fastScaleUp=@{stabilizationWindowSeconds=0;selectPolicy='Max';policies=@(@{type='Percent';value=100;periodSeconds=15},@{type='Pods';value=20;periodSeconds=15})}
+        $slowScaleDown=@{stabilizationWindowSeconds=300;selectPolicy='Min';policies=@(@{type='Percent';value=25;periodSeconds=60})}
+        foreach ($app in $apps) { $gate[$app].behavior=@{scaleUp=$fastScaleUp;scaleDown=$slowScaleDown}; $gate[$app].replicas=[int]$gate[$app].minReplicas }
+        $script:HpaBehaviorAction=@{user='TUNE_SCALE_UP';product='TUNE_SCALE_UP';stress='TUNE_SCALE_UP'}
         Show-Config $gate 'PERFORMANCE_GATE score-first config'
         Ensure-38PointStressTopology -ApplyPlacement
         $gateCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $gateCluster
