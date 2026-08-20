@@ -278,10 +278,10 @@ resource "aws_s3_object" "apply_sh" {
 }
 
 resource "aws_s3_object" "book_binary" {
-  bucket = aws_s3_bucket.manifest.id
-  key    = "book"
-  source = "${path.root}/docker/book"
-  etag   = filemd5("${path.root}/docker/book")
+  bucket      = aws_s3_bucket.manifest.id
+  key         = "book"
+  source      = "${path.root}/docker/book"
+  source_hash = filemd5("${path.root}/docker/book")
 }
 
 resource "aws_s3_object" "dockerfile" {
