@@ -4178,6 +4178,12 @@ function Run-LoadTest([hashtable]$config,[int]$durationSec,$cluster,[switch]$Pre
         $env:PRE_ALLOCATED_VUS=$PreAllocatedVUs; $env:MAX_VUS=$MaxVUs
         # VU Retry warmup(초). 0이면 k6 프로필에 warmup 구간이 추가되지 않는다.
         $env:RETRY_WARMUP_SECONDS=[string]$(if ($null -ne $script:retryWarmupSeconds -and [int]$script:retryWarmupSeconds -gt 0) { [int]$script:retryWarmupSeconds } else { 0 })
+        # Stress는 latency가 긴 arrival-rate 시나리오라 planner의 초기 max(예: 63)가
+        # 목표 생성률을 막을 수 있다. MaxVUs를 stress scenario의 hard floor로 적용한다.
+        # 요청률/length는 변경하지 않고 generator saturation만 방지한다.
+        if ($apps -contains 'stress' -and $vuPlan.Apps.stress.Max -lt $MaxVUs) {
+            $vuPlan.Apps.stress.Max=[int]$MaxVUs
+        }
         foreach ($app in $apps) {
             $upper=$app.ToUpperInvariant()
             [Environment]::SetEnvironmentVariable("${upper}_PRE_ALLOCATED_VUS",[string]$vuPlan.Apps[$app].PreAllocated,'Process')
