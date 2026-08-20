@@ -348,9 +348,10 @@ foreach ($app in @('user','product','stress')) {
 }
 $KnownGoodReference = $GoldenBaseline.Apps
 # HardSafetyMax: cluster absolute ceiling (node budget과 무관 — maxPods/placement/앱 안전 기준)
-# user/product max=20은 reference prior (max≠reservation — 실제 Pod/Node lifetime으로만 비용 계산)
-# 앱별 안전 상한. 실제 선택은 측정된 quality/score/cost 후보로 결정한다.
-$script:HardSafetyMaxByApp=@{user=20;product=20;stress=12}
+# BASE keeps user/product max=20. Peak2 reached user max=20 with CPU≈86%
+# and SLO collapse, so ONE-DELTA experiments may test user HPA 21..30.
+# Product remains at the verified max=20; final selection still uses measured score/cost.
+$script:HardSafetyMaxByApp=@{user=30;product=20;stress=12}
 # ELASTIC_DENSITY_REQUEST 대상 (burst 허용 + HPA 분산): user/product. GUARANTEED: stress.
 $script:ElasticDensityApps=@('user','product')
 $WarmReplicaHardCap = 3            # burst warm replica 최대 (전역 cap, 앱별 하드코딩 아님)
