@@ -1,4 +1,4 @@
-﻿
+
 # ============================================================
 # SELF TESTS (BASE EXPERIMENT MODE)
 # ============================================================
@@ -24,7 +24,7 @@ if ($BaseExperiment) {
         if ($p.hpaTarget -ne 29) { throw 'product target' }
         if ($p.maxReplicas -ne 20) { throw 'product max' }
         if ($st.requestCpu -ne '600m') { throw 'stress req' }
-        if ($st.limitCpu -ne '2000m') { throw 'stress limit' }
+        if ($null -ne $st.limitCpu) { throw 'stress CPU limit not null' }
         if ($st.hpaTarget -ne 55) { throw 'stress target' }
         if ($st.maxReplicas -ne 6) { throw 'stress max' }
     }

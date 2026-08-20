@@ -111,7 +111,7 @@ $BaseConfig = @{
     }
     stress = @{
         requestCpu = '600m'; requestMemory = '640Mi'
-        limitCpu = '2000m'; limitMemory = '1536Mi'
+        limitCpu = $null; limitMemory = '1536Mi'
         hpaTarget = 55; minReplicas = 1; maxReplicas = 6
         placement = 'ISOLATED'; placementDomain = 'dedicated'
     }
@@ -229,7 +229,7 @@ process.stdout.write(JSON.stringify({duration_seconds:d.duration_seconds,cost_de
 # 1150m이라 c5.large 관측 app budget 1180m 안에 1 Pod씩 들어가며,
 # 더 작은 실제 노드에서는 Enforce-IdleBudget이 기존 하한까지 자동 축소한다.
 $cpuRequestStart = @{ user=150.0; product=75.0; stress=925.0 }
-$cpuLimitStart = @{ user=$null; product=$null; stress=2000.0 }  # P0-6: user/product CPU limit optional (0=제거), stress 2000m reference prior
+$cpuLimitStart = @{ user=$null; product=$null; stress=$null }  # CPU limit 제거: request만으로 burst 허용, memory limit은 유지
 $memoryRequestStart = @{ user=64.0; product=64.0; stress=640.0 }
 $memoryLimitStart = @{ user=128.0; product=256.0; stress=1536.0 }  # Golden baseline: product 256Mi
 # 관측된 앱 비용과 보호 정책은 서로 다르다.
@@ -334,7 +334,7 @@ $GoldenBaseline = @{
     Apps = @{
         user    = @{ requestCpu='70m';  limitCpu=$null;   limitMemory='256Mi';  hpaTarget=33; minReplicas=2; maxReplicas=20; placement='SHARED' }
         product = @{ requestCpu='70m';  limitCpu=$null;   limitMemory='256Mi';  hpaTarget=29; minReplicas=2; maxReplicas=20; placement='SHARED' }
-        stress  = @{ requestCpu='600m'; limitCpu='2000m'; limitMemory='1536Mi'; hpaTarget=55; minReplicas=1; maxReplicas=6;  placement='ISOLATED' }
+        stress  = @{ requestCpu='600m'; limitCpu=$null;   limitMemory='1536Mi'; hpaTarget=55; minReplicas=1; maxReplicas=6;  placement='ISOLATED' }
     }
 }
 $KnownGoodReference = $GoldenBaseline.Apps
@@ -1054,8 +1054,8 @@ function Get-LiveConfig([string]$name = 'original') {
         $hpa = $hpas.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1
         if (-not $deployment -or -not $hpa) { throw "필수 Deployment/HPA를 찾지 못했습니다: $app" }
         $resources = $deployment.spec.template.spec.containers[0].resources
-        foreach ($value in @($resources.requests.cpu,$resources.requests.memory)) {
-            if (-not $value) { throw "$app resources의 requests/limits가 모두 필요합니다." }
+        if (-not $resources.requests -or -not $resources.requests.cpu -or -not $resources.requests.memory) {
+            throw "$app resources.requests.cpu/memory가 필요합니다. CPU limit은 user/product에서 의도적으로 생략할 수 있습니다."
         }
         $target = $hpa.spec.metrics | Where-Object { $_.type -eq 'Resource' -and $_.resource.name -eq 'cpu' } | Select-Object -First 1
         if (-not $target) { throw "$app HPA CPU metric을 찾지 못했습니다." }
@@ -1095,17 +1095,9 @@ function Set-RequiredPolicy([hashtable]$source,[string]$name,[hashtable]$desired
         $requestM=[math]::Max([double]$cpuRequestMinimum[$app],[double]$existingReq)
 
         $existingLimit=Convert-CpuToM $config[$app].limitCpu
-        # CPU limit 정책: 실제 evidence로 동적 결정.
-        # stress: limit 유지 (burst 보존, proportional reduction 금지).
-        # user/product: throttling evidence 없으면 limit 제거 (CFS 해소).
-        # 기존 limit이 있으면: throttle ratio/slo/oom으로 판단.
-        if ($app -eq 'stress') {
-            $limitM=if ($existingLimit -gt 0) { [double]$existingLimit } else { 0 }
-        } else {
-            # user/product: reliable measurement에서 throttling 없으면 limit 제거.
-            # 기본: 기존 limit 유지. 후에 리소스 right-sizing에서 evidence 기반 판단.
-            $limitM=if ($existingLimit) { [double]$existingLimit } else { 0 }
-        }
+        # CPU limit은 모든 앱에서 제거한다. request만으로 burst를 허용하고
+        # CPU throttling을 피한다. memory limit은 별도로 유지한다.
+        $limitM=0
         # K8s invariant: request ≤ limit. limit이 있으면 request는 limit 이하로.
         if ($limitM -gt 0 -and $requestM -gt $limitM) {
             Write-Host ("  {0}: request {1:N0}m → {2:N0}m (limit {2:N0}m 초과 → request 축소)" -f $app,$requestM,$limitM) -ForegroundColor Yellow
@@ -3763,7 +3755,7 @@ function Apply-TuningActions([hashtable]$source,$profile,[string]$name,$cluster=
     foreach ($app in $script:FinalResourceOverrideByApp.Keys) {
         $ro=$script:FinalResourceOverrideByApp[$app]
         $config[$app].requestCpu=Format-Cpu ([double]$ro.requestCpu)
-        $config[$app].limitCpu=Format-Cpu ([double]$ro.limitCpu)
+        $config[$app].limitCpu=$null  # CPU limit 정책: 모든 앱에서 제거
     }
     $actions=[System.Collections.Generic.List[object]]::new()
     foreach ($app in $apps) {
@@ -3771,39 +3763,32 @@ function Apply-TuningActions([hashtable]$source,$profile,[string]$name,$cluster=
         $actions.Add($action)
         switch ($action.Type) {
             'INCREASE_MEMORY_LIMIT' { $config[$app].limitMemory=Format-Memory ([double]$action.To) ([int][math]::Ceiling([double]$action.To)) }
-            'INCREASE_CPU_LIMIT' { $config[$app].limitCpu=Format-Cpu ([double]$action.To) }
+            'INCREASE_CPU_LIMIT' { $config[$app].limitCpu=$null }
             'INCREASE_HPA_MAX' { $config[$app].maxReplicas=[int]$action.To }
-            'REDUCE_CPU_LIMIT' {
-                # 채점 burst 대비 안전망: user/product는 500m 또는 request x 2.5 미만으로 내리지 않는다.
-                $minLimit=if ($app -eq 'stress') { [double](Convert-CpuToM $config[$app].requestCpu) } else { [math]::Max(500.0,(Convert-CpuToM $config[$app].requestCpu)*2.5) }
-                $config[$app].limitCpu=Format-Cpu ([math]::Max([double]$action.To,$minLimit))
-            }
-            'INCREASE_CPU_LIMIT_FOR_BURST' { $config[$app].limitCpu=Format-Cpu ([double]$action.To) }
+            'REDUCE_CPU_LIMIT' { $config[$app].limitCpu=$null }
+            'INCREASE_CPU_LIMIT_FOR_BURST' { $config[$app].limitCpu=$null }
             'REDUCE_CPU_REQUEST' {
                 # 현재 앱의 안전 하한만 적용한다. reference profile의 request는 사용하지 않는다.
                 $reqAfter=[math]::Max([double]$cpuRequestMinimum[$app],[double]$action.To)
                 $config[$app].requestCpu=Format-Cpu $reqAfter
                 $reqM=[double](Convert-CpuToM $config[$app].requestCpu)
-                $limM=[double](Convert-CpuToM $config[$app].limitCpu)
-                if ($limM -lt $reqM) { $config[$app].limitCpu=Format-Cpu $reqM }
+                $config[$app].limitCpu=$null
             }
             'REDUCE_MEMORY_REQUEST' { $config[$app].requestMemory=Format-Memory ([double]$action.To) ([int][math]::Max($MinMemoryRequestMi,[double]$action.To)) }
             'INCREASE_CPU_REQUEST' {
                 $config[$app].requestCpu=Format-Cpu ([double]$action.To)
-                $reqM=[double](Convert-CpuToM $config[$app].requestCpu)
-                $limM=[double](Convert-CpuToM $config[$app].limitCpu)
-                if ($limM -lt $reqM) { $config[$app].limitCpu=Format-Cpu ([math]::Max($limM,$reqM)) }
+                $config[$app].limitCpu=$null
             }
             'REDUCE_MEMORY_LIMIT' { $config[$app].limitMemory=Format-Memory ([double]$action.To) ([int][math]::Ceiling([double]$action.To)) }
             # Stress coarse allocation → request/limit 분할 + HPA 확대 + 측정 pre-warm(replicas=2).
             # HPA minReplicas는 별도로 1 유지된다.
             'SPLIT_STRESS_CAPACITY' {
                 $config[$app].requestCpu=Format-Cpu ([double]$action.RequestTo)
-                $config[$app].limitCpu=Format-Cpu ([double]$action.LimitTo)
+                $config[$app].limitCpu=$null
                 $config[$app].maxReplicas=[int]$action.HpaMaxTo
                 $config[$app].replicas=2
                 # SPLIT 결과를 전역 override로 persist: 이후 어떤 candidate도 old resource로 되돌리지 못한다.
-                $script:FinalResourceOverrideByApp[$app]=@{requestCpu=[double]$action.RequestTo;limitCpu=[double]$action.LimitTo}
+                $script:FinalResourceOverrideByApp[$app]=@{requestCpu=[double]$action.RequestTo;limitCpu=$null}
             }
         }
     }
@@ -4397,7 +4382,7 @@ function Run-LoadTest([hashtable]$config,[int]$durationSec,$cluster,[switch]$Pre
     foreach ($app in $apps) {
         $splitAction=@($profile.TuningActions | Where-Object { $_.App -eq $app -and $_.Type -eq 'SPLIT_STRESS_CAPACITY' }) | Select-Object -First 1
         if ($splitAction -and $null -ne $splitAction.RequestTo -and [double]$splitAction.RequestTo -gt 0) {
-            $script:FinalResourceOverrideByApp[$app]=@{requestCpu=[double]$splitAction.RequestTo;limitCpu=[double]$splitAction.LimitTo}
+            $script:FinalResourceOverrideByApp[$app]=@{requestCpu=[double]$splitAction.RequestTo;limitCpu=$null}
         }
     }
     # 실제 성적표 로그 (스펙 14)
@@ -6239,31 +6224,13 @@ try {
     } else {
         $finalConfig[$DedicatedApp].placementDomain='shared'
     }
-    # resource override overlay: SPLIT 등 dynamic tune 결과가 candidate 기본값보다 우선한다.
-    # 단, stress limit은 density/reference prior가 우선 (CPU throttling 방지).
+    # resource override overlay: request만 반영하고 CPU limit은 항상 제거한다.
     foreach ($app in $script:FinalResourceOverrideByApp.Keys) {
         $ro=$script:FinalResourceOverrideByApp[$app]
         $finalConfig[$app].requestCpu=Format-Cpu ([double]$ro.requestCpu)
-        if ($app -eq 'stress') {
-            # stress limit은 현재 live/config limit과 실측 density 중 큰 값을 사용한다.
-            $overrideLimit=[double]$ro.limitCpu
-            $densityLimit=if ($script:StressDensityLimitM -gt 0) { [double]$script:StressDensityLimitM } else { 0 }
-            $bestLimit=[math]::Max($overrideLimit,$densityLimit)
-            $finalConfig[$app].limitCpu=Format-Cpu $bestLimit
-            $script:FinalResourceOverrideByApp[$app].limitCpu=$bestLimit
-        } else {
-            $finalConfig[$app].limitCpu=Format-Cpu ([double]$ro.limitCpu)
-        }
-        Write-Host ("  resource override [{0}]: request={1} limit={2}" -f $app,$finalConfig[$app].requestCpu,$finalConfig[$app].limitCpu) -ForegroundColor DarkGray
-    }
-    # ISOLATED_DENSE면 density-aware limit을 최종 config에 반영한다.
-    if ($script:StressDensityPlacement -eq 'ISOLATED_DENSE' -and $script:StressDensityLimitM -gt 0) {
-        $effectiveLimit=[double]$script:StressDensityLimitM
-        $finalConfig.stress.limitCpu=Format-Cpu $effectiveLimit
-        if ($script:FinalResourceOverrideByApp.ContainsKey('stress')) {
-            $script:FinalResourceOverrideByApp['stress'].limitCpu=$effectiveLimit
-        }
-        Write-Host ("  density limit [stress]: $($finalConfig.stress.limitCpu) source=DENSITY_MODEL") -ForegroundColor Yellow
+        $finalConfig[$app].limitCpu=$null
+        $script:FinalResourceOverrideByApp[$app].limitCpu=$null
+        Write-Host ("  resource override [{0}]: request={1} limit=none" -f $app,$finalConfig[$app].requestCpu) -ForegroundColor DarkGray
     }
     # stale resource guard: optimizer 입력 request는 반드시 최신 override와 일치해야 한다.
     foreach ($app in $script:FinalResourceOverrideByApp.Keys) {
@@ -7039,7 +7006,7 @@ if ($BaseExperiment) {
         if ($p.hpaTarget -ne 29) { throw 'product target' }
         if ($p.maxReplicas -ne 20) { throw 'product max' }
         if ($st.requestCpu -ne '600m') { throw 'stress req' }
-        if ($st.limitCpu -ne '2000m') { throw 'stress limit' }
+        if ($null -ne $st.limitCpu) { throw 'stress CPU limit not null' }
         if ($st.hpaTarget -ne 55) { throw 'stress target' }
         if ($st.maxReplicas -ne 6) { throw 'stress max' }
     }

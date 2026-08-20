@@ -237,12 +237,15 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
+  # peak2 프로필: Managed 1대 + default 1대 + stress 3대 = 최대 5대.
+  # stress 6개(600m request)를 수용하며 저부하에서는 빈 노드를 회수한다.
   limits:
+    cpu: "2"
     memory: 1000Gi
   disruption:
     # 채점/부하 중 노드 회수로 인한 Pod 재배치와 timeout을 방지한다.
     consolidationPolicy: WhenEmpty
-    consolidateAfter: 10m
+    consolidateAfter: 5m
 NODEPOOL
 # 38점 기준: stress는 별도 NodePool + taint로 격리한다.
 # default NodePool은 user/product만 수용하고 stress NodePool만 workload-class=stress를 제공한다.
@@ -276,11 +279,15 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
+  # stress 6개 × 600m request를 안정적으로 수용하는 전용 3대분.
+  # c5/t3.medium allocatable과 daemonset overhead를 고려하면 2대에는 3개씩 배치할 수 없다.
+  # 저부하에서는 빈 stress 노드가 5분 후 회수된다.
   limits:
+    cpu: "6"
     memory: 1000Gi
   disruption:
     consolidationPolicy: WhenEmpty
-    consolidateAfter: 10m
+    consolidateAfter: 5m
 STRESS_NODEPOOL
 
 # NodePool에 taint가 있으면(스트레스 격리) aws-node/kube-proxy가 그 노드에
@@ -346,6 +353,12 @@ spec:
           periodSeconds: 2
           timeoutSeconds: 2
           failureThreshold: 3
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels: {app: user}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -391,6 +404,12 @@ spec:
           periodSeconds: 3
           timeoutSeconds: 2
           failureThreshold: 3
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels: {app: product}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -426,16 +445,22 @@ spec:
         ports:
         - containerPort: 8080
         resources:
-          # 38점 기준: stress는 600m request / 2CPU limit으로 격리한다.
-          # CPU limit을 제거하지 않아 stress burst가 foreground 앱을 침범하지 않는다.
+          # stress는 600m request만 두고 CPU limit은 제거해 burst/throttling을 방지한다.
+          # request × HPA target = 600m × 55% = 330m control point를 유지한다.
           requests: {cpu: 600m, memory: 640Mi}
-          limits: {cpu: 2000m, memory: 1536Mi}
+          limits: {memory: 1536Mi}
         readinessProbe:
           httpGet: {path: /healthcheck, port: 8080}
           initialDelaySeconds: 2
           periodSeconds: 5
           timeoutSeconds: 5
           failureThreshold: 6
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels: {app: stress}
 ---
 apiVersion: v1
 kind: Service
@@ -474,8 +499,7 @@ metadata:
     alb.ingress.kubernetes.io/healthcheck-timeout-seconds: '3'
     alb.ingress.kubernetes.io/healthcheck-healthy-threshold-count: '2'
     # 큐잉 병목: 막힌 Pod로 요청을 보내지 않는다
-    alb.ingress.kubernetes.io/target-group-attributes: load_balancing.algorithm.type=least_outstanding_requests
-    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=10
+    alb.ingress.kubernetes.io/target-group-attributes: load_balancing.algorithm.type=least_outstanding_requests,deregistration_delay.timeout_seconds=10
     alb.ingress.kubernetes.io/actions.response-404: '{"type":"fixed-response","fixedResponseConfig":{"contentType":"application/json","statusCode":"404","messageBody":"{\"err\":\"not found\"}"}}'
 spec:
   ingressClassName: alb
@@ -601,6 +625,7 @@ spec:
     kind: Deployment
     name: stress
   minReplicas: 1
+  # peak2 프로필: stress는 전용 노드 3대까지 확장한다.
   maxReplicas: 6
   behavior:
     scaleUp:

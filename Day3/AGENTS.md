@@ -188,6 +188,10 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-20 | superseded | 3대 프로필 실측 — stress 성능 4.69%, user 8.51%로 성능 게이트 실패. 600m stress 6개를 안정적으로 수용하려면 stress NodePool 3대분(CPU 6)이 필요함을 확인 |
+| 2026-08-20 | pending | 안정 프로필로 전환 — default CPU 2, stress CPU 6(전용 3대), HPA user/product 2~20·stress 1~6, 저부하 consolidation 5m 유지 |
+| 2026-08-20 | pending | spike2 결과 반영 — stress HPA 6개 중 3개만 Ready, stress 5xx 175건·P95 30초로 확인되어 NodePool stress 한도를 4 CPU(2대분)로 확대해 총 4대까지 허용하고 request 500m 기준을 소스에 반영 |
+| 2026-08-20 | pending | `bastion_setup.sh` 성능 개선 — Karpenter default/stress를 각 2 CPU(각 1대분)로 조정해 총 3대 유지, stress 노드 1대 축소, ALB least-outstanding-requests와 앱 topology spread 반영 |
 | 2026-08-20 | pending | `tune.ps1` 개선 — 38점 앱 세트 BASE seed를 live 오염 상태가 아닌 재현 구성(70m/70m/600m, HPA 33/29/55, min 2/2/1)으로 고정하고, 외부 부하 결과의 잘못된 EC2 telemetry(reported 1 vs actual 3)를 진단 import/경고하며 최종 적용 config를 BASE 결과에 저장 |
 
 | 날짜 | 커밋 | 변경 요약 |
