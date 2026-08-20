@@ -3622,6 +3622,9 @@ function Get-NextTuningAction($profile,[string]$app,$cluster=$null) {
     if ('ZERO_SUCCESS_CAPACITY' -in $reasons -and 'MEMORY_OOM' -notin $reasons) {
         $current=[int]$profile.Config[$app].maxReplicas
         if ($app -eq 'stress') {
+            # user/product가 모두 정상일 때만 stress 수평 확장을 허용한다.
+            # 초기화하지 않으면 $null이 false로 평가되어 항상 NO_CHANGE가 되는 버그가 있다.
+            $interactiveProtected=$true
             foreach ($protectedApp in @('user','product')) {
                 $protectedMetric=$profile.Apps[$protectedApp]
                 if ($null -eq $protectedMetric -or -not [bool]$protectedMetric.SLOPass -or -not [bool]$protectedMetric.LoadPass -or -not [bool]$protectedMetric.AvailabilityPass) { $interactiveProtected=$false }
