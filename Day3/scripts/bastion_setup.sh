@@ -279,11 +279,11 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
-  # stress 6개 × 600m request를 안정적으로 수용하는 전용 3대분.
-  # c5/t3.medium allocatable과 daemonset overhead를 고려하면 2대에는 3개씩 배치할 수 없다.
+  # stress 12개 × 600m request를 수용할 수 있는 전용 6대분.
+  # c5/t3.medium allocatable과 daemonset overhead를 고려하면 노드당 2개만 안정 배치한다.
   # 저부하에서는 빈 stress 노드가 5분 후 회수된다.
   limits:
-    cpu: "6"
+    cpu: "12"
     memory: 1000Gi
   disruption:
     consolidationPolicy: WhenEmpty
@@ -625,9 +625,9 @@ spec:
     kind: Deployment
     name: stress
   minReplicas: 1
-  # peak2 실측에서 stress는 6개 Pod가 zero-success capacity에 도달할 수 있다.
-  # 전용 3대에서 최대 8개까지 수평 확장을 허용한다.
-  maxReplicas: 8
+  # peak2 실측에서 stress 8개도 zero-success capacity에 도달했다.
+  # 전용 NodePool을 확장해 최대 12개까지 수평 확장을 허용한다.
+  maxReplicas: 12
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0

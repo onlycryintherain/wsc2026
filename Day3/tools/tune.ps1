@@ -113,7 +113,7 @@ $BaseConfig = @{
     stress = @{
         requestCpu = '600m'; requestMemory = '640Mi'
         limitCpu = $null; limitMemory = '1536Mi'
-        hpaTarget = 55; minReplicas = 1; maxReplicas = 8
+        hpaTarget = 55; minReplicas = 1; maxReplicas = 12
         placement = 'ISOLATED'; placementDomain = 'dedicated'
     }
 }
@@ -335,13 +335,13 @@ $GoldenBaseline = @{
     Apps = @{
         user    = @{ requestCpu='70m';  limitCpu=$null;   limitMemory='256Mi';  hpaTarget=33; minReplicas=2; maxReplicas=20; placement='SHARED' }
         product = @{ requestCpu='70m';  limitCpu=$null;   limitMemory='256Mi';  hpaTarget=29; minReplicas=2; maxReplicas=20; placement='SHARED' }
-        stress  = @{ requestCpu='600m'; limitCpu=$null;   limitMemory='1536Mi'; hpaTarget=55; minReplicas=1; maxReplicas=8;  placement='ISOLATED' }
+        stress  = @{ requestCpu='600m'; limitCpu=$null;   limitMemory='1536Mi'; hpaTarget=55; minReplicas=1; maxReplicas=12; placement='ISOLATED' }
     }
 }
 $KnownGoodReference = $GoldenBaseline.Apps
 # HardSafetyMax: cluster absolute ceiling (node budget과 무관 — maxPods/placement/앱 안전 기준)
 # user/product max=20은 reference prior (max≠reservation — 실제 Pod/Node lifetime으로만 비용 계산)
-$script:HardSafetyMaxByApp=@{user=20;product=20;stress=8}
+$script:HardSafetyMaxByApp=@{user=20;product=20;stress=12}
 # ELASTIC_DENSITY_REQUEST 대상 (burst 허용 + HPA 분산): user/product. GUARANTEED: stress.
 $script:ElasticDensityApps=@('user','product')
 $WarmReplicaHardCap = 3            # burst warm replica 최대 (전역 cap, 앱별 하드코딩 아님)
@@ -7023,7 +7023,7 @@ if ($BaseExperiment) {
         if ($st.requestCpu -ne '600m') { throw 'stress req' }
         if ($null -ne $st.limitCpu) { throw 'stress CPU limit not null' }
         if ($st.hpaTarget -ne 55) { throw 'stress target' }
-        if ($st.maxReplicas -ne 8) { throw 'stress max' }
+        if ($st.maxReplicas -ne 12) { throw 'stress max' }
     }
 
     # TEST 2: hpaMaxMinimum does not mutate BaseConfig
