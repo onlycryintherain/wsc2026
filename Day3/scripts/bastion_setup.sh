@@ -237,14 +237,14 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
-  # peak2 프로필: Managed 1대 + default 1대 + stress 3대 = 최대 5대.
-  # stress 6개(600m request)를 수용하며 저부하에서는 빈 노드를 회수한다.
+  # peak2 프로필: Managed 1대 + default 1대 + stress 6대 = 최대 8대.
+  # stress 12개(600m request)를 수용하며 저부하에서는 빈 노드를 회수한다.
   limits:
     cpu: "2"
     memory: 1000Gi
   disruption:
-    # 채점/부하 중 노드 회수로 인한 Pod 재배치와 timeout을 방지한다.
-    consolidationPolicy: WhenEmpty
+    # 저부하에서 빈/저활용 노드를 회수하고 부하 중에는 5분 유예한다.
+    consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 5m
 NODEPOOL
 # 38점 기준: stress는 별도 NodePool + taint로 격리한다.
@@ -281,12 +281,12 @@ spec:
       expireAfter: 720h
   # stress 12개 × 600m request를 수용할 수 있는 전용 6대분.
   # c5/t3.medium allocatable과 daemonset overhead를 고려하면 노드당 2개만 안정 배치한다.
-  # 저부하에서는 빈 stress 노드가 5분 후 회수된다.
+  # 저부하에서는 빈/저활용 stress 노드가 5분 후 회수된다.
   limits:
     cpu: "12"
     memory: 1000Gi
   disruption:
-    consolidationPolicy: WhenEmpty
+    consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 5m
 STRESS_NODEPOOL
 
