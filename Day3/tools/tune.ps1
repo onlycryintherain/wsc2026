@@ -77,7 +77,10 @@ param(
     [switch]$DiscardResults,
     [switch]$BaseExperiment,
     [switch]$LegacyAdaptive,
-    [switch]$SelfTestOnly
+    [switch]$SelfTestOnly,
+    # Apply only the measured performance-gate profile. All app HPA/resource
+    # values are still changed through this script (never ad-hoc kubectl).
+    [switch]$PerformanceGateOnly
 )
 
 # Safe default: BASE-first pipeline is the normal path. Legacy adaptive behavior
@@ -1467,6 +1470,13 @@ function Set-KarpenterNodeLimit($cluster) {
             $obj=((& kubectl get nodepool $pool -o json 2>$null) -join '') | ConvertFrom-Json
             if (-not $obj) { throw "NodePool/$pool not found" }
             $old=[string]$obj.spec.limits.cpu
+            if ($PerformanceGateOnly -and $script:Is38PointAppSet) {
+                # Keep the recovery profile within the verified CNI-safe capacity.
+                # Performance-gate experiments must be run only after a clean,
+                # Ready baseline; this branch is also the safe rollback path.
+                $desired.default=2000
+                $desired.stress=12000
+            }
             if ($desired.ContainsKey($pool)) {
                 $new=Format-Cpu ([double]$desired[$pool])
                 if ([string]$old -ne [string]$new) {
@@ -5881,6 +5891,29 @@ if ($ProbeDurationSec -lt $minimumProfileDuration -or $FinalDurationSec -lt $min
 try {
     Initialize-EndpointAndData
     if (-not [string]::IsNullOrWhiteSpace($ExternalResultDir)) { Import-ExternalEvidence | Out-Null }
+    if ($PerformanceGateOnly) {
+        if (-not $script:Is38PointAppSet) { throw 'PERFORMANCE_GATE_PROFILE requires user/product/stress app set' }
+        Write-Host "`n========== PERFORMANCE GATE ONLY ==========" -ForegroundColor Green
+        # This is the sole source of HPA/request/limit values for this mode.
+        # Keep enough replicas warm before the external peak profile starts.
+        $gate=Copy-Config $BaseConfig 'PERFORMANCE_GATE'
+        $gate.user.requestCpu='70m'; $gate.user.requestMemory='64Mi'; $gate.user.limitCpu=$null; $gate.user.limitMemory='256Mi'; $gate.user.hpaTarget=33; $gate.user.minReplicas=2; $gate.user.maxReplicas=21
+        $gate.product.requestCpu='70m'; $gate.product.requestMemory='64Mi'; $gate.product.limitCpu=$null; $gate.product.limitMemory='256Mi'; $gate.product.hpaTarget=29; $gate.product.minReplicas=2; $gate.product.maxReplicas=20
+        $gate.stress.requestCpu='600m'; $gate.stress.requestMemory='640Mi'; $gate.stress.limitCpu='2000m'; $gate.stress.limitMemory='1536Mi'; $gate.stress.hpaTarget=55; $gate.stress.minReplicas=1; $gate.stress.maxReplicas=6
+        foreach ($app in $apps) { $gate[$app].replicas=[int]$gate[$app].minReplicas }
+        Show-Config $gate 'PERFORMANCE_GATE recovery config'
+        Ensure-38PointStressTopology -ApplyPlacement
+        $gateCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $gateCluster
+        if (-not $NoApply) {
+            # Explicit scale-down is part of the script-managed recovery; it
+            # releases CNI IPs before the verified profile is reapplied.
+            foreach ($app in $apps) { Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app",("--replicas={0}" -f [int]$gate[$app].replicas)) }
+            if (-not (Apply-CandidateSafely $gate Hard)) { throw 'PERFORMANCE_GATE_ROLLOUT_NOT_READY' }
+            Assert-MeasurementReady 180
+        }
+        Write-Host 'PERFORMANCE_GATE_READY: HPA/resources applied by tune.ps1; capacity retained.' -ForegroundColor Green
+        return
+    }
     if ($BaseExperiment -and -not $LegacyAdaptive) {
         Write-Host "`n========== BASE EXPERIMENT MODE ==========" -ForegroundColor Green
         if ($SelfTestOnly) { . (Join-Path $PSScriptRoot "tune\selftest.ps1"); return }
