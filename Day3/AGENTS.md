@@ -188,7 +188,7 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
-| 2026-08-19 | pending | `tune.ps1` 범용화 — GoldenBaseline/앱별 request·HPA floor를 강제하지 않고 live Deployment/HPA를 seed로 사용, 실측 CPU/HPA 제어점·stress limit·노드 예산을 앱 난이도에 맞춰 재계산 |
+| 2026-08-20 | pending | `tune.ps1` 개선 — 38점 앱 세트 BASE seed를 live 오염 상태가 아닌 재현 구성(70m/70m/600m, HPA 33/29/55, min 2/2/1)으로 고정하고, 외부 부하 결과의 잘못된 EC2 telemetry(reported 1 vs actual 3)를 진단 import/경고하며 최종 적용 config를 BASE 결과에 저장 |
 
 | 날짜 | 커밋 | 변경 요약 |
 | 2026-08-18 | pending | `bastion_setup.sh`/EKS Launch Template에 38점 기준 반영 — CNI prefix+warm prefix, MNG/Karpenter maxPods=110, user/product 70m·256Mi, stress 600m·2CPU·dedicated NodePool, HPA 33/29/55 및 20/20/6 |

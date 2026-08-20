@@ -25,7 +25,11 @@ param(
     [ValidateRange(1, 1000)][int]$TargetRate = 60,
     [ValidateRange(0.50, 1.00)][double]$MinProcessingRate = 0.90,
     [string]$OutputDir = (Join-Path ([IO.Path]::GetTempPath()) "wsi-k6-$PID"),
-    [string]$DataFile = (Join-Path $PSScriptRoot '..\application\load_user.dump'),
+    [string]$DataFile = '',
+    # 외부 부하 도구 결과는 진단용으로만 읽는다. 비용은 live Kubernetes node
+    # telemetry를 우선하며, 외부 도구가 EC2 수를 잘못 보고하면 실제 수를 명시한다.
+    [string]$ExternalResultDir = '',
+    [ValidateRange(0, 20)][int]$ExternalActualInstanceCount = 0,
     [string]$ProductId = 'dbdump500001',
     [string]$ProductIds,
     [ValidateRange(1, 20)][int]$MaxNodes = 3,
@@ -76,6 +80,10 @@ param(
 if (-not $LegacyAdaptive) { $BaseExperiment = $true }
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($DataFile)) {
+    $script:tuneRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $DataFile = Join-Path $script:tuneRoot '..\application\load_user.dump'
+}
 $apps = @('user','product','stress')
 # 범용 앱 구성: ManagedApps/SLO/target 파라미터가 주입되면 전역을 대체한다.
 # (다른 과제/API 세트에서 tune.ps1을 재사용할 수 있게 함)
@@ -108,6 +116,7 @@ $BaseConfig = @{
         placement = 'ISOLATED'; placementDomain = 'dedicated'
     }
 }
+$script:Is38PointAppSet = (@($apps | Where-Object { $_ -in @('user','product','stress') }).Count -eq 3 -and $apps.Count -eq 3)
 
 function Get-ConfigFingerprintFromValues($config) {
     $parts = [System.Collections.Generic.List[string]]::new()
@@ -157,17 +166,62 @@ function Save-EvaluationSnapshot($measurement, $config, $name) {
         PeakNodes=[double]$(Get-OptionalPropertyValue $measurement 'PeakReadyNodes' 0)
     }
 }
-function Save-BaseExperimentProfile([hashtable]$config,$measurement,[string]$path) {
+function Save-BaseExperimentProfile([hashtable]$config,$measurement,[string]$path,[string]$status='BASE_MEASURED') {
     $payload=[pscustomobject]@{
         GeneratedAt=(Get-Date -Format o)
         Mode='BASE_EXPERIMENT'
         Configuration=$config
         Measurement=$measurement
-        Selection=[pscustomobject]@{Status='BASE_MEASURED';ExternalScorePending=$true}
+        ExternalEvidence=$script:ExternalEvidence
+        Selection=[pscustomobject]@{Status=$status;ExternalScorePending=$true}
     }
     $text=$payload|ConvertTo-Json -Depth 20
     [IO.File]::WriteAllText($path,$text,(New-Object System.Text.UTF8Encoding($false)))
     return $path
+}
+
+function Import-ExternalEvidence {
+    if ([string]::IsNullOrWhiteSpace($ExternalResultDir)) { return $null }
+    $summaryPath=Join-Path $ExternalResultDir 'summary.json'
+    if (-not (Test-Path -LiteralPath $summaryPath)) {
+        Write-Warning "외부 결과 summary.json을 찾지 못했습니다: $summaryPath"
+        return $null
+    }
+    try {
+        try {
+            $summary=Get-Content -Raw -LiteralPath $summaryPath | ConvertFrom-Json
+        } catch {
+            # Windows PowerShell 5.1은 큰 summary의 일부 특수문자에서
+            # ConvertFrom-Json이 실패할 수 있다. node로 필요한 비용/점수
+            # 필드만 축약해 다시 PowerShell 객체로 변환한다.
+            if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw }
+            $compact=@'
+const fs=require('fs');
+const d=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));
+process.stdout.write(JSON.stringify({duration_seconds:d.duration_seconds,cost_details:{average_running_instance_count:d.cost_details && d.cost_details.average_running_instance_count},score_earned:d.score && d.score.earned,score_max:d.score && d.score.max}));
+'@
+            $compactJson=(& node -e $compact $summaryPath -ErrorAction Stop) -join ''
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($compactJson)) { throw }
+            $summary=$compactJson | ConvertFrom-Json
+        }
+        $reported=[double](Get-OptionalPropertyValue $summary.cost_details 'average_running_instance_count' $null)
+        $actual=if ($ExternalActualInstanceCount -gt 0) { [double]$ExternalActualInstanceCount } else { $null }
+        $score=Get-OptionalPropertyValue $summary 'score' $null
+        if ($null -eq $score -and $null -ne (Get-OptionalPropertyValue $summary 'score_earned' $null)) {
+            $score=[pscustomobject]@{earned=[double]$summary.score_earned;max=[double](Get-OptionalPropertyValue $summary 'score_max' 40)}
+        }
+        $e=[pscustomobject]@{
+            Source=$ExternalResultDir; SummaryPath=$summaryPath
+            DurationSeconds=[double](Get-OptionalPropertyValue $summary 'duration_seconds' 0)
+            ReportedAverageInstances=$reported; ActualAverageInstances=$actual
+            ReportedCostTelemetryReliable=($null -ne $reported -and $null -ne $actual -and [math]::Abs($reported-$actual) -lt 0.01)
+            ExternalScore=$score; ByApi=Get-OptionalPropertyValue $summary 'by_api' $null
+        }
+        if ($null -ne $reported -and $null -ne $actual -and [math]::Abs($reported-$actual) -ge 0.01) {
+            Write-Warning ("외부 비용 telemetry 불일치: reported avg EC2={0:N2}, actual={1:N0}. reported 값은 튜닝 비용 판단에 사용하지 않습니다." -f $reported,$actual)
+        }
+        $script:ExternalEvidence=$e; return $e
+    } catch { Write-Warning "외부 결과 import 실패: $($_.Exception.Message)"; return $null }
 }
 
 # P0-5: user/product request floor도 reference(70m)에 가깝게 — ELASTIC_DENSITY에서 실측 우선
@@ -210,6 +264,7 @@ $script:HpaBehaviorAction = @{ user='KEEP'; product='KEEP'; stress='KEEP' }
 # 이 값을 old candidate resource(예: 925m/1400m)로 되돌리지 못하게 한다.
 #   key=app → @{requestCpu=...;limitCpu=...}
 $script:FinalResourceOverrideByApp = @{}
+$script:ExternalEvidence = $null
 # Stress dedicated density 상태 (ISOLATED_DENSE / ISOLATED_SPREAD)
 $script:StressDensityPlacement = $null
 $script:StressDensityLimitM = $null
@@ -264,7 +319,7 @@ $MinMemoryBudgetUtilization = 0.80
 # known-good 38점 reference (t3.medium 검증)를 empirical prior로 사용:
 #   user    70m × 33% = 23.1m
 #   product 70m × 29% = 20.3m
-#   stress 300m × 55% = 165m
+#   stress 600m × 55% = 330m
 # 최종 source of truth는 same-run measurement (MEASURED_*) — prior보다 우선한다.
 $script:ControlPointByApp=@{}
 $script:ControlPointSourceByApp=@{}
@@ -273,13 +328,13 @@ $script:ControlPointStateFile = Join-Path ([IO.Path]::GetTempPath()) 'wsi-hpa-co
 $HpaTargetLowerBound=15.0      # EMPIRICAL_UNCONFIRMED (known-good 29/33/55 포함 범위)
 $HpaTargetUpperBound=90.0
 # Known-good reference (38점 검증 — literal 복사가 아니라 empirical prior)
-# Golden Baseline: 38점 empirically verified configuration
+# Golden Baseline: user/product/stress 앱 세트에서 BASE seed로 사용하는 재현 구성.
 $GoldenBaseline = @{
     Infra = @{ PrefixDelegation=$true; WarmPrefixTarget=1; MaxPods=110 }
     Apps = @{
-        user    = @{ requestCpu='70m';  limitCpu=$null; limitMemory='256Mi'; hpaTarget=33; minReplicas=2; maxReplicas=20; placement='SHARED' }
-        product = @{ requestCpu='70m';  limitCpu=$null; limitMemory='256Mi'; hpaTarget=29; minReplicas=2; maxReplicas=20; placement='SHARED' }
-        stress  = @{ requestCpu='300m'; limitCpu='2000m'; hpaTarget=55; minReplicas=3; maxReplicas=6; placement='SHARED' }
+        user    = @{ requestCpu='70m';  limitCpu=$null;   limitMemory='256Mi';  hpaTarget=33; minReplicas=2; maxReplicas=20; placement='SHARED' }
+        product = @{ requestCpu='70m';  limitCpu=$null;   limitMemory='256Mi';  hpaTarget=29; minReplicas=2; maxReplicas=20; placement='SHARED' }
+        stress  = @{ requestCpu='600m'; limitCpu='2000m'; limitMemory='1536Mi'; hpaTarget=55; minReplicas=1; maxReplicas=6;  placement='ISOLATED' }
     }
 }
 $KnownGoodReference = $GoldenBaseline.Apps
@@ -5707,6 +5762,7 @@ if ($ProbeDurationSec -lt $minimumProfileDuration -or $FinalDurationSec -lt $min
 
 try {
     Initialize-EndpointAndData
+    if (-not [string]::IsNullOrWhiteSpace($ExternalResultDir)) { Import-ExternalEvidence | Out-Null }
     if ($BaseExperiment -and -not $LegacyAdaptive) {
         Write-Host "`n========== BASE EXPERIMENT MODE ==========" -ForegroundColor Green
         if ($SelfTestOnly) { . (Join-Path $PSScriptRoot "tune\selftest.ps1"); return }
@@ -5726,15 +5782,23 @@ try {
         Write-Host "`n===== BASELINE CONTROL =====" -ForegroundColor Green
         foreach ($app in $apps) { $bc=$BaseConfig[$app]; $lim=if($bc.limitCpu){$bc.limitCpu}else{'none'}; Write-Host ("  {0}: {1}/{2} limit={3}/{4} HPA={5}% {6}..{7} ({8})" -f $app,$bc.requestCpu,$bc.requestMemory,$lim,$bc.limitMemory,$bc.hpaTarget,$bc.minReplicas,$bc.maxReplicas,$bc.placement) }
         $originalConfig=Get-LiveConfig 'Original'
-        # Base 측정은 고정 GoldenBaseline이 아니라 현재 live Deployment/HPA를
-        # seed로 사용한다. 대회 앱의 난이도/리소스가 달라도 첫 측정이 실제 상태에서 시작된다.
-        foreach ($app in $apps) {
-            # live HPA max/min을 각 앱의 시작 floor로 보존한다.
-            $hpaMaxMinimum[$app]=[int][math]::Max(1,$originalConfig[$app].maxReplicas)
-            if (-not $script:HardSafetyMaxByApp.ContainsKey($app)) { $script:HardSafetyMaxByApp[$app]=[int]$MaxAutoReplicas
-            }
+        # 38점 앱 세트에서는 이전 tune 실행이 남긴 HPA/resource를 seed로
+        # 재사용하지 않는다. 매번 검증된 기준 구성에서 시작해야
+        # `terraform apply -> tune.ps1` 재현성이 유지된다.
+        $baseSeed=if ($script:Is38PointAppSet) {
+            Write-Host 'BASE seed: 38점 재현 구성(오염된 live HPA/resource 무시)' -ForegroundColor Yellow
+            Copy-Config $BaseConfig 'BASE_SEED'
+        } else {
+            Write-Host 'BASE seed: live Deployment/HPA (범용 앱 세트)' -ForegroundColor DarkGray
+            Copy-Config $originalConfig 'BASE_SEED'
         }
-        $baseCfg=Copy-Config $originalConfig 'BASE'; foreach($app in $apps){$baseCfg[$app].replicas=1}
+        foreach ($app in $apps) {
+            # BASE candidate의 max는 seed 설정이 기준이다. 직전 실행의
+            # 실험용 max가 다음 실행의 축소 불가 floor가 되지 않게 한다.
+            $hpaMaxMinimum[$app]=[int][math]::Max(1,$baseSeed[$app].maxReplicas)
+            if (-not $script:HardSafetyMaxByApp.ContainsKey($app)) { $script:HardSafetyMaxByApp[$app]=[int]$MaxAutoReplicas }
+        }
+        $baseCfg=Copy-Config $baseSeed 'BASE'; foreach($app in $apps){$baseCfg[$app].replicas=[int]$baseCfg[$app].minReplicas}
         if (-not $NoApply) { Ensure-38PointStressTopology -ApplyPlacement }
         $baseReady=Apply-CandidateSafely $baseCfg Hard
         if (-not $baseReady) { throw 'BASE candidate가 Ready 상태가 되지 않아 측정할 수 없습니다.' }
@@ -5809,7 +5873,10 @@ try {
         $finalApplied=(-not $NoApply)
         $selectedCandidate=$null; $selectedValidation=$bestSnap.Measurement
         $verificationStatuses=@(); $verificationSkipped=0
-        $correction=[pscustomobject]@{Config=$finalConfig;CandidateGrade='BASE_EXPERIMENT';SelectionReason='BASE -> ONE DELTA -> BEST -> GRADING_READY';Corrections=@();StopReason='BASE_COMPLETE'}
+        $correction=[pscustomobject]@{Config=$finalConfig;CandidateGrade='BASE_EXPERIMENT';SelectionReason='38POINT_BASE -> ONE DELTA -> BEST -> GRADING_READY';Corrections=@();StopReason='BASE_COMPLETE'}
+        # BASE 경로도 최종 적용 구성을 결과 파일에 남긴다. 중간 BASE 측정만
+        # 저장하면 다음 실행/사후 분석에서 실제 적용 상태를 잃는다.
+        Save-BaseExperimentProfile $finalConfig $bestSnap.Measurement $baseProfilePath 'FINAL_APPLIED' | Out-Null
         $runFailed=$false; return
     }
     Initialize-HpaControlPointModel
@@ -6990,7 +7057,7 @@ if ($BaseExperiment) {
         $a=Copy-Config $BaseConfig 'a'; $b=Copy-Config $BaseConfig 'b'
         $b.user.requestCpu='60m'
         $diffs=Compare-Config $a $b @('USER_REQUESTCPU')
-        if ($diffs.Count -ne 1) { throw "expected 1 diff got $($diffs.Count)" }
+        if (@($diffs).Count -ne 1) { throw "expected 1 diff got $(@($diffs).Count)" }
         if ($diffs[0].Axis -ne 'USER_REQUESTCPU') { throw "wrong axis $($diffs[0].Axis)" }
     }
 

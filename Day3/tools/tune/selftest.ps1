@@ -42,7 +42,7 @@ if ($BaseExperiment) {
         $a=Copy-Config $BaseConfig 'a'; $b=Copy-Config $BaseConfig 'b'
         $b.user.requestCpu='60m'
         $diffs=Compare-Config $a $b @('USER_REQUESTCPU')
-        if ($diffs.Count -ne 1) { throw "expected 1 diff got $($diffs.Count)" }
+        if (@($diffs).Count -ne 1) { throw "expected 1 diff got $(@($diffs).Count)" }
         if ($diffs[0].Axis -ne 'USER_REQUESTCPU') { throw "wrong axis $($diffs[0].Axis)" }
     }
 

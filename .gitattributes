@@ -1,0 +1,25 @@
+# Normalize text files to LF in every checkout.
+* text=auto eol=lf
+
+# Shell and infrastructure files must stay LF for Linux tooling.
+*.sh text eol=lf
+*.bash text eol=lf
+*.tf text eol=lf
+*.tfvars text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.ps1 text eol=lf
+
+# Keep binary artifacts out of line-ending conversion.
+*.zip binary
+*.gz binary
+*.tar binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.webp binary
+**/book binary
+**/binary/* binary
