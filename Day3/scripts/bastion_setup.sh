@@ -625,8 +625,9 @@ spec:
     kind: Deployment
     name: stress
   minReplicas: 1
-  # peak2 프로필: stress는 전용 노드 3대까지 확장한다.
-  maxReplicas: 6
+  # peak2 실측에서 stress는 6개 Pod가 zero-success capacity에 도달할 수 있다.
+  # 전용 3대에서 최대 8개까지 수평 확장을 허용한다.
+  maxReplicas: 8
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0
