@@ -112,9 +112,8 @@ $BaseConfig = @{
     }
     stress = @{
         requestCpu = '600m'; requestMemory = '640Mi'
-        limitCpu = $null; limitMemory = '1536Mi'
-        # stress HPA max는 고정값이 아니라 실측 capacity/quality/cost 후보에서 결정한다.
-        hpaTarget = 55; minReplicas = 1; maxReplicas = 12
+        limitCpu = '2000m'; limitMemory = '1536Mi'
+        hpaTarget = 55; minReplicas = 1; maxReplicas = 6
         placement = 'ISOLATED'; placementDomain = 'dedicated'
     }
 }
@@ -153,6 +152,9 @@ function Assert-ConfigDrift([hashtable]$L,[hashtable]$R,[string[]]$AllowedAxes) 
     return $axes[0]
 }
 function Save-EvaluationSnapshot($measurement, $config, $name) {
+    # Snapshot is immutable: later live/HPA changes must never rewrite BEST evidence.
+    $measurement=$measurement | ConvertTo-Json -Depth 40 | ConvertFrom-Json
+    $config=Copy-Config $config $name
     $apps2 = @($measurement.Apps.PSObject.Properties | ForEach-Object { @{Name=$_.Name;Val=$_.Value} })
     $userP=0;$productP=0;$stressP=0
     foreach ($a in $apps2) { if ($a.Name -eq 'user') { $userP=[double](Get-OptionalPropertyValue $a.Val 'Performance' 0) } elseif ($a.Name -eq 'product') { $productP=[double](Get-OptionalPropertyValue $a.Val 'Performance' 0) } elseif ($a.Name -eq 'stress') { $stressP=[double](Get-OptionalPropertyValue $a.Val 'Performance' 0) } }
@@ -231,7 +233,7 @@ process.stdout.write(JSON.stringify({duration_seconds:d.duration_seconds,cost_de
 # 1150m이라 c5.large 관측 app budget 1180m 안에 1 Pod씩 들어가며,
 # 더 작은 실제 노드에서는 Enforce-IdleBudget이 기존 하한까지 자동 축소한다.
 $cpuRequestStart = @{ user=150.0; product=75.0; stress=925.0 }
-$cpuLimitStart = @{ user=$null; product=$null; stress=$null }  # CPU limit 제거: request만으로 burst 허용, memory limit은 유지
+$cpuLimitStart = @{ user=$null; product=$null; stress=2000.0 }  # immutable BASE reference; candidate analyzer may recommend a separate delta
 $memoryRequestStart = @{ user=64.0; product=64.0; stress=640.0 }
 $memoryLimitStart = @{ user=128.0; product=256.0; stress=1536.0 }  # Golden baseline: product 256Mi
 # 관측된 앱 비용과 보호 정책은 서로 다르다.
@@ -329,14 +331,15 @@ $script:ControlPointConfidenceByApp=@{}
 $script:ControlPointStateFile = Join-Path ([IO.Path]::GetTempPath()) 'wsi-hpa-controlpoints.json'
 $HpaTargetLowerBound=15.0      # EMPIRICAL_UNCONFIRMED (known-good 29/33/55 포함 범위)
 $HpaTargetUpperBound=90.0
-# Known-good reference (38점 검증 — literal 복사가 아니라 empirical prior)
-# Golden Baseline: user/product/stress 앱 세트에서 BASE seed로 사용하는 재현 구성.
-$GoldenBaseline = @{
-    Infra = @{ PrefixDelegation=$true; WarmPrefixTarget=1; MaxPods=110 }
-    Apps = @{
-        user    = @{ requestCpu='70m';  limitCpu=$null;   limitMemory='256Mi';  hpaTarget=33; minReplicas=2; maxReplicas=20; placement='SHARED' }
-        product = @{ requestCpu='70m';  limitCpu=$null;   limitMemory='256Mi';  hpaTarget=29; minReplicas=2; maxReplicas=20; placement='SHARED' }
-        stress  = @{ requestCpu='600m'; limitCpu=$null;   limitMemory='1536Mi'; hpaTarget=55; minReplicas=1; maxReplicas=12; placement='ISOLATED' }
+# Known-good reference is a projection of BaseConfig; do not duplicate app numbers.
+$GoldenBaseline = @{ Infra=@{PrefixDelegation=$true;WarmPrefixTarget=1;MaxPods=110}; Apps=@{} }
+foreach ($app in @('user','product','stress')) {
+    $b=$BaseConfig[$app]
+    $GoldenBaseline.Apps[$app]=@{
+        requestCpu=$b.requestCpu; requestMemory=$b.requestMemory
+        limitCpu=$b.limitCpu; limitMemory=$b.limitMemory
+        hpaTarget=$b.hpaTarget; minReplicas=$b.minReplicas; maxReplicas=$b.maxReplicas
+        placement=$b.placement; placementDomain=$b.placementDomain
     }
 }
 $KnownGoodReference = $GoldenBaseline.Apps
@@ -522,7 +525,7 @@ $script:nullDevice=if ($env:OS -eq 'Windows_NT' -or $IsWindows) { 'NUL' } else {
 function Initialize-HpaControlPointModel {
     # 기본값은 새 앱에서도 동작하는 보수적 prior이며, live HPA/request를 읽을 수
     # 있으면 현재 설정의 절대 제어점(request x target)을 먼저 사용한다.
-    $ref=@{user=@{cp=23.1;source='REFERENCE_PRIOR';conf=0.30};product=@{cp=20.3;source='REFERENCE_PRIOR';conf=0.30};stress=@{cp=165.0;source='REFERENCE_PRIOR';conf=0.30}}
+    $ref=@{user=@{cp=23.1;source='REFERENCE_PRIOR';conf=0.30};product=@{cp=20.3;source='REFERENCE_PRIOR';conf=0.30};stress=@{cp=330.0;source='REFERENCE_PRIOR';conf=0.30}}
     foreach ($app in $apps) {
         $cp=[double]$ref[$app].cp; $source=[string]$ref[$app].source; $confidence=[double]$ref[$app].conf
         try {
@@ -5747,6 +5750,79 @@ function Initialize-EndpointAndData {
     if ($getCode -ne '200') { throw "Product fixture를 조회할 수 없습니다: HTTP $getCode. 임의 데이터는 삽입하지 않습니다." }
 }
 
+# ============================================================
+# BASE-FIRST MATHEMATICAL RECOMMENDER
+# ============================================================
+# These functions are pure recommendation builders. They never mutate a config,
+# live cluster, or global candidate state.
+function New-RequestRecommendation($measurement,[hashtable]$config,[string]$app) {
+    $m=$measurement.Apps[$app]
+    if ($null -eq $m -or -not [bool](Get-OptionalPropertyValue $m 'MeasurementReliable' $false)) { return $null }
+    if (-not [bool](Get-OptionalPropertyValue $m 'SLOPass' $false)) { return $null }
+    $q75=Get-OptionalPropertyValue $m 'CPUP95Millicores' $null
+    if ($null -eq $q75 -or [double]$q75 -le 0) { return $null }
+    $current=[double](Convert-CpuToM $config[$app].requestCpu)
+    $proposed=[math]::Ceiling(([double]$q75*$CpuRequestMinHeadroom)/25.0)*25
+    $proposed=[math]::Max([double]$cpuRequestMinimum[$app],[double]$proposed)
+    if ($proposed -ge $current) { return $null }
+    return [pscustomobject]@{
+        Axis=("{0}_CPU_REQUEST" -f $app.ToUpperInvariant()); App=$app; Field='requestCpu'
+        Current=(Format-Cpu $current); Proposed=(Format-Cpu $proposed)
+        Confidence=0.82; ExpectedBenefit='NODE_DENSITY'; Risk=0.25
+        Evidence=@("Q75=$([math]::Round([double]$q75,1))m","headroom=$CpuRequestMinHeadroom","SLO=reliable")
+    }
+}
+function New-HpaMaxRecommendation($measurement,[hashtable]$config,[string]$app) {
+    $m=$measurement.Apps[$app]
+    if ($null -eq $m) { return $null }
+    $reasons=@(Get-OptionalPropertyValue $m 'Bottlenecks' @())
+    if ('HPA_CEILING' -notin $reasons -and 'ZERO_SUCCESS_CAPACITY' -notin $reasons) { return $null }
+    $generated=[double](Get-OptionalPropertyValue $m 'GeneratedLoadRatio' 0)
+    if ($generated -lt 0.95) { return $null }
+    $current=[int]$config[$app].maxReplicas
+    $hard=[int](Get-OptionalPropertyValue $script:HardSafetyMaxByApp $app $MaxAutoReplicas)
+    if ($current -ge $hard) { return $null }
+    $proposed=[int][math]::Min($hard,$current+1)
+    $cpu=[double](Get-OptionalPropertyValue $m 'AverageCPUUtilization' 0)
+    $confidence=[math]::Min(0.95,[math]::Max(0.55,0.60+([math]::Min(1.0,$cpu/100.0)*0.25)))
+    return [pscustomobject]@{
+        Axis=("{0}_HPA_MAX" -f $app.ToUpperInvariant()); App=$app; Field='maxReplicas'
+        Current=$current; Proposed=$proposed; Confidence=$confidence
+        ExpectedBenefit='HPA_CEILING'; Risk=0.35
+        Evidence=@("bottleneck=$($reasons -join ',')","generated=$([math]::Round($generated*100,1))%","cpu=$([math]::Round($cpu,1))%")
+    }
+}
+function Get-NextExperimentRecommendation($bestMeasurement,[hashtable]$bestConfig,[int]$ExperimentCount) {
+    # Environment/measurement failures never become tuning recommendations.
+    foreach ($app in $apps) {
+        $m=$bestMeasurement.Apps[$app]
+        $b=@(Get-OptionalPropertyValue $m 'Bottlenecks' @())
+        if ('CNI_FAILURE' -in $b -or 'ROLLOUT_FAILURE' -in $b -or 'POD_STARTUP_DELAY' -in $b -or [double](Get-OptionalPropertyValue $m 'PeakPendingReplicas' 0) -gt 0 -or [bool](Get-OptionalPropertyValue $bestMeasurement 'RolloutFailure' $false) -or [bool](Get-OptionalPropertyValue $bestMeasurement 'ApplyFailure' $false)) { return $null }
+    }
+    $recs=[System.Collections.Generic.List[object]]::new()
+    # Lock stress during the first two experiments as a safety rule.
+    foreach ($app in @('user','product','stress')) {
+        if ($app -eq 'stress' -and $ExperimentCount -lt 2) { continue }
+        $h=New-HpaMaxRecommendation $bestMeasurement $bestConfig $app
+        if ($h) { $recs.Add($h) }
+        $r=New-RequestRecommendation $bestMeasurement $bestConfig $app
+        if ($r) { $recs.Add($r) }
+    }
+    if (-not $recs.Count) { return $null }
+    # Ranking is only experiment order; KEEP/REJECT uses actual measured score.
+    return @($recs | Sort-Object @{Expression={([double]$_.Confidence*1.0)/([math]::Max(0.05,[double]$_.Risk))};Descending=$true},@{Expression='Axis';Descending=$false})[0]
+}
+function New-ExperimentCandidate([hashtable]$bestConfig,$recommendation,[string]$name) {
+    if ($null -eq $recommendation) { throw 'NO_SAFE_RECOMMENDATION' }
+    $candidate=Copy-Config $bestConfig $name
+    $candidate[$recommendation.App][$recommendation.Field]=$recommendation.Proposed
+    # Human-facing recommendation axis maps to the existing config field axis.
+    $diffAxis=("{0}_{1}" -f $recommendation.App,$recommendation.Field).ToUpperInvariant()
+    $axis=Assert-ConfigDrift $bestConfig $candidate @($diffAxis)
+    if ($axis -ne $diffAxis) { throw "RECOMMENDATION_AXIS_MISMATCH: $axis" }
+    return $candidate
+}
+
 Require kubectl;Require k6;Require $script:curlCmd;Require aws
 if (-not $SkipKubeconfig) {
     Write-Host "[tune] kubeconfig 갱신: aws eks update-kubeconfig --name $ClusterName --region $Region" -ForegroundColor Cyan
@@ -5804,6 +5880,10 @@ try {
         if (-not $NoApply) { Ensure-38PointStressTopology -ApplyPlacement }
         $baseReady=Apply-CandidateSafely $baseCfg Hard
         if (-not $baseReady) { throw 'BASE candidate가 Ready 상태가 되지 않아 측정할 수 없습니다.' }
+        $baseLive=Get-LiveConfig 'BASE_LIVE_VERIFY'
+        $baseDiff=@(Compare-Config $baseCfg $baseLive @())
+        if ($baseDiff.Count -ne 0) { throw "BASE_CONFIG_DRIFT: $([string]::Join(',',@($baseDiff | ForEach-Object { $_.App+'.'+$_.Field })))" }
+        Write-Host 'BASE_CONFIG_EXACT: live fingerprint matches immutable BaseConfig' -ForegroundColor Green
         $baseCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $baseCluster
         $baseRun=Run-ReliableLoadTest $baseCfg $ProbeDurationSec $baseCluster 0 -SkipRetry
         $baseMeas=$baseRun.Result; if(-not $baseMeas){throw 'BASE measurement failed'}
@@ -5812,33 +5892,35 @@ try {
         Save-BaseExperimentProfile $baseCfg $baseMeas $baseProfilePath | Out-Null
         Write-Host ("BASE Eval={0:N2} user={1:N1}% prod={2:N1}% stress={3:N1}% profile={4}" -f $bestSnap.EvalScore,$bestSnap.UserPerformance,$bestSnap.ProductPerformance,$bestSnap.StressPerformance,$baseProfilePath) -ForegroundColor Cyan
 
-        # Exactly one delta from the current BEST. A rejected candidate is rolled
-        # back by re-applying the complete BEST config, never by partial fields.
-        # 현재 user request에서 하나의 안전한 ONE DELTA를 자동 생성한다.
-        # 70m->60m 같은 앱별 고정값을 사용하지 않는다.
-        $delta=Copy-Config $bestCfg 'DELTA_USER_CPU'
-        $deltaReqM=[double](Convert-CpuToM $bestCfg.user.requestCpu)
-        $deltaReqM=[math]::Max([double]$cpuRequestMinimum.user,[math]::Floor(($deltaReqM*0.85)/25.0)*25.0)
-        if ($deltaReqM -ge [double](Convert-CpuToM $bestCfg.user.requestCpu)) { $deltaReqM=[double](Convert-CpuToM $bestCfg.user.requestCpu)+25.0 }
-        $delta.user.requestCpu=Format-Cpu $deltaReqM
-        Assert-ConfigDrift $bestCfg $delta @('USER_REQUESTCPU') | Out-Null
-        Write-Host ("`n===== ONE DELTA: USER_CPU_REQUEST {0}m -> {1}m =====" -f (Convert-CpuToM $bestCfg.user.requestCpu),$deltaReqM) -ForegroundColor Green
-        $deltaMeas=$null
-        $deltaReady=Apply-CandidateSafely $delta Hard
-        $deltaCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $deltaCluster
-        $deltaRun=$null
-        if ($deltaReady) { $deltaRun=Run-ReliableLoadTest $delta $ProbeDurationSec $deltaCluster 0 -SkipRetry }
-
-        if ($deltaRun -and $deltaRun.Result) {
-            $deltaSnap=Save-EvaluationSnapshot $deltaRun.Result $delta 'DELTA_USER_CPU'
-            Write-Host ("DELTA Eval={0:N2} BEST={1:N2}" -f $deltaSnap.EvalScore,$bestSnap.EvalScore) -ForegroundColor Cyan
-            if ($deltaSnap.EvalScore -gt $bestSnap.EvalScore) {
-                $bestSnap=$deltaSnap; $bestCfg=$delta; Write-Host '  -> KEEP' -ForegroundColor Green
-            } else {
-                Apply-CandidateSafely $bestCfg Hard
-            }
-        } else {
-            Apply-CandidateSafely $bestCfg Hard
+        # ONE DELTA loop: recommendation is generated from immutable BEST measurement,
+        # candidate is an exact BEST copy plus one field, and rejected candidates never
+        # become the input of the next recommendation.
+        $hist=[System.Collections.Generic.List[object]]::new()
+        for ($ei=1; $ei -le 3; $ei++) {
+            if ((Get-RemainingRuntimeSeconds Tuning) -lt (240 + (Get-EstimatedMeasurementDuration $ProbeDurationSec))) { Write-Warning 'Runtime 부족: recommendation experiment 종료'; break }
+            $rec=Get-NextExperimentRecommendation $bestSnap.Measurement $bestCfg ($ei-1)
+            if ($null -eq $rec) { Write-Host 'NO_SAFE_RECOMMENDATION: BEST verification으로 진행' -ForegroundColor Yellow; break }
+            Write-Host "`n===== RECOMMENDATION #$ei =====" -ForegroundColor Cyan
+            Write-Host ("  Axis={0}  Current={1}  Proposed={2}" -f $rec.Axis,$rec.Current,$rec.Proposed)
+            Write-Host ("  Formula={0}  Confidence={1:P0}  Benefit={2}  Evidence={3}" -f $rec.Field,$rec.Confidence,$rec.ExpectedBenefit,($rec.Evidence -join '; ')) -ForegroundColor DarkGray
+            $cand=New-ExperimentCandidate $bestCfg $rec "Exp$ei"
+            $ac=Copy-Config $cand "Exp$ei"; foreach($app in $apps){$ac[$app].replicas=1}
+            Write-Host "`n===== EXPERIMENT #$ei =====" -ForegroundColor Green
+            $candidateValid=$false; $es=$null
+            try {
+                Apply-Resources $ac Hard; Apply-Hpa $ac; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+                $cl=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $cl
+                $er=Run-ReliableLoadTest $ac $ProbeDurationSec $cl 0 -SkipRetry; $em=$er.Result
+                if ($em) {
+                    $candidateValid=($apps | ForEach-Object { [bool](Get-OptionalPropertyValue $em.Apps[$_] 'MeasurementReliable' $false) } | Where-Object { -not $_ }).Count -eq 0
+                    if ($candidateValid) { $es=Save-EvaluationSnapshot $em $ac "Exp$ei" }
+                }
+            } catch { Write-Warning "Experiment #$ei 환경/측정 실패: $($_.Exception.Message)" }
+            $keep=($candidateValid -and $es -and ($es.EvalScore -gt $bestSnap.EvalScore -or ($es.EvalScore -eq $bestSnap.EvalScore -and $es.AvgNodes -lt $bestSnap.AvgNodes)))
+            $decision=if ($keep) { 'KEEP' } else { 'REJECT' }
+            Write-Host ("  actual Eval={0} BEST={1:N2} Decision={2}" -f $(if($es){'{0:N2}' -f $es.EvalScore}else{'INVALID'}),$bestSnap.EvalScore,$decision) -ForegroundColor $(if($keep){'Green'}else{'Yellow'})
+            $hist.Add([pscustomobject]@{Num=$ei;Axis=$rec.Axis;Current=$rec.Current;Proposed=$rec.Proposed;Decision=$decision;Score=$(if($es){$es.EvalScore}else{$null});BaseFingerprint=$bestSnap.ConfigFingerprint})
+            if ($keep) { $bestSnap=$es; $bestCfg=$ac } else { Apply-CandidateSafely $bestCfg Hard; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard} }
         }
 
         # BEST verification uses the complete selected BEST configuration.
@@ -7023,9 +7105,13 @@ if ($BaseExperiment) {
         if ($p.hpaTarget -ne 29) { throw 'product target' }
         if ($p.maxReplicas -ne 20) { throw 'product max' }
         if ($st.requestCpu -ne '600m') { throw 'stress req' }
-        if ($null -ne $st.limitCpu) { throw 'stress CPU limit not null' }
+        if ($st.requestMemory -ne '640Mi') { throw 'stress reqMem' }
+        if ($st.limitCpu -ne '2000m') { throw 'stress CPU limit' }
+        if ($st.limitMemory -ne '1536Mi') { throw 'stress limMem' }
         if ($st.hpaTarget -ne 55) { throw 'stress target' }
-        if ($st.maxReplicas -ne 12) { throw 'stress max' }
+        if ($st.minReplicas -ne 1) { throw 'stress min' }
+        if ($st.maxReplicas -ne 6) { throw 'stress max' }
+        if ($st.placement -ne 'ISOLATED') { throw 'stress placement' }
     }
 
     # TEST 2: hpaMaxMinimum does not mutate BaseConfig

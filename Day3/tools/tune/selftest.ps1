@@ -24,9 +24,13 @@ if ($BaseExperiment) {
         if ($p.hpaTarget -ne 29) { throw 'product target' }
         if ($p.maxReplicas -ne 20) { throw 'product max' }
         if ($st.requestCpu -ne '600m') { throw 'stress req' }
-        if ($null -ne $st.limitCpu) { throw 'stress CPU limit not null' }
+        if ($st.requestMemory -ne '640Mi') { throw 'stress reqMem' }
+        if ($st.limitCpu -ne '2000m') { throw 'stress CPU limit' }
+        if ($st.limitMemory -ne '1536Mi') { throw 'stress limMem' }
         if ($st.hpaTarget -ne 55) { throw 'stress target' }
-        if ($st.maxReplicas -ne 12) { throw 'stress max' }
+        if ($st.minReplicas -ne 1) { throw 'stress min' }
+        if ($st.maxReplicas -ne 6) { throw 'stress max' }
+        if ($st.placement -ne 'ISOLATED') { throw 'stress placement' }
     }
 
     # TEST 2: hpaMaxMinimum does not mutate BaseConfig
@@ -109,6 +113,47 @@ if ($BaseExperiment) {
         if ([string]::IsNullOrWhiteSpace($fp)) { throw 'empty fingerprint' }
         $parts=$fp -split ';'
         if ($parts.Count -ne 3) { throw "expected 3 apps got $($parts.Count)" }
+    }
+
+    # TEST 12: Base stress control point is 330m
+    Assert-Test 'Base stress control point' {
+        $cp=(Convert-CpuToM $BaseConfig.stress.requestCpu)*[double]$BaseConfig.stress.hpaTarget/100.0
+        if ([math]::Abs($cp-330.0) -gt 0.01) { throw "stress cp=$cp" }
+    }
+
+    # TEST 13: New-ExperimentCandidate changes exactly one field
+    Assert-Test 'Candidate one delta' {
+        $best=Copy-Config $BaseConfig 'best'
+        $rec=[pscustomobject]@{Axis='USER_CPU_REQUEST';App='user';Field='requestCpu';Current='70m';Proposed='50m';Confidence=0.8;ExpectedBenefit='NODE_DENSITY';Risk=0.2}
+        $cand=New-ExperimentCandidate $best $rec 'candidate'
+        $diff=@(Compare-Config $best $cand @('USER_REQUESTCPU'))
+        if ($diff.Count -ne 1 -or $diff[0].Axis -ne 'USER_REQUESTCPU') { throw 'candidate is not one delta' }
+    }
+
+    # TEST 14: analyzer does not mutate BEST
+    Assert-Test 'Analyzer does not mutate BEST' {
+        $best=Copy-Config $BaseConfig 'best'; $before=Get-ConfigFingerprintFromValues $best
+        $metric=[pscustomobject]@{MeasurementReliable=$true;SLOPass=$true;CPUP95Millicores=30;Bottlenecks=@();GeneratedLoadRatio=1.0}
+        $m=[pscustomobject]@{Apps=[pscustomobject]@{user=$metric;product=$metric;stress=$metric}}
+        [void](New-RequestRecommendation $m $best 'user')
+        if ($before -ne (Get-ConfigFingerprintFromValues $best)) { throw 'BEST mutated by analyzer' }
+    }
+
+    # TEST 15: rejected candidate never becomes next BEST
+    Assert-Test 'Reject inheritance invariant' {
+        $best=Copy-Config $BaseConfig 'best'; $rejected=New-ExperimentCandidate $best ([pscustomobject]@{Axis='USER_CPU_REQUEST';App='user';Field='requestCpu';Current='70m';Proposed='50m'}) 'reject'
+        if ((Get-ConfigFingerprintFromValues $best) -eq (Get-ConfigFingerprintFromValues $rejected)) { throw 'candidate did not differ' }
+        $next=Copy-Config $best 'next'
+        if ((Get-ConfigFingerprintFromValues $next) -ne (Get-ConfigFingerprintFromValues $best)) { throw 'next inherited reject' }
+    }
+
+    # TEST 16: deterministic recommendation for same measurement
+    Assert-Test 'Recommendation deterministic' {
+        $best=Copy-Config $BaseConfig 'best'
+        $metric=[pscustomobject]@{MeasurementReliable=$true;SLOPass=$true;CPUP95Millicores=30;Bottlenecks=@();GeneratedLoadRatio=1.0}
+        $m=[pscustomobject]@{Apps=[pscustomobject]@{user=$metric;product=$metric;stress=$metric}}
+        $a=New-RequestRecommendation $m $best 'user'; $b=New-RequestRecommendation $m $best 'user'
+        if ($a.Axis -ne $b.Axis -or $a.Proposed -ne $b.Proposed) { throw 'recommendation changed' }
     }
 
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
