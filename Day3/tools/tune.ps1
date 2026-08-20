@@ -35,7 +35,8 @@ param(
     [ValidateRange(1, 20)][int]$MaxNodes = 3,
     [ValidateRange(1, 20)][int]$IdleNodes = 1,
     [ValidateRange(1, 20)][int]$ManagedNodes = 1,
-    [ValidateRange(1, 20)][int]$CostBaselineNodes = 3,
+    # Grader cost baseline is two c5.large nodes (one managed + one Karpenter).
+    [ValidateRange(1, 20)][int]$CostBaselineNodes = 2,
     [ValidateRange(2, 30)][int]$MaxAutoReplicas = 12,
     # arrival-rate 목표를 생성할 수 있도록 VU 여유를 확보한다.
     # 요청률/Stress length는 변경하지 않고 k6 generator saturation만 방지한다.
@@ -1237,19 +1238,19 @@ function Apply-Hpa([hashtable]$config) {
 }
 
 function Apply-CandidateSafely([hashtable]$config,[ValidateSet('Hard','Tuning')][string]$Deadline='Hard') {
-    # 후보 전환 중 이전 부하의 HPA metric이 새 rollout을 흔들지 않도록
-    # 먼저 모든 앱을 1 replica/1..1 HPA로 고정한다.
+    # Never freeze a live service to 1..1. Apply the resource delta while the
+    # existing replicas/HPA continue serving, then only scale UP to the candidate
+    # minimum if the current deployment is below it.
     $allReady=$true
-    foreach ($app in $apps) {
-        $freeze='{"spec":{"minReplicas":1,"maxReplicas":1}}'
-        Invoke-Kubectl @('-n',$Namespace,'patch','hpa',$app,'--type=merge','-p',$freeze)
-        Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app",'--replicas=1')
-    }
     Apply-Resources $config $Deadline
     Apply-Hpa $config
     foreach ($app in $apps) {
         $warm=[int][math]::Max(1,$config[$app].minReplicas)
-        Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$warm")
+        $current=0
+        try { $current=[int]((Invoke-Kubectl @('-n',$Namespace,'get','deployment',$app,'-o','jsonpath={.spec.replicas}')) -join '') } catch { $current=0 }
+        if ($current -lt $warm) {
+            Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$warm")
+        }
     }
     foreach ($app in $apps) {
         try {
@@ -1266,10 +1267,25 @@ function Apply-CandidateSafely([hashtable]$config,[ValidateSet('Hard','Tuning')]
             Write-Warning "candidate available 대기 timeout($app): $($_.Exception.Message)"
         }
     }
-    # HPA controllers and the freeze phase can race during rollout. Re-apply the
-    # candidate after readiness so the exact candidate fingerprint is what is measured.
+    # Re-apply after readiness so the measured fingerprint is the candidate.
     Apply-Hpa $config
     return $allReady
+}
+
+function Assert-MeasurementReady([int]$RecentSeconds = 90) {
+    $pods=((& kubectl get pods -n $Namespace -o json 2>$null) -join '') | ConvertFrom-Json
+    $bad=@($pods.items | Where-Object {
+        $_.metadata.deletionTimestamp -eq $null -and $_.status.phase -ne 'Running'
+    })
+    if ($bad.Count) { throw "MEASUREMENT_ENV_INVALID: app pods not Running ($($bad.metadata.name -join ','))" }
+    $events=((& kubectl get events -A --field-selector reason=FailedCreatePodSandBox -o json 2>$null) -join '') | ConvertFrom-Json
+    $cutoff=(Get-Date).ToUniversalTime().AddSeconds(-1*[math]::Max(30,$RecentSeconds))
+    $recent=@($events.items | Where-Object {
+        $stamp=$_.eventTime; if (-not $stamp) { $stamp=$_.lastTimestamp }; if (-not $stamp) { $stamp=$_.firstTimestamp }
+        try { ([datetime]$stamp).ToUniversalTime() -ge $cutoff } catch { $false }
+    })
+    if ($recent.Count) { throw "MEASUREMENT_ENV_INVALID: recent CNI FailedCreatePodSandBox=$($recent.Count)" }
+    Write-Host "MEASUREMENT_ENV_READY: Pods Running, recent CNI sandbox errors=0" -ForegroundColor Green
 }
 
 function Wait-ReadyNodeCountAtMost([int]$targetTotal, [int]$timeoutSec, [ValidateSet('Hard','Tuning')][string]$Deadline = 'Tuning') {
@@ -1338,49 +1354,37 @@ function Set-IdleState([int]$waitSec = $IdleWaitSec, [switch]$SkipNodeWait, [swi
 }
 
 function Prepare-Test([hashtable]$config, $cluster, [switch]$PreserveKarpenterNodes) {
-    # 먼저 HPA/Deployment를 1개로 고정한 뒤 다음 후보 resources를 적용한다.
-    # 이전 tier가 1-Node에 안 들어가는 상태에서 먼저 Node 축소를 기다리는 시간 낭비를 피한다.
-    Set-IdleState -SkipNodeWait -PreserveKarpenterNodes:$PreserveKarpenterNodes
+    # Measurement preparation must not take a serving application through 1..1.
+    # Keep the current replicas/HPA while rolling the candidate, then warm only
+    # missing minimum replicas. This makes BASE and candidate windows comparable
+    # to the grader's continuously serving state.
     Apply-Resources $config
-    # P0: 측정 준비에서 Karpenter drain 금지 — IdleOneNodeFit 여부와 무관하게
-    # 정상 OperatingNodeBudget의 existing warm nodes를 유지한다.
-    # (drain하면 PDB eviction 실패 반복 + nodeSelector(전용 노드) 때문에 스케줄 불가
-    #  → stress Pending → 측정 자체가 망가짐. 노드 축소는 Karpenter consolidate가 담당)
     $idle=Get-IdleCapacity $config $cluster
     if (-not $idle.IdleOneNodeFit) { Write-Warning "$($config.Name)은 IdleOneNodeFit=false — warm node 유지 상태로 측정합니다." }
     Apply-Hpa $config
     foreach ($app in $apps) {
-        $availableTimeout=Get-DeadlineTimeoutSeconds 90 Tuning
-        Invoke-Kubectl @('-n',$Namespace,'wait','--for=condition=Available',"deployment/$app","--timeout=${availableTimeout}s")
-    }
-    # P0: 측정은 채점 시작 상태(warm min)와 동일하게 시작한다.
-    #     Set-IdleState가 1로 동결한 직후 HPA sync + Pod 기동 지연 때문에 k6 시작 후
-    #     60~90초가 1 replica 포화되어 stress SLO가 0%로 무너지는 측정 왜곡을 제거한다.
-    #     부족한 용량(Pending/Node 대기)이면 경고 후 준비된 replica만으로 측정한다.
-    foreach ($app in $apps) {
-        $warmMin=[int]$config[$app].minReplicas
-        if ($warmMin -gt 1) {
-            try {
-                Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$warmMin")
-                Write-Host ("  warm prewarm [{0}]: replicas=1 -> {1} (적용 설정 min)" -f $app,$warmMin) -ForegroundColor DarkGray
-            } catch { Write-Warning "warm prewarm scale 실패($app): $($_.Exception.Message)" }
+        $warmMin=[int][math]::Max(1,$config[$app].minReplicas)
+        $current=0
+        try { $current=[int]((Invoke-Kubectl @('-n',$Namespace,'get','deployment',$app,'-o','jsonpath={.spec.replicas}')) -join '') } catch { $current=0 }
+        if ($current -lt $warmMin) {
+            Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$warmMin")
+            Write-Host ("  warm prewarm [{0}]: replicas={1} -> {2} (scale-up only)" -f $app,$current,$warmMin) -ForegroundColor DarkGray
         }
     }
     foreach ($app in $apps) {
-        # wait Available은 최소 1개만 보장 — min까지의 준비 replica 수를 폴링으로 확정한다.
-        $warmMin=[int]$config[$app].minReplicas
-        if ($warmMin -le 1) { continue }
+        $availableTimeout=Get-DeadlineTimeoutSeconds 90 Tuning
+        Invoke-Kubectl @('-n',$Namespace,'wait','--for=condition=Available',"deployment/$app","--timeout=${availableTimeout}s")
+        $warmMin=[int][math]::Max(1,$config[$app].minReplicas)
         $warmDeadline=(Get-Date).AddSeconds([math]::Max(10,(Get-DeadlineTimeoutSeconds 150 Tuning)))
         $ready=0
         while ((Get-Date) -lt $warmDeadline -and $ready -lt $warmMin) {
-            try { $ready=[int]((Invoke-Kubectl @('-n',$Namespace,'get','deploy',$app,'-o','jsonpath={.status.readyReplicas}')) -join '') } catch { $ready=0 }
+            try { $ready=[int]((Invoke-Kubectl @('-n',$Namespace,'get','deployment',$app,'-o','jsonpath={.status.readyReplicas}')) -join '') } catch { $ready=0 }
             if ($ready -lt $warmMin) { Start-Sleep -Seconds 5 }
         }
         if ($ready -lt $warmMin) {
-            Write-Warning "warm min prewarm 대기 timeout($app): ready=$ready < min=$warmMin — 준비된 replica만으로 측정"
-        } else {
-            Write-Host ("  warm ready [{0}]: {1}/{1}" -f $app,$warmMin) -ForegroundColor DarkGray
+            throw "MEASUREMENT_PREP_NOT_READY: $app ready=$ready min=$warmMin"
         }
+        Write-Host ("  warm ready [{0}]: {1}/{1}" -f $app,$warmMin) -ForegroundColor DarkGray
     }
 }
 
@@ -1388,16 +1392,16 @@ function Restore-Config([hashtable]$config) {
     if (-not $config) { return }
     Write-Warning "원래 Deployment/HPA 설정을 복구합니다."
     try {
-        # 부하 중 HPA가 늘린 replica가 복구 롤아웃을 방해하지 않도록
-        # 복구 구간에서는 일시적으로 min/max=1로 고정한다. 롤아웃 완료 후
-        # 복구 후에도 대회 운영 정책에 따라 HPA minReplicas=1을 유지한다.
-        foreach ($app in $apps) {
-            $freeze = @{spec=@{minReplicas=1;maxReplicas=1}} | ConvertTo-Json -Compress
-            Invoke-Kubectl @('-n',$Namespace,'patch','hpa',$app,'--type=merge','-p',$freeze)
-        }
+        # Recovery is also non-disruptive: never freeze a serving app to 1..1.
+        # Restore resources/HPA in place and only scale up to the original replica
+        # count if the current deployment is below it.
         Apply-Resources $config
-        foreach ($app in $apps) { Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$($config[$app].replicas)") }
+        Apply-Hpa $config
         foreach ($app in $apps) {
+            $wanted=[int][math]::Max(1,$config[$app].replicas)
+            $current=0
+            try { $current=[int]((Invoke-Kubectl @('-n',$Namespace,'get','deployment',$app,'-o','jsonpath={.spec.replicas}')) -join '') } catch { $current=0 }
+            if ($current -lt $wanted) { Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$wanted") }
             try {
                 $restoreTimeout=Get-DeadlineTimeoutSeconds 30 Hard
                 Invoke-Kubectl @('-n',$Namespace,'wait','--for=condition=Available',"deployment/$app","--timeout=${restoreTimeout}s")
@@ -1438,18 +1442,32 @@ function Assert-LiveConfigMatches([hashtable]$expected) {
 }
 
 function Set-KarpenterNodeLimit($cluster) {
-    # 38점 재현: NodePool spec.limits.cpu는 튜너가 관리하지 않는다.
-    # 별도 CPU limit을 주입하면 stress scale-out 동작이 달라진다.
+    # Enforce the real total-node ceiling through per-pool CPU budgets. Karpenter
+    # has no account-wide node limit, so reserve at most one c5.large for the
+    # shared pool and one for the dedicated pool within MaxNodes-ManagedNodes.
+    $karpenterBudget=[math]::Max(0,$MaxNodes-$ManagedNodes)
+    $sharedNodes=if ($DedicatedApp -and $karpenterBudget -ge 2) { 1 } else { 0 }
+    $dedicatedNodes=[math]::Max(0,$karpenterBudget-$sharedNodes)
+    $desired=@{default=[math]::Max(1,$sharedNodes*2000);stress=[math]::Max(1,$dedicatedNodes*2000)}
     foreach ($pool in @('default','stress')) {
         try {
             $obj=((& kubectl get nodepool $pool -o json 2>$null) -join '') | ConvertFrom-Json
-            Write-Host ("NodePool/{0} CPU limit observed: {1}" -f $pool,$obj.spec.limits.cpu) -ForegroundColor DarkGray
-        } catch { Write-Warning "NodePool/$pool 조회 실패: $($_.Exception.Message)" }
+            if (-not $obj) { throw "NodePool/$pool not found" }
+            $old=[string]$obj.spec.limits.cpu
+            $new=Format-Cpu ([double]$desired[$pool])
+            if ([string]$old -ne [string]$new) {
+                $patch=@{spec=@{limits=@{cpu=$new}}} | ConvertTo-Json -Compress -Depth 8
+                Invoke-Kubectl @('patch','nodepool',$pool,'--type=merge','-p',$patch)
+                Write-Host ("NodePool/{0} CPU limit: {1} -> {2} (MaxNodes={3}, KarpenterBudget={4})" -f $pool,$old,$new,$MaxNodes,$karpenterBudget) -ForegroundColor Yellow
+            } else {
+                Write-Host ("NodePool/{0} CPU limit enforced: {1}" -f $pool,$new) -ForegroundColor DarkGray
+            }
+        } catch { throw "NodePool/$pool CPU limit 적용 실패: $($_.Exception.Message)" }
     }
 }
 
 function Restore-KarpenterNodeLimit {
-    # Set-KarpenterNodeLimit가 mutation을 하지 않으므로 복구도 no-op이다.
+    # Final grading configuration intentionally keeps the enforced budget.
 }
 
 function Set-InstanceAwarePlacement {
@@ -5882,7 +5900,10 @@ try {
         }
         $baseCfg=Copy-Config $baseSeed 'BASE'; foreach($app in $apps){$baseCfg[$app].replicas=[int]$baseCfg[$app].minReplicas}
         foreach($app in $apps){ Write-Host ("BASE candidate {0}: req={1}/{2} limit={3}/{4} HPA={5}..{6}" -f $app,$baseCfg[$app].requestCpu,$baseCfg[$app].requestMemory,$baseCfg[$app].limitCpu,$baseCfg[$app].limitMemory,$baseCfg[$app].minReplicas,$baseCfg[$app].maxReplicas) -ForegroundColor DarkGray }
-        if (-not $NoApply) { Ensure-38PointStressTopology -ApplyPlacement }
+        if (-not $NoApply) {
+            Ensure-38PointStressTopology -ApplyPlacement
+            $preBaseCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $preBaseCluster
+        }
         $baseReady=Apply-CandidateSafely $baseCfg Hard
         if (-not $baseReady) { throw 'BASE candidate가 Ready 상태가 되지 않아 측정할 수 없습니다.' }
         $baseLive=Get-LiveConfig 'BASE_LIVE_VERIFY'
@@ -5891,6 +5912,11 @@ try {
         if ($baseDiff.Count -ne 0) { throw "BASE_CONFIG_DRIFT: $([string]::Join(',',@($baseDiff | ForEach-Object { $_.App+'.'+$_.Field })))" }
         Write-Host 'BASE_CONFIG_EXACT: live fingerprint matches immutable BaseConfig' -ForegroundColor Green
         $baseCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $baseCluster
+        if (-not $NoApply) {
+            $withinBudget=Wait-ReadyNodeCountAtMost $CostBaselineNodes 180 Hard
+            if (-not $withinBudget) { throw "BASE_ENVIRONMENT_INVALID: Ready node budget did not converge to $CostBaselineNodes" }
+            Assert-MeasurementReady 90
+        }
         $baseRun=Run-ReliableLoadTest $baseCfg $ProbeDurationSec $baseCluster 0 -SkipRetry
         $baseMeas=$baseRun.Result; if(-not $baseMeas){throw 'BASE measurement failed'}
         $baseSnap=Save-EvaluationSnapshot $baseMeas $baseCfg 'BASE'; $bestSnap=$baseSnap; $bestCfg=$baseCfg
@@ -5910,11 +5936,12 @@ try {
             Write-Host ("  Axis={0}  Current={1}  Proposed={2}" -f $rec.Axis,$rec.Current,$rec.Proposed)
             Write-Host ("  Formula={0}  Confidence={1:P0}  Benefit={2}  Evidence={3}" -f $rec.Field,$rec.Confidence,$rec.ExpectedBenefit,($rec.Evidence -join '; ')) -ForegroundColor DarkGray
             $cand=New-ExperimentCandidate $bestCfg $rec "Exp$ei"
-            $ac=Copy-Config $cand "Exp$ei"; foreach($app in $apps){$ac[$app].replicas=1}
+            $ac=Copy-Config $cand "Exp$ei"
             Write-Host "`n===== EXPERIMENT #$ei =====" -ForegroundColor Green
             $candidateValid=$false; $es=$null
             try {
-                Apply-Resources $ac Hard; Apply-Hpa $ac; foreach($app in $apps){Wait-DeploymentRollout $app 180 Hard}
+                $candidateReady=Apply-CandidateSafely $ac Hard
+                if (-not $candidateReady) { throw 'CANDIDATE_ROLLOUT_NOT_READY' }
                 $cl=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $cl
                 $er=Run-ReliableLoadTest $ac $ProbeDurationSec $cl 0 -SkipRetry; $em=$er.Result
                 if ($em) {
