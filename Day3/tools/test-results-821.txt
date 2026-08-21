@@ -344,6 +344,26 @@ Karpenter subnet selector repair (after explicit owner approval):
     subnet-0e7ef5168e828794d with a public IP.
   - Probe Pod reached Running; it and its temporary NodeClaim/EC2 were then
     deleted, and the original three nodes/apps remained healthy.
+
+Fresh 순차증가 after subnet repair:
+  Run ID: run-1787298425
+  Score: 23.0 / 40
+  Availability: user 99.97%, product 99.98%, stress 99.33%
+  Performance: user 24.77%, product 101.11%, stress 85.48%
+  Average EC2: 4.53 (cost score 0/12)
+  Node range: 3 -> 6 during measurement; dropped=0; CNI errors=0
+  Peak HPA: user 20/20, product 20/20, stress 7/12
+  Peak measured CPU: user 1496.3m, product 550.9m, stress 2697.9m
+  Evidence: C:\Users\competitor\AppData\Local\Temp\wsi-sequential-after-subnet-fix-20260821-1640\profile-sweep-DIAGNOSTIC.json
+
+Decision/evidence:
+  - The 16.5 dashboard shown before this run was run-1787294395, the invalid
+    pre-fix measurement; it was not the new execution.
+  - Public-subnet node provisioning repaired stress availability from 49.13%
+    to 99.33% and stress performance from 23.52% to 85.48%.
+  - Remaining primary bottleneck is user at its measured HPA ceiling 20/20.
+  - After measurement, extra Karpenter capacity was removed only after load
+    stopped; all apps Ready at the topology floor of two nodes.
 ====================================================
 
 ====================================================
