@@ -6063,10 +6063,17 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
     if (@($samples | Where-Object { [int]$_.CniErrors -gt 0 }).Count) {
         return [pscustomobject]@{Type='CNI_IP_CAPACITY';Signature='CNI_IP_CAPACITY';App=$null;Reason='FailedCreatePodSandBox; application capacity must not be increased'}
     }
-    $pending=@($samples | ForEach-Object { @($_.Pending) })
-    if (@($pending | Where-Object { $_.Reason -match 'Insufficient cpu' }).Count) { return [pscustomobject]@{Type='NODE_CPU_CAPACITY';Signature='NODE_CPU_CAPACITY';App=$null;Reason='Pending Insufficient cpu'} }
-    if (@($pending | Where-Object { $_.Reason -match 'Insufficient memory' }).Count) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Signature='NODE_MEMORY_CAPACITY';App=$null;Reason='Pending Insufficient memory'} }
-    if ($pending.Count) { return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Signature='SCHEDULER_PLACEMENT';App=$null;Reason=(@($pending.Reason) -join '; ')} }
+    # A short Pending window while Karpenter launches a node is expected elastic
+    # behavior, not proof of exhausted capacity. Stop mutation only when Pending
+    # persists across a meaningful portion of the measured samples.
+    $pendingSamples=@($samples | Where-Object { @($_.Pending).Count -gt 0 })
+    $sustainedPendingThreshold=[math]::Max(3,[math]::Ceiling($samples.Count*0.10))
+    if ($pendingSamples.Count -ge $sustainedPendingThreshold) {
+        $pending=@($pendingSamples | ForEach-Object { @($_.Pending) })
+        if (@($pending | Where-Object { $_.Reason -match 'Insufficient cpu' }).Count) { return [pscustomobject]@{Type='NODE_CPU_CAPACITY';Signature='NODE_CPU_CAPACITY';App=$null;Reason="sustained Pending Insufficient cpu ($($pendingSamples.Count)/$($samples.Count) samples)"} }
+        if (@($pending | Where-Object { $_.Reason -match 'Insufficient memory' }).Count) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Signature='NODE_MEMORY_CAPACITY';App=$null;Reason="sustained Pending Insufficient memory ($($pendingSamples.Count)/$($samples.Count) samples)"} }
+        return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Signature='SCHEDULER_PLACEMENT';App=$null;Reason="sustained Pending ($($pendingSamples.Count)/$($samples.Count) samples): $(@($pending.Reason) -join '; ')"}
+    }
 
     $ceilingCandidates=[System.Collections.Generic.List[object]]::new()
     foreach ($app in $apps) {
