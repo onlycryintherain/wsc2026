@@ -90,10 +90,15 @@ param(
     [ValidateRange(1, 100)][int]$MaxProfileCandidates = 20
 )
 
-# Safe production default: discover unknown workloads and use external fresh
-# profile measurements. The legacy/app-fixture pipeline is explicit opt-in only.
+# The only production path discovers unknown workloads and uses external fresh
+# profile measurements. App-fixture/legacy paths remain loadable only by tests.
 if ($SelfTestOnly) { $BaseExperiment=$true; $ProfileSweepOnly=$false }
-elseif (-not $LegacyAdaptive -and -not $PerformanceGateOnly) { $ProfileSweepOnly=$true; $BaseExperiment=$false }
+else {
+    if ($LegacyAdaptive -or $PerformanceGateOnly -or $PSBoundParameters.ContainsKey('BaseExperiment')) {
+        throw 'LEGACY_APPLICATION_POLICY_DISABLED: production tuning must use measured unknown-application lifecycle'
+    }
+    $ProfileSweepOnly=$true; $BaseExperiment=$false
+}
 
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($DataFile)) {
