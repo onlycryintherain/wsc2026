@@ -332,6 +332,21 @@ if ($BaseExperiment) {
         try{$script:HardSafetyMaxByApp.user=48;$rec=Get-DynamicSweepRecommendation $best $evaluation @();if($rec.Type-ne'HPA_CEILING'-or$rec.App-ne'user'-or$rec.To-ne40){throw "unexpected $($rec.Type) $($rec.App) $($rec.To)"}}finally{$script:HardSafetyMaxByApp.user=$oldHard}
     }
 
+    # TEST 33: external profile measurements use fast scale-up but retain the
+    # peak for five minutes to prevent CPU-noise downscale during a spike.
+    Assert-Test 'External HPA behavior prevents spike flapping' {
+        $behavior=Get-StandardHpaBehavior
+        if([int]$behavior.scaleUp.stabilizationWindowSeconds-ne0-or[int]$behavior.scaleDown.stabilizationWindowSeconds-ne300-or$behavior.scaleDown.selectPolicy-ne'Min'){throw 'unsafe external HPA behavior'}
+    }
+
+    # TEST 34: FINAL_FRESH cannot be accepted when either independent gate is off.
+    Assert-Test 'Final fresh requires both gates' {
+        $good=[pscustomobject]@{AllPerformanceGuards=$true;AllCostGuards=$true;PrimaryScore=$ProfileTargetScore}
+        $perfOff=[pscustomobject]@{AllPerformanceGuards=$false;AllCostGuards=$true;PrimaryScore=40}
+        $costOff=[pscustomobject]@{AllPerformanceGuards=$true;AllCostGuards=$false;PrimaryScore=40}
+        if(-not(Test-ExternalSweepFinalAccepted $good)-or(Test-ExternalSweepFinalAccepted $perfOff)-or(Test-ExternalSweepFinalAccepted $costOff)){throw 'final gate acceptance regression'}
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
     if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }

@@ -936,6 +936,22 @@ function Get-StandardHpaBehavior([string]$app = '') {
     }
 }
 
+function Ensure-ExternalSweepHpaBehavior {
+    $desired=Get-StandardHpaBehavior
+    foreach ($app in $apps) {
+        $patch=@{spec=@{behavior=$desired}} | ConvertTo-Json -Compress -Depth 12
+        Invoke-Kubectl @('-n',$Namespace,'patch','hpa',$app,'--type=merge','-p',$patch)
+        $live=((Invoke-Kubectl @('-n',$Namespace,'get','hpa',$app,'-o','json')) -join '') | ConvertFrom-Json
+        $up=[int]$live.spec.behavior.scaleUp.stabilizationWindowSeconds
+        $down=[int]$live.spec.behavior.scaleDown.stabilizationWindowSeconds
+        $downPolicy=[string]$live.spec.behavior.scaleDown.selectPolicy
+        if ($up -ne 0 -or $down -ne 300 -or $downPolicy -ne 'Min') {
+            throw "HPA_BEHAVIOR_APPLY_FAILED: app=$app scaleUp=$up scaleDown=$down policy=$downPolicy"
+        }
+        Write-Host "HPA_BEHAVIOR_READY: app=$app scaleUp=0s scaleDown=300s/Min" -ForegroundColor DarkGray
+    }
+}
+
 function Get-RateSteps([int]$peakRate) {
     $steps=[System.Collections.Generic.List[int]]::new()
     if ($peakRate -le 10) { $steps.Add($peakRate); return @($steps) }
@@ -6514,6 +6530,12 @@ function Initialize-ExternalSweepNodeFloor([hashtable]$MeasuredBase) {
     Write-Host "MEASURED_LOW_LOAD_NODE_FLOOR=$script:ExternalSweepNodeFloor (managed=$managedReady dedicatedDomains=$($domains.Count))" -ForegroundColor Cyan
 }
 
+function Test-ExternalSweepFinalAccepted($Evaluation) {
+    return ([bool](Get-OptionalPropertyValue $Evaluation 'AllPerformanceGuards' $false) -and
+        [bool](Get-OptionalPropertyValue $Evaluation 'AllCostGuards' $false) -and
+        [double](Get-OptionalPropertyValue $Evaluation 'PrimaryScore' -1) -ge $ProfileTargetScore)
+}
+
 function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvaluation=$null) {
     $bestConfig=Copy-Config $MeasuredBase 'MEASURED_BEST'
     Initialize-ExternalSweepNodeFloor $MeasuredBase
@@ -6524,6 +6546,11 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
         $best=$InitialEvaluation
         Write-Host "RESUME_IMMUTABLE_BASE: minScore=$($best.PrimaryScore) fingerprint=$actual" -ForegroundColor Cyan
     } else { $best=Invoke-ExternalProfileSweep -CandidateName 'BASE' -Config $bestConfig }
+    # A one-run KEEP remains provisional until FINAL_FRESH repeats it. Preserve
+    # the preceding measured BEST so a noisy candidate can never be left live.
+    $confirmedFallbackConfig=Copy-Config $bestConfig 'CONFIRMED_FALLBACK'
+    $confirmedFallbackEvaluation=$best
+    $lastKeptRecommendation=$null
     $history=[System.Collections.Generic.List[object]]::new();$rejected=[System.Collections.Generic.List[string]]::new()
     foreach($signature in @($RejectedSweepSignatures-split',')){if(-not[string]::IsNullOrWhiteSpace($signature)){$rejected.Add($signature.Trim())}}
     for ($i=1; $i -le $MaxProfileCandidates; $i++) {
@@ -6542,8 +6569,12 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
         $measured=Invoke-ExternalProfileSweep -CandidateName "CANDIDATE_$i" -Config $candidate
         $keep=Test-SweepCandidateBetter $measured $best
         $history.Add([pscustomobject]@{Iteration=$i;Recommendation=$rec;Decision=$(if($keep){'KEEP'}else{'REJECT'});Objective=$measured})
-        if ($keep) { $best=$measured; $bestConfig=Copy-Config $candidate 'MEASURED_BEST' }
-        else {
+        if ($keep) {
+            $confirmedFallbackConfig=Copy-Config $bestConfig 'CONFIRMED_FALLBACK'
+            $confirmedFallbackEvaluation=$best
+            $lastKeptRecommendation=$rec
+            $best=$measured; $bestConfig=Copy-Config $candidate 'MEASURED_BEST'
+        } else {
             $rejected.Add($rec.Signature)
             if (-not $NoApply) { $script:hardDeadline=(Get-Date).AddMinutes(15); Apply-CandidateSafely $bestConfig Hard | Out-Null }
         }
@@ -6551,9 +6582,21 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
     if (-not $NoApply) { $script:hardDeadline=(Get-Date).AddMinutes(15); Apply-CandidateSafely $bestConfig Hard | Out-Null }
     # Final validation is always three new load runs, never cached re-scoring.
     $fresh=Invoke-ExternalProfileSweep -CandidateName 'FINAL_FRESH' -Config $bestConfig -FreshVerification
-    $accepted=([bool]$fresh.AllPerformanceGuards -and [bool]$fresh.AllCostGuards -and [double]$fresh.PrimaryScore -ge $ProfileTargetScore)
-    $lifecycle=[pscustomobject]@{GeneratedAt=(Get-Date -Format o);SelectionObjective='performance and cost guards together, then maximize min(TotalScore), then minimize AverageNodes';TargetScore=$ProfileTargetScore;Accepted=$accepted;BestConfig=$bestConfig;SelectedMeasured=$best;FinalFresh=$fresh;History=@($history)}
-    if (-not $accepted) { Write-Warning ("FINAL_FRESH_NOT_ACCEPTED: minScore={0:N1}, guards={1}; next execution resumes from live measured BASE" -f $fresh.PrimaryScore,$fresh.AllPerformanceGuards) }
+    $accepted=Test-ExternalSweepFinalAccepted $fresh
+    $rolledBack=$false;$rejectedFinalSignature=$null
+    if (-not $accepted -and (Get-ConfigFingerprintFromValues $bestConfig) -ne (Get-ConfigFingerprintFromValues $confirmedFallbackConfig)) {
+        if ($lastKeptRecommendation) { $rejectedFinalSignature=[string]$lastKeptRecommendation.Signature; $rejected.Add($rejectedFinalSignature) }
+        if (-not $NoApply) {
+            $script:hardDeadline=(Get-Date).AddMinutes(15)
+            if (-not (Apply-CandidateSafely $confirmedFallbackConfig Hard)) { throw 'FINAL_FRESH_ROLLBACK_FAILED' }
+        }
+        $bestConfig=Copy-Config $confirmedFallbackConfig 'ROLLED_BACK_BEST'
+        $best=$confirmedFallbackEvaluation
+        $rolledBack=$true
+        Write-Warning "FINAL_FRESH_ROLLBACK: rejected=$rejectedFinalSignature restored=$(Get-ConfigFingerprintFromValues $bestConfig)"
+    }
+    $lifecycle=[pscustomobject]@{GeneratedAt=(Get-Date -Format o);SelectionObjective='performance and cost guards together, then maximize min(TotalScore), then minimize AverageNodes';TargetScore=$ProfileTargetScore;Accepted=$accepted;RolledBack=$rolledBack;RejectedFinalSignature=$rejectedFinalSignature;BestConfig=$bestConfig;SelectedMeasured=$best;FinalFresh=$fresh;RejectedSignatures=@($rejected);History=@($history)}
+    if (-not $accepted) { Write-Warning ("FINAL_FRESH_NOT_ACCEPTED: minScore={0:N1}, guards={1}; restored preceding measured BEST" -f $fresh.PrimaryScore,$fresh.AllPerformanceGuards) }
     $lifecycle | ConvertTo-Json -Depth 60 | Set-Content -LiteralPath (Join-Path $OutputDir 'profile-sweep-lifecycle.json') -Encoding UTF8
     return $lifecycle
 }
@@ -6582,6 +6625,7 @@ try {
         Write-Host "`n========== UNKNOWN-APPLICATION PROFILE SWEEP ==========" -ForegroundColor Green
         Initialize-EndpointAndData
         Repair-InvalidPdbPrerequisite
+        Ensure-ExternalSweepHpaBehavior
         $measuredBase=Get-LiveConfig 'MEASURED_LIVE_BASE'
         Initialize-HpaControlPointModel
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'

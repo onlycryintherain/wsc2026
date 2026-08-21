@@ -188,6 +188,7 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-22 | pending | user Max40 후보는 1차 `run-1787335919` 34.5/40·성능10.5로 KEEP됐으나 FINAL_FRESH `run-1787337791`이 33.5/40·성능8.5로 게이트 off. live HPA scaleDown=0s/100%로 spike2 replica가 29~35 사이에서 흔들린 원인을 반영해 external sweep 시작 전 scaleUp=0s·scaleDown=300s/Min을 강제 검증하고, FINAL_FRESH dual gate 실패 시 직전 measured BEST 자동 롤백 및 rejected signature 기록을 추가. self-test 34/34 통과. |
 | 2026-08-22 | pending | `tune.ps1`의 live Max 안전 상한을 측정 seed의 1.5배로 분리하고, aggregate 성능 게이트가 통과해도 개별 앱 성능<90%·실측 HPA ceiling·비용 게이트 통과 시 Max를 20~25% bounded one-delta로 확장하도록 개선. 0.25x 증거의 user 32/32·uncapped 41을 user Max 40 후보로 산출하며 self-test 32/32 통과. |
 | 2026-08-22 | pending | 사용자 지정 0.25x `순차증가` 진단 `run-1787333608`: 33.5/40(가용성 12, 성능 9.5, 비용 8), user/product/stress 성능 84.16/109.47/86.27%, 평균 EC2 3.73·peak 6·dropped/CNI 0. user HPA 32 ceiling 15/48 sample과 spike2 steady user p95 222~256ms를 확인해 다음 단일 후보를 user Max 32→40으로 선정하되 아직 적용하지 않음. 공식 0.5x 결과와 직접 비교하지 않는다. |
 | 2026-08-21 | pending | `tune.ps1 -PerformanceGateOnly`를 통해 HPA/request/limit을 스크립트로만 적용하고, CNI IP 할당 실패 대응으로 10.0.4.0/22·10.0.8.0/22 pod-capacity subnet을 추가. Node Type/RDS Instance Type은 유지. Default-spike2 10분 실측: 성능 11/12, user 89.39%, product 112.14%, stress 88.32%, 총 27/40(평균 EC2 9.45로 비용 0). | 
