@@ -423,6 +423,19 @@ Rejected early-trigger combination:
   did not improve. The rejected trigger combination was restored to 33%/29%/55%.
   Retained changes are only the proven two-node low-load packing, one-minute
   consolidation, public-subnet provisioning, and total six-node ceiling.
+
+Performance-first/cost-one-point experiment:
+  Delta: total worker ceiling 6 -> 7 and user HPA Max 20 -> 24
+  Capacity split: managed 1 + default 2 + stress 4
+  Run ID: run-1787314521
+  Score: 23.0/40; performance 7/12; cost 0/12; avg EC2 4.57
+  user/product/stress performance: 24.08% / 100.69% / 85.61%
+  Availability: 12/12
+  Decision: REJECT
+  Evidence: C:\Users\competitor\AppData\Local\Temp\wsi-performance12-cost1-node7-20260821-2115\profile-sweep-DIAGNOSTIC.json
+  Conclusion: the extra shared node and four additional user replicas produced
+  no material user/stress gain versus the six-node BASE, while average EC2
+  crossed the one-point cost boundary. HPA Max=20 and total ceiling=6 restored.
 ====================================================
 
 ====================================================
