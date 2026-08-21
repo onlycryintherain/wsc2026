@@ -99,7 +99,7 @@ param(
     [switch]$DiagnosticSweepOnly,
     [switch]$NodeCeilingOnly,
     [string]$RestoreConfigFingerprint = '',
-    [string[]]$RejectedSweepSignatures = @()
+    [string]$RejectedSweepSignatures = ''
 )
 
 # The only production path discovers unknown workloads and uses external fresh
@@ -6482,7 +6482,7 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
         Write-Host "RESUME_IMMUTABLE_BASE: minScore=$($best.PrimaryScore) fingerprint=$actual" -ForegroundColor Cyan
     } else { $best=Invoke-ExternalProfileSweep -CandidateName 'BASE' -Config $bestConfig }
     $history=[System.Collections.Generic.List[object]]::new();$rejected=[System.Collections.Generic.List[string]]::new()
-    foreach($signature in @($RejectedSweepSignatures)){if(-not[string]::IsNullOrWhiteSpace($signature)){$rejected.Add($signature)}}
+    foreach($signature in @($RejectedSweepSignatures-split',')){if(-not[string]::IsNullOrWhiteSpace($signature)){$rejected.Add($signature.Trim())}}
     for ($i=1; $i -le $MaxProfileCandidates; $i++) {
         $script:ExternalSweepClusterCapacity=Get-ClusterCapacitySnapshot
         $rec=Get-DynamicSweepRecommendation $bestConfig $best @($rejected)
