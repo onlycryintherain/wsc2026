@@ -6268,7 +6268,8 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
     $results=[System.Collections.Generic.List[object]]::new()
     $profileIndex=0
     foreach ($profileName in $profiles) {
-        if ($profileIndex -gt 0 -or $CandidateName -ne 'BASE') { Wait-ExternalProfileLowLoadFloor ([int]$script:ExternalSweepNodeFloor) }
+        # Every cost window, including a fresh BASE, starts from the same floor.
+        Wait-ExternalProfileLowLoadFloor ([int]$script:ExternalSweepNodeFloor)
         $profileIndex++
         Write-Host "`n===== EXTERNAL PROFILE: $CandidateName / $profileName =====" -ForegroundColor Cyan
         # The grading server keeps endpoint per run; never rely on a stale/default
