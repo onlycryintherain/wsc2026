@@ -6203,6 +6203,7 @@ try {
     if ($SelfTestOnly) { . (Join-Path $PSScriptRoot "tune\selftest.ps1"); $runFailed=$false; return }
     if ($ProfileSweepOnly) {
         Write-Host "`n========== UNKNOWN-APPLICATION PROFILE SWEEP ==========" -ForegroundColor Green
+        Initialize-EndpointAndData
         $measuredBase=Get-LiveConfig 'MEASURED_LIVE_BASE'
         Initialize-HpaControlPointModel
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'
