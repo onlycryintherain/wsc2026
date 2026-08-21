@@ -199,6 +199,16 @@ if ($BaseExperiment) {
         if ($rec.Type -ne 'HPA_MAX_COST' -or [int]$rec.To -lt 3) { throw "unexpected max recommendation $($rec.Type) $($rec.To)" }
     }
 
+    # TEST 22: instantaneous sent-RPS jitter is not a generator limit.
+    Assert-Test 'Generator jitter does not stop search' {
+        $best=Copy-Config $BaseConfig 'best'; $h=@{}
+        foreach($app in $apps){$h[$app]=[pscustomobject]@{Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget}}
+        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=@{}}
+        $result=[pscustomobject]@{Status=[pscustomobject]@{dropped=0;target_rps=4.6;sent_rps=4.0};Samples=@($sample)}
+        $evaluation=[pscustomobject]@{AllPerformanceGuards=$true;Results=@($result,$result,$result)}
+        if ((Get-DynamicSweepRecommendation $best $evaluation @()).Type -eq 'GENERATOR_LIMIT') { throw 'RPS jitter classified as saturation' }
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
     if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }

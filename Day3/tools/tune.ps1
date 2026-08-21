@@ -6026,11 +6026,11 @@ function Test-SweepCandidateBetter($Candidate,$Best) {
 
 function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[string[]]$RejectedSignatures) {
     $samples=@($BestEvaluation.Results | ForEach-Object { @($_.Samples) })
-    $generatorLimited=@($BestEvaluation.Results | Where-Object {
-        ([double](Get-OptionalPropertyValue $_.Status 'dropped' 0) -gt 0) -or
-        ([double](Get-OptionalPropertyValue $_.Status 'target_rps' 0) -gt 0 -and [double](Get-OptionalPropertyValue $_.Status 'sent_rps' 0) -lt [double](Get-OptionalPropertyValue $_.Status 'target_rps' 0)*0.90)
-    })
-    if ($generatorLimited.Count) { return [pscustomobject]@{Type='GENERATOR_LIMIT';Signature='GENERATOR_LIMIT';App=$null;Reason='external generator did not deliver requested load'} }
+    # The final status is an instantaneous RPS sample and naturally oscillates
+    # around target; it must not classify a whole 15-minute run as generator-limited.
+    # The external engine's dropped counter is the reliable saturation signal.
+    $generatorLimited=@($BestEvaluation.Results | Where-Object { [double](Get-OptionalPropertyValue $_.Status 'dropped' 0) -gt 0 })
+    if ($generatorLimited.Count) { return [pscustomobject]@{Type='GENERATOR_LIMIT';Signature='GENERATOR_LIMIT';App=$null;Reason='external generator reported dropped requests'} }
     if (@($samples | Where-Object { [int]$_.CniErrors -gt 0 }).Count) {
         return [pscustomobject]@{Type='CNI_IP_CAPACITY';Signature='CNI_IP_CAPACITY';App=$null;Reason='FailedCreatePodSandBox; application capacity must not be increased'}
     }
