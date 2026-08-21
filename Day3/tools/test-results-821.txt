@@ -1,0 +1,161 @@
+2026-08-21 tune.ps1 연속 튜닝 실측 기록
+작성 시각: 2026-08-21 12:08 KST
+브랜치: feature/day3-tuning
+현재 코드: e704c1e
+
+============================================================
+1. 고정 조건 및 현재 환경
+============================================================
+- Region: ap-northeast-2
+- EKS: wsi2026-cluster
+- Worker instance type: c5.large
+- RDS: apdev-rds-instance / db.t3.micro / MySQL 8 / Multi-AZ / gp3
+- CloudFront endpoint: https://d1gwk7qzzdof9o.cloudfront.net
+- Load server: http://skills-server:8003
+- Cost baseline: EKS worker 2대
+- StressLength: 변경하지 않음
+- production 튜닝 경로: unknown-application live discovery 전용
+
+현재 measured BASE 설정
+- product: request 70m/64Mi, CPU limit 없음, memory limit 256Mi, HPA target 29%, min/max 2/20
+- stress: request 600m/640Mi, CPU limit 없음, memory limit 1536Mi, HPA target 55%, min/max 1/12, dedicated NodePool
+- user: request 70m/64Mi, CPU limit 없음, memory limit 256Mi, HPA target 33%, min/max 2/20
+- absolute HPA trigger: product 20.3m, stress 330m, user 23.1m
+- low-load measured node floor: 2대
+
+============================================================
+2. 재생성 환경 점검 결과
+============================================================
+- kubeconfig의 삭제된 EKS endpoint를 새 endpoint로 갱신함.
+- EKS ACTIVE, RDS available 확인.
+- 기본 상태 c5.large 노드 2대 Ready.
+- user/product/stress Deployment와 ALB target 정상.
+- CloudFront/WAF 정상 요청 및 차단 응답 확인.
+- VPC CNI prefix delegation 활성화.
+- Terraform validate PASS.
+- Terraform plan에는 최신 AMI에 따른 Bastion 교체와 ALB controller SG drift가 있어 apply하지 않음.
+
+============================================================
+3. endpoint 오류와 복구
+============================================================
+- 초기 부하 실행에서 skills-server 사용자 endpoint가 이전 배포를 가리켜 모든 앱 점수가 0으로 집계됨.
+- 사용자가 skills-server endpoint를 새 CloudFront로 직접 교체함.
+- 교체 후 실제 앱 로그에서 user/product 200/201, stress 201 요청 유입 확인.
+- 정상 window에서 Default 초반 40/40 확인.
+- tune.ps1 profile 진입 전 Initialize-EndpointAndData 누락을 수정함(7057166).
+- 외부 start 요청에도 현재 발견 endpoint를 포함하도록 수정함(3848b76).
+- skills-server status의 endpoint 필드는 계속 null로 표시되지만 실제 요청은 새 endpoint로 유입됨.
+
+============================================================
+4. 동일 BASE 3프로필 fresh 실측
+============================================================
+결과 파일:
+C:\Users\competitor\AppData\Local\Temp\wsi-live-tune-dynamic-max-20260821-1013\profile-sweep-BASE.json
+
+공통 결과
+- Valid: True
+- AllPerformanceGuards: False
+- Worst-profile score: 21.5/40
+- 3프로필 평균: 26.33/40
+- 평균 EC2(프로필 평균): 4.77대
+
+[Default]
+- Run ID: run-1787274928
+- 최종: 35.0/40
+- abnormal: 4/4
+- availability: 12/12
+- performance: 10/12
+- cost: 9/12
+- user performance: 82.63%
+- product performance: 106.28%
+- stress performance: 89.50%
+- average EC2: 3.20대
+- 초반 저부하 구간에서는 2노드 40/40이었음.
+- spike 후 user/product/stress 확장 및 tail latency로 35점까지 하락.
+
+[Default-spike2]
+- Run ID: run-1787276216
+- 최종: 21.5/40
+- abnormal: 4/4
+- availability: 12/12
+- performance: 5.5/12
+- cost: 0/12
+- user performance: 6.27%
+- product performance: 99.14%
+- stress performance: 75.98%
+- average EC2: 5.53대
+- 고부하 시 user HPA 20, stress HPA 8까지 관측.
+- 약 155 RPS 구간 user p95 약 478~482ms, stress p95 최대 약 2265ms.
+- dropped=0으로 generator는 목표 부하를 생성함.
+
+[순차증가]
+- Run ID: run-1787277512
+- 최종: 22.5/40
+- abnormal/availability 정상, performance 6.5/12, cost 0/12
+- user performance: 25.02%
+- product performance: 101.45%
+- stress performance: 83.40%
+- average EC2: 5.57대
+
+판정
+- 특정 프로필만 높은 설정은 불가.
+- selection primary objective는 min(Default, Default-spike2, 순차증가)임.
+- 현재 measured BEST의 primary score는 21.5이므로 목표(각 프로필 30 이상)에 미달.
+
+============================================================
+5. 발견된 튜너 문제와 수정
+============================================================
+1) 프로필 간 비용 window 오염
+- 앞 profile에서 증가한 노드가 다음 profile 시작 시 남아 다음 비용 점수를 오염함.
+- 최초 measured low-load node floor와 HPA min으로 복귀하도록 최대 360초 cooldown 추가.
+- timeout 시 증거를 남기고 다음 프로필 진행.
+- commit: be0913a
+
+2) HPA Max 정책
+- Max는 저부하 제어값이 아니라 고부하 ceiling임.
+- 성능 guard 실패 + 실제 Desired>=Max/CPU>target에서만 Max 증가 후보 생성.
+- guard 통과 시 measured peak desired + 20% headroom보다 과도한 Max만 one-delta 축소.
+- Min은 별도 one-delta로 저부하 비용 최적화.
+- commit: be0913a
+
+3) 순간 RPS 흔들림 오판
+- BASE 완료 후 최종 순간 status sent_rps=4 / target_rps=4.6을 전체 run generator limit으로 잘못 판정해 application candidate 없이 중단됨.
+- run 누적 dropped>0만 generator saturation으로 판정하도록 수정.
+- 정상 instantaneous RPS jitter는 탐색을 중단하지 않음.
+- self-test 22/22 PASS.
+- commit: e704c1e
+
+============================================================
+6. 현재 진행 상태
+============================================================
+기존 프로세스 PID: 45872
+기존 출력:
+C:\Users\competitor\AppData\Local\Temp\wsi-live-tune-dynamic-max-20260821-1013
+
+현재 old-code FINAL_FRESH 실행 중(이 실행은 false GENERATOR_LIMIT 수정 전 프로세스가 시작한 verification임).
+- 현재 Run ID: run-1787281064
+- 현재 profile: Default-spike2
+- 12:08 KST 기준 elapsed 약 620초
+- 현재 중간 score: 21.0/40
+- user performance: 7.46%
+- product performance: 100.98%
+- stress performance: 52.84%
+- average EC2: 4.90대
+- HPA: product 20/20, stress 8/12, user 20/20
+- worker node: 8대
+- dropped: 0
+
+이 old-code process가 종료되면 e704c1e 코드로 새 iteration을 즉시 시작해야 함.
+실제 resource/session loss가 아니므로 오류 종료 시 BEST/환경 확인 후 다음 iteration을 계속함.
+
+============================================================
+7. 연속 탐색 원칙
+============================================================
+- 매 candidate는 measured BEST의 정확한 copy에서 one-delta만 변경.
+- 각 candidate마다 Default, Default-spike2, 순차증가를 모두 fresh 실행.
+- 세 profile performance/availability guard 우선.
+- primary score는 세 profile TotalScore 중 최저값.
+- 한 profile만 좋아지고 최저 profile이 나빠지면 REJECT.
+- KEEP이면 measured BEST 갱신, REJECT이면 BEST rollback.
+- 최종 선택 후에도 FINAL_FRESH 세 profile을 실제 재실행.
+- resource loss, AWS credential 만료, EKS/RDS 삭제 외 recoverable failure는 증거 저장 후 다음 iteration 계속.
