@@ -6164,7 +6164,8 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
             $currentTarget=[int]$BestConfig[$app].hpaTarget
             $rejectedMax="HPA_MAX:${app}:$([int][math]::Ceiling([int]$BestConfig[$app].maxReplicas*1.20))" -in $RejectedSignatures
             if (($peakDesired -lt [int]$BestConfig[$app].maxReplicas -or $rejectedMax) -and $peakUtil -gt $currentTarget*1.20 -and $currentTarget -gt $HpaTargetLowerBound+5) {
-                $nextTarget=[int][math]::Max($HpaTargetLowerBound,$currentTarget-5)
+                $rejectedTargetCount=@($RejectedSignatures|Where-Object{$_-like"HPA_TARGET_RECOVERY:${app}:*"}).Count
+                $nextTarget=[int][math]::Max($HpaTargetLowerBound,$currentTarget-(5*($rejectedTargetCount+1)))
                 $sig="HPA_TARGET_RECOVERY:${app}:$nextTarget"
                 if ($sig -notin $RejectedSignatures) { $recovery.Add([pscustomobject]@{Type='HPA_TARGET_RECOVERY';Signature=$sig;App=$app;From=$currentTarget;To=$nextTarget;WorstAppPerformance=$worstPerf;Reason="guard deficit with sustained CPU signal; desired peak=$peakDesired below max; utilization peak=$peakUtil%"}) }
             }

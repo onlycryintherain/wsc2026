@@ -308,6 +308,16 @@ if ($BaseExperiment) {
         try{$script:ExternalSweepClusterCapacity=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150};$rec=Get-DynamicSweepRecommendation $best $evaluation @('REQUEST_PACKING:stress:550:60','HPA_MAX:user:24');if($rec.Type-ne'HPA_TARGET_RECOVERY'-or$rec.App-ne'user'-or$rec.To-ne28){throw "unexpected $($rec.Type) $($rec.App) $($rec.To)"}}finally{$script:ExternalSweepClusterCapacity=$oldCluster}
     }
 
+    # TEST 31: repeated target recovery failures advance without mutating BASE.
+    Assert-Test 'Rejected target advances recovery step' {
+        $best=Copy-Config $BaseConfig 'best';$h=@{};$u=@{}
+        foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget};$u[$app]=[pscustomobject]@{CpuTotalM=100}}
+        $h.user=[pscustomobject]@{Current=20;Desired=20;Max=20;CpuUtil=100;Target=33};$h.stress=[pscustomobject]@{Current=7;Desired=7;Max=12;CpuUtil=80;Target=55}
+        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=$u};$result=[pscustomobject]@{Score=[pscustomobject]@{user_perf=25;product_perf=100;stress_perf=85};Status=[pscustomobject]@{dropped=0};Samples=@($sample)}
+        $evaluation=[pscustomobject]@{AllPerformanceGuards=$false;AllCostGuards=$false;Results=@($result)};$oldCluster=$script:ExternalSweepClusterCapacity
+        try{$script:ExternalSweepClusterCapacity=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150};$rec=Get-DynamicSweepRecommendation $best $evaluation @('REQUEST_PACKING:stress:550:60','HPA_MAX:user:24','HPA_TARGET_RECOVERY:user:28');if($rec.Type-ne'HPA_TARGET_RECOVERY'-or$rec.To-ne23){throw "unexpected $($rec.Type) $($rec.To)"}}finally{$script:ExternalSweepClusterCapacity=$oldCluster}
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
     if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }

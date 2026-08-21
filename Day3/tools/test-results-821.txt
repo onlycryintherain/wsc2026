@@ -393,6 +393,15 @@ Rejected stress packing experiment (early stop):
   Rollback: immutable fingerprint restored stress to 600m@55%; all other values unchanged.
   Conclusion: scheduler packing that removes request headroom cannot be used merely
   to improve cost when it switches off the performance gate.
+
+Rejected user early-scaling experiment:
+  Delta: user HPA target 33% -> 28%; Min=2, Max=20 and node ceiling unchanged
+  Fresh Run ID: run-1787307750
+  Low-load state: two nodes; score recovered to 39/40 before spike
+  Spike1: performance gate fell to 7/12 (user 47.81%) after 32 seconds
+  Decision: immediate stop/REJECT under dual-gate invariant; immutable BASE restored.
+  Next measured axis: stronger baseline-signal target recovery while retaining
+  Min=2, so true idle traffic still returns to the two-node topology floor.
 ====================================================
 
 ====================================================
