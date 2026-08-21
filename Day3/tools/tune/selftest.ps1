@@ -156,5 +156,31 @@ if ($BaseExperiment) {
         if ($a.Axis -ne $b.Axis -or $a.Proposed -ne $b.Proposed) { throw 'recommendation changed' }
     }
 
+    # TEST 17: selection primary objective is minimum profile score, not average.
+    Assert-Test 'Sweep objective uses minimum score' {
+        function New-FakeResult([double]$total,[double]$perf,[double]$nodes) { [pscustomobject]@{Score=[pscustomobject]@{total40=$total;performance=[pscustomobject]@{score=$perf};availability=[pscustomobject]@{score=12;max=12};avg_ec2=$nodes}} }
+        $e=Get-ExternalSweepObjective -Results @((New-FakeResult 32 10 4),(New-FakeResult 32 10 4),(New-FakeResult 24 10 4)) -CandidateName x -ConfigFingerprint fp
+        if ($e.PrimaryScore -ne 24) { throw "expected min=24 got $($e.PrimaryScore)" }
+    }
+
+    # TEST 18: a guard-passing candidate wins before score/cost tie-breaks.
+    Assert-Test 'Sweep guard precedence' {
+        $best=[pscustomobject]@{Valid=$true;AllPerformanceGuards=$false;PrimaryScore=32.0;AverageNodes=2.0}
+        $cand=[pscustomobject]@{Valid=$true;AllPerformanceGuards=$true;PrimaryScore=30.0;AverageNodes=4.0}
+        if (-not (Test-SweepCandidateBetter $cand $best)) { throw 'guard precedence not enforced' }
+    }
+
+    # TEST 19: request candidate preserves the absolute HPA control point.
+    Assert-Test 'Request delta preserves control point' {
+        $best=Copy-Config $BaseConfig 'best'
+        $rec=[pscustomobject]@{Type='REQUEST_OVERSIZED';App='user';To=35.0;NewTarget=66}
+        $candidate=New-DynamicSweepCandidate $best $rec candidate
+        $old=(Convert-CpuToM $best.user.requestCpu)*$best.user.hpaTarget/100.0
+        $new=(Convert-CpuToM $candidate.user.requestCpu)*$candidate.user.hpaTarget/100.0
+        if ([math]::Abs($old-$new) -gt 1.0) { throw "control point drift $old -> $new" }
+        if ($candidate.product.requestCpu -ne $best.product.requestCpu -or $candidate.user.minReplicas -ne $best.user.minReplicas) { throw 'request candidate changed another axis' }
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
+    if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }

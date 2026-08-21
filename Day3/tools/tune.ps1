@@ -7,10 +7,10 @@ param(
     [string]$Namespace = 'app',
     [switch]$StressMode,
     # 범용 튜너: 관리 앱 목록/SLO/CPU target을 파라미터로 주입하면 어떤 API 세트에도 동작한다.
-    [string[]]$ManagedApps = @('user','product','stress'),
-    [hashtable]$AppSloMs = $null,        # 앱별 latency SLO (ms). 기본: 200/200/1000
-    [hashtable]$AppCpuTargets = $null,   # 앱별 HPA CPU target (%). 기본: 40/65/70
-    [string]$DedicatedApp = 'stress',    # dedicated NodePool로 격리할 앱 (기본 stress, 없으면 '')
+    [string[]]$ManagedApps = @(),
+    [hashtable]$AppSloMs = $null,        # 앱별 latency SLO(ms). 미지정 시 외부 평가 결과를 source of truth로 사용
+    [hashtable]$AppCpuTargets = $null,   # 선택적 초기값. production 후보는 live HPA와 측정값에서 계산
+    [string]$DedicatedApp = '',          # 측정 없이 workload 이름으로 전용 배치를 선택하지 않는다
     # 실제 채점 결과(앱별 performance %)를 주입하면 empirical 예측과 mismatch를 감지한다.
     [hashtable]$ObservedPerformance = $null,
     [ValidateRange(15, 20)][int]$MaxRuntimeMinutes = 20,
@@ -83,31 +83,34 @@ param(
     [switch]$PerformanceGateOnly,
     # Run the external grading server's three named profiles sequentially.
     [switch]$ProfileSweepOnly,
-    [string]$LoadServer = 'http://skills-server:8003'
+    [string]$LoadServer = 'http://skills-server:8003',
+    [ValidateRange(0, 12)][double]$ProfilePerformanceGuard = 9.0,
+    [ValidateRange(1, 40)][double]$ProfileTargetScore = 30.0,
+    [ValidateRange(0, 2)][double]$SweepNoiseTolerance = 0.5,
+    [ValidateRange(1, 100)][int]$MaxProfileCandidates = 20
 )
 
-# Safe default: BASE-first pipeline is the normal path. Legacy adaptive behavior
-# is opt-in only with -LegacyAdaptive; if both switches are supplied, legacy wins.
-if (-not $LegacyAdaptive) { $BaseExperiment = $true }
+# Safe production default: discover unknown workloads and use external fresh
+# profile measurements. The legacy/app-fixture pipeline is explicit opt-in only.
+if ($SelfTestOnly) { $BaseExperiment=$true; $ProfileSweepOnly=$false }
+elseif (-not $LegacyAdaptive -and -not $PerformanceGateOnly) { $ProfileSweepOnly=$true; $BaseExperiment=$false }
 
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($DataFile)) {
     $script:tuneRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
     $DataFile = Join-Path $script:tuneRoot '..\application\load_user.dump'
 }
-$apps = @('user','product','stress')
-# 범용 앱 구성: ManagedApps/SLO/target 파라미터가 주입되면 전역을 대체한다.
-# (다른 과제/API 세트에서 tune.ps1을 재사용할 수 있게 함)
-if ($PSBoundParameters.ContainsKey('ManagedApps')) { $apps = @($ManagedApps) }
-# (AppSloMs/AppCpuTargets는 아래 $sloMs/$hpaTargets 조건부 정의에서 반영)
-if (-not $AppSloMs) { $sloMs = @{ user=200.0; product=200.0; stress=1000.0 } } else { $sloMs = $AppSloMs }
-$trafficShare = @{ user=0.50; product=0.35; stress=0.15 } # User 50% / Product 35% / Stress 15%
-if (-not $AppCpuTargets) { $hpaTargets = @{ user=40; product=65; stress=$(if ($StressMode) { 55 } else { 70 }) } } else { $hpaTargets = $AppCpuTargets }
-$cpuRequestMinimum = @{ user=25.0; product=25.0; stress=50.0 }
+$apps = @($ManagedApps)
+# Production에서는 Deployment와 HPA의 교집합을 live cluster에서 발견한다.
+# 아래 oracle은 회귀 테스트에서만 사용하며 production seed/final로 적용하지 않는다.
+$sloMs = if ($AppSloMs) { $AppSloMs } else { @{} }
+$trafficShare = @{}
+$hpaTargets = if ($AppCpuTargets) { $AppCpuTargets } else { @{} }
+$cpuRequestMinimum = @{}
 # ============================================================
-# BASE EXPERIMENT CONFIG
+# REGRESSION ORACLE — SELF-TEST ONLY, NEVER A PRODUCTION SEED
 # ============================================================
-$BaseConfig = @{
+$RegressionOracleConfig = @{
     user = @{
         requestCpu = '70m'; requestMemory = '64Mi'
         limitCpu = $null; limitMemory = '256Mi'
@@ -127,7 +130,10 @@ $BaseConfig = @{
         placement = 'ISOLATED'; placementDomain = 'dedicated'
     }
 }
-$script:Is38PointAppSet = (@($apps | Where-Object { $_ -in @('user','product','stress') }).Count -eq 3 -and $apps.Count -eq 3)
+# Compatibility alias exists only while regression self-tests execute.
+if ($SelfTestOnly) { $BaseConfig=$RegressionOracleConfig }
+$script:Is38PointAppSet = $false
+$script:RequiredNodePools=@()
 
 function Get-ConfigFingerprintFromValues($config) {
     $parts = [System.Collections.Generic.List[string]]::new()
@@ -242,25 +248,20 @@ process.stdout.write(JSON.stringify({duration_seconds:d.duration_seconds,cost_de
 # 하한은 유지하되 첫 측정은 과밀 배치를 막는 보호값에서 시작한다. 합계
 # 1150m이라 c5.large 관측 app budget 1180m 안에 1 Pod씩 들어가며,
 # 더 작은 실제 노드에서는 Enforce-IdleBudget이 기존 하한까지 자동 축소한다.
-$cpuRequestStart = @{ user=150.0; product=75.0; stress=925.0 }
-$cpuLimitStart = @{ user=$null; product=$null; stress=2000.0 }  # immutable BASE reference; candidate analyzer may recommend a separate delta
-$memoryRequestStart = @{ user=64.0; product=64.0; stress=640.0 }
-$memoryLimitStart = @{ user=128.0; product=256.0; stress=1536.0 }  # Golden baseline: product 256Mi
-# 관측된 앱 비용과 보호 정책은 서로 다르다.
-# - 실제 처리 무게: Stress > User > Product
-# - SLO 보호: User > Product > Stress
-# - HPA 여유 축소: Product > User > Stress
-# - Idle request 축소: Stress > Product > User
-$appResourceWeight = @{ stress=3; user=2; product=1 }
-$performanceProtectionOrder = @('user','product','stress')
-$hpaReductionOrder = @('product','user','stress')
-$idleRequestReductionOrder = @('stress','product','user')
+$cpuRequestStart = @{}
+$cpuLimitStart = @{}
+$memoryRequestStart = @{}
+$memoryLimitStart = @{}
+# 순서와 가중치는 workload 이름이 아니라 live 사용량/측정 결과에서 갱신한다.
+$appResourceWeight = @{}
+$performanceProtectionOrder = @()
+$hpaReductionOrder = @()
+$idleRequestReductionOrder = @()
 # HPA maxReplicas는 관측 기반 수식(Get-AppHpaCapacity → FinalHpaMaxByApp)이
 # 최종 overlay한다. 아래 값은 candidate 시작값/fallback floor일 뿐 최종 source of
 # truth가 아니다. stress는 max=2가 기능적으로 부족해 floor를 6으로 올린다.
-    # HPA floor는 live config에서 설정된다. reference profile의 앱별 숫자를
-    # 다른 난이도의 앱에 재사용하지 않는다.
-    $hpaMaxMinimum=@{ user=1; product=1; stress=1 }
+# HPA floor는 workload 발견 후 live config에서 초기화한다.
+$hpaMaxMinimum=@{}
 # 관측 기반 HPA max 최종 상태 (candidate lifecycle과 분리).
 # measurement마다 monotonic(max)으로 갱신되고 최종 적용 시 overlay된다.
 $script:FinalHpaMaxByApp=@{}
@@ -341,25 +342,13 @@ $script:ControlPointConfidenceByApp=@{}
 $script:ControlPointStateFile = Join-Path ([IO.Path]::GetTempPath()) 'wsi-hpa-controlpoints.json'
 $HpaTargetLowerBound=15.0      # EMPIRICAL_UNCONFIRMED (known-good 29/33/55 포함 범위)
 $HpaTargetUpperBound=90.0
-# Known-good reference is a projection of BaseConfig; do not duplicate app numbers.
-$GoldenBaseline = @{ Infra=@{PrefixDelegation=$true;WarmPrefixTarget=1;MaxPods=110}; Apps=@{} }
-foreach ($app in @('user','product','stress')) {
-    $b=$BaseConfig[$app]
-    $GoldenBaseline.Apps[$app]=@{
-        requestCpu=$b.requestCpu; requestMemory=$b.requestMemory
-        limitCpu=$b.limitCpu; limitMemory=$b.limitMemory
-        hpaTarget=$b.hpaTarget; minReplicas=$b.minReplicas; maxReplicas=$b.maxReplicas
-        placement=$b.placement; placementDomain=$b.placementDomain
-    }
-}
-$KnownGoodReference = $GoldenBaseline.Apps
-# HardSafetyMax: cluster absolute ceiling (node budget과 무관 — maxPods/placement/앱 안전 기준)
-# BASE keeps user/product max=20. Peak2 reached user max=20 with CPU≈86%
-# and SLO collapse, so ONE-DELTA experiments may test user HPA 21..30.
-# Product remains at the verified max=20; final selection still uses measured score/cost.
-$script:HardSafetyMaxByApp=@{user=30;product=20;stress=12}
-# ELASTIC_DENSITY_REQUEST 대상 (burst 허용 + HPA 분산): user/product. GUARANTEED: stress.
-$script:ElasticDensityApps=@('user','product')
+# No application performance oracle is exposed to production calculations.
+# Infrastructure prerequisites are separate from application performance values.
+$GoldenBaseline = @{ Infra=@{PrefixDelegation=$true;WarmPrefixTarget=1;MaxPods=110} }
+$KnownGoodReference = @{}
+# Per-workload ceilings are initialized from live HPA and measured capacity.
+$script:HardSafetyMaxByApp=@{}
+$script:ElasticDensityApps=@()
 $WarmReplicaHardCap = 3            # burst warm replica 최대 (전역 cap, 앱별 하드코딩 아님)
 $SafeMemoryUtilizationDefault = 0.70
 $CollapseMinFallback = 3           # 실측 spike-collapse fallback (history 부족 + collapse 증거 시, 성능 우선 warm 3)
@@ -534,26 +523,23 @@ $script:nullDevice=if ($env:OS -eq 'Windows_NT' -or $IsWindows) { 'NUL' } else {
 
 # ===================== HPA CONTROL POINT MODEL =====================
 function Initialize-HpaControlPointModel {
-    # 기본값은 새 앱에서도 동작하는 보수적 prior이며, live HPA/request를 읽을 수
-    # 있으면 현재 설정의 절대 제어점(request x target)을 먼저 사용한다.
-    $ref=@{user=@{cp=23.1;source='REFERENCE_PRIOR';conf=0.30};product=@{cp=20.3;source='REFERENCE_PRIOR';conf=0.30};stress=@{cp=330.0;source='REFERENCE_PRIOR';conf=0.30}}
+    # Unknown workloads always seed the absolute trigger from the live HPA.
+    # No application-name prior is permitted in production policy.
+    $live=Get-LiveConfig 'ControlPointLive'
     foreach ($app in $apps) {
-        $cp=[double]$ref[$app].cp; $source=[string]$ref[$app].source; $confidence=[double]$ref[$app].conf
-        try {
-            $live=Get-LiveConfig 'ControlPointLive'
-            $req=Convert-CpuToM $live[$app].requestCpu
-            $target=[double]$live[$app].hpaTarget
-            if ($req -gt 0 -and $target -gt 0) { $cp=$req*$target/100.0; $source='LIVE_SEED'; $confidence=0.45 }
-        } catch { }
-        $script:ControlPointByApp[$app]=$cp
-        $script:ControlPointSourceByApp[$app]=$source
-        $script:ControlPointConfidenceByApp[$app]=$confidence
+        $req=Convert-CpuToM $live[$app].requestCpu
+        $target=[double]$live[$app].hpaTarget
+        if ($req -le 0 -or $target -le 0) { throw "HPA_CONTROL_POINT_UNAVAILABLE: $app" }
+        $script:ControlPointByApp[$app]=$req*$target/100.0
+        $script:ControlPointSourceByApp[$app]='LIVE_MEASURED_BASE'
+        $script:ControlPointConfidenceByApp[$app]=0.45
     }
     Write-Host '===== HPA CONTROL POINT =====' -ForegroundColor Cyan
     foreach ($app in $apps) {
         Write-Host ("  {0}: absoluteThreshold={1:N1}m source={2} confidence={3:N2}" -f $app,$script:ControlPointByApp[$app],$script:ControlPointSourceByApp[$app],$script:ControlPointConfidenceByApp[$app]) -ForegroundColor DarkGray
     }
-    Restore-HpaControlPointState
+    # Cross-run app-name state is intentionally not restored: an application
+    # with the same Deployment name may be different on competition day.
 }
 
 function Restore-HpaControlPointState {
@@ -737,6 +723,55 @@ function Get-ElasticDensityRequest([string]$app,$metric,[double]$currentReqM) {
     return $candidate
 }
 
+function Initialize-ManagedApplicationDiscovery {
+    if ($SelfTestOnly) {
+        $script:apps=@('user','product','stress')
+    } else {
+        $deploy=((& kubectl -n $Namespace get deployments -o json 2>$null) -join '') | ConvertFrom-Json
+        $hpas=((& kubectl -n $Namespace get hpa -o json 2>$null) -join '') | ConvertFrom-Json
+        if (-not $deploy -or -not $hpas) { throw "WORKLOAD_DISCOVERY_FAILED: namespace=$Namespace" }
+        $deployNames=@($deploy.items | ForEach-Object { [string]$_.metadata.name })
+        $hpaNames=@($hpas.items | ForEach-Object { [string]$_.metadata.name })
+        $discovered=@($deployNames | Where-Object { $_ -in $hpaNames } | Sort-Object -Unique)
+        if ($ManagedApps.Count -gt 0) {
+            $missing=@($ManagedApps | Where-Object { $_ -notin $discovered })
+            if ($missing.Count) { throw "WORKLOAD_DISCOVERY_MISSING: $($missing -join ',')" }
+            $script:apps=@($ManagedApps)
+        } else { $script:apps=$discovered }
+        if ($script:apps.Count -eq 0) { throw 'WORKLOAD_DISCOVERY_EMPTY' }
+        $poolJson=((& kubectl get nodepool -o json 2>$null) -join '') | ConvertFrom-Json
+        $script:RequiredNodePools=@($poolJson.items | ForEach-Object { [string]$_.metadata.name })
+    }
+
+    $live=$null
+    if (-not $SelfTestOnly) { $live=Get-LiveConfig 'DISCOVERED_LIVE_BASE' }
+    $equalShare=1.0/[math]::Max(1,$script:apps.Count)
+    foreach ($app in $script:apps) {
+        $oracle=if ($SelfTestOnly) { $RegressionOracleConfig[$app] } else { $live[$app] }
+        $req=[double](Convert-CpuToM $oracle.requestCpu)
+        $reqMem=[double](Convert-MemoryToMi $oracle.requestMemory)
+        $limMem=[double](Convert-MemoryToMi $oracle.limitMemory)
+        $cpuRequestMinimum[$app]=[math]::Max(1.0,[math]::Floor($req*0.25))
+        $cpuRequestStart[$app]=$req
+        $cpuLimitStart[$app]=Convert-CpuToM $oracle.limitCpu
+        $memoryRequestStart[$app]=[math]::Max(1.0,$reqMem)
+        $memoryLimitStart[$app]=[math]::Max($reqMem,$limMem)
+        $hpaTargets[$app]=[int]$oracle.hpaTarget
+        $trafficShare[$app]=$equalShare
+        if (-not $sloMs.ContainsKey($app)) { $sloMs[$app]=1000.0 }
+        $appResourceWeight[$app]=1
+        $hpaMaxMinimum[$app]=[int][math]::Max(1,$oracle.maxReplicas)
+        $script:HardSafetyMaxByApp[$app]=[int][math]::Max([int]$oracle.maxReplicas,$MaxAutoReplicas)
+        $script:HpaBehaviorAction[$app]='KEEP'
+    }
+    $script:ElasticDensityApps=@($script:apps)
+    $script:performanceProtectionOrder=@($script:apps)
+    $script:hpaReductionOrder=@($script:apps)
+    $script:idleRequestReductionOrder=@($script:apps)
+    $script:Is38PointAppSet=$false
+    Write-Host ("Discovered workloads: {0}" -f ($script:apps -join ', ')) -ForegroundColor Cyan
+}
+
 function Require([string]$name) {
     if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { throw "명령을 찾을 수 없습니다: $name" }
 }
@@ -859,26 +894,21 @@ function Copy-Config([hashtable]$source, [string]$name) {
 }
 
 function Get-StandardHpaBehavior([string]$app = '') {
-    # User는 200ms SLO라 늦은 scale-up의 tail latency 손실이 크고, Stress는
-    # timeout 전 용량이 필요하다. Product만 Min으로 비용을 제어한다.
-    $scaleUpPolicy=if ($app -in @('user','stress')) { 'Max' } else { 'Min' }
-    $scaleUpStabilization=if ($app -eq 'user') { 0 } else { 30 }
+    # Name-agnostic safe response policy. It is applied only through a measured
+    # candidate lifecycle, never because of a workload name.
     return @{
         scaleUp=@{
-            stabilizationWindowSeconds=$scaleUpStabilization
-            selectPolicy=$scaleUpPolicy
-            policies=@(
-                @{type='Percent';value=50;periodSeconds=30},
-                @{type='Pods';value=2;periodSeconds=30}
-            )
-        }
-        scaleDown=@{
-            stabilizationWindowSeconds=30
+            stabilizationWindowSeconds=0
             selectPolicy='Max'
             policies=@(
                 @{type='Percent';value=100;periodSeconds=15},
                 @{type='Pods';value=4;periodSeconds=15}
             )
+        }
+        scaleDown=@{
+            stabilizationWindowSeconds=300
+            selectPolicy='Min'
+            policies=@(@{type='Percent';value=25;periodSeconds=60})
         }
     }
 }
@@ -1139,7 +1169,8 @@ function Set-RequiredPolicy([hashtable]$source,[string]$name,[hashtable]$desired
 function New-MinimumConfig([hashtable]$seed,[string]$name = 'Minimum') {
     # P0-1: 측정 config = final config 원칙. 기존 seed의 request/limit/min/max/target을 보존한다.
     $config=Copy-Config $seed $name
-    $memoryFloor=@{user=[math]::Max([double]$memoryRequestStart.user,$MinMemoryRequestMi);product=[math]::Max([double]$memoryRequestStart.product,$MinMemoryRequestMi);stress=[math]::Max([double]$memoryRequestStart.stress,$MinMemoryRequestMi)}
+    $memoryFloor=@{}
+    foreach ($app in $apps) { $memoryFloor[$app]=[math]::Max([double]$memoryRequestStart[$app],$MinMemoryRequestMi) }
     foreach ($app in $apps) {
         # 실제 live request를 튜닝 seed로 사용한다. KnownGoodReference는
         # 새 앱/새 난이도에서 잘못된 고정 prior가 되므로 seed를 덮어쓰지 않는다.
@@ -1452,46 +1483,32 @@ function Assert-LiveConfigMatches([hashtable]$expected) {
 }
 
 function Set-KarpenterNodeLimit($cluster) {
-    # CostBaselineNodes is a score denominator, not a capacity ceiling. A hard
-    # two-node Karpenter budget caused the observed Peak2 failure: stress HPA
-    # reached 6 while three stress Pods stayed Pending. BASE/candidate measurements
-    # therefore retain the known-good performance capacity (default=2, stress=12)
-    # and let measured AverageTotalNodes decide the cost trade-off.
+    # NodePool names and CPU capacity come from live discovery. Normal measured
+    # runs only observe limits; an explicit -EnforceNodeBudget is the sole path
+    # that mutates infrastructure capacity.
+    $pools=@($script:RequiredNodePools)
+    if (-not $pools.Count) { Write-Host 'No Karpenter NodePool discovered' -ForegroundColor DarkGray; return }
     $desired=@{}
     if ($EnforceNodeBudget) {
-        $karpenterBudget=[math]::Max(0,$MaxNodes-$ManagedNodes)
-        $sharedNodes=if ($DedicatedApp -and $karpenterBudget -ge 2) { 1 } else { 0 }
-        $dedicatedNodes=[math]::Max(0,$karpenterBudget-$sharedNodes)
-        $desired.default=[math]::Max(1,$sharedNodes*2000)
-        $desired.stress=[math]::Max(1,$dedicatedNodes*2000)
-    } elseif ($script:Is38PointAppSet) {
-        $desired.default=2000
-        $desired.stress=12000
+        $karpenterNodes=[math]::Max(0,$MaxNodes-$ManagedNodes)
+        $perPoolNodes=[math]::Floor($karpenterNodes/[math]::Max(1,$pools.Count))
+        $nodeCpu=[double](Get-OptionalPropertyValue $cluster 'NodeCapacityCPU' 0)
+        foreach ($pool in $pools) { $desired[$pool]=[math]::Max(1,$perPoolNodes*$nodeCpu) }
     }
-    foreach ($pool in @('default','stress')) {
+    foreach ($pool in $pools) {
         try {
             $obj=((& kubectl get nodepool $pool -o json 2>$null) -join '') | ConvertFrom-Json
             if (-not $obj) { throw "NodePool/$pool not found" }
             $old=[string]$obj.spec.limits.cpu
-            if ($PerformanceGateOnly -and $script:Is38PointAppSet) {
-                # Keep capacity available for the peak profile. The additional
-                # tagged pod-capacity subnets provide fresh CNI prefix space.
-                $desired.default=8000
-                $desired.stress=12000
-            }
             if ($desired.ContainsKey($pool)) {
                 $new=Format-Cpu ([double]$desired[$pool])
                 if ([string]$old -ne [string]$new) {
                     $patch=@{spec=@{limits=@{cpu=$new}}} | ConvertTo-Json -Compress -Depth 8
                     Invoke-Kubectl @('patch','nodepool',$pool,'--type=merge','-p',$patch)
-                    Write-Host ("NodePool/{0} CPU limit: {1} -> {2} ({3})" -f $pool,$old,$new,$(if($EnforceNodeBudget){'hard budget'}else{'performance measurement capacity'})) -ForegroundColor Yellow
-                } else {
-                    Write-Host ("NodePool/{0} CPU limit: {1} ({2})" -f $pool,$new,$(if($EnforceNodeBudget){'hard budget'}else{'performance measurement capacity'})) -ForegroundColor DarkGray
+                    Write-Host ("NodePool/{0} CPU limit: {1} -> {2} (explicit measured budget)" -f $pool,$old,$new) -ForegroundColor Yellow
                 }
-            } else {
-                Write-Host ("NodePool/{0} CPU limit observed: {1}" -f $pool,$old) -ForegroundColor DarkGray
-            }
-        } catch { throw "NodePool/$pool CPU limit 적용 실패: $($_.Exception.Message)" }
+            } else { Write-Host ("NodePool/{0} CPU limit observed: {1}" -f $pool,$old) -ForegroundColor DarkGray }
+        } catch { throw "NodePool/$pool CPU limit 처리 실패: $($_.Exception.Message)" }
     }
 }
 
@@ -1692,7 +1709,7 @@ function Assert-RequiredResourcesPresent {
             if (@($deploy.items | Where-Object { $_.metadata.name -eq $app }).Count -eq 0) { $missing.Add("deployment/$app") }
             if (@($hpa.items | Where-Object { $_.metadata.name -eq $app }).Count -eq 0) { $missing.Add("hpa/$app") }
         }
-        foreach ($pool in @('default','stress')) {
+        foreach ($pool in @($script:RequiredNodePools)) {
             if (@($pools.items | Where-Object { $_.metadata.name -eq $pool }).Count -eq 0) { $missing.Add("nodepool/$pool") }
         }
         if ($ready.Count -lt [math]::Max(1,$ManagedNodes)) { $missing.Add("ready-nodes<$ManagedNodes") }
@@ -1933,7 +1950,7 @@ function Enforce-ClusterReplicaBudget([hashtable]$config,$cluster,[int]$nodeBudg
             # 앱별 기능 하한보다 여유가 있는 후보만 축소한다.
             $app=$hpaReductionOrder | Where-Object { [int]$adjusted[$_].maxReplicas -gt [int]$hpaMaxMinimum[$_] } | Select-Object -First 1
         }
-        if (-not $app) { throw "$nodeBudget Node 안에 HPA 기능 하한(user=$($hpaMaxMinimum.user), product=$($hpaMaxMinimum.product), stress=$($hpaMaxMinimum.stress))을 배치할 수 없습니다." }
+        if (-not $app) { $floors=@($apps | ForEach-Object { "$_=$($hpaMaxMinimum[$_])" }); throw "$nodeBudget Node 안에 HPA 기능 하한($($floors -join ', '))을 배치할 수 없습니다." }
         $adjusted[$app].maxReplicas=[int]$adjusted[$app].maxReplicas-1
     }
     $finalFit=Test-ClusterReplicaFit $adjusted $cluster $nodeBudget
@@ -3116,7 +3133,7 @@ function Write-EmpiricalSummary($finalConfig,$validation,$cluster,[int]$targetTo
     Write-Host '===== FINAL CONFIG (reference vs calculated) =====' -ForegroundColor Cyan
     Write-Host ("  {0,-9} {1,-28} {2,-28} {3}" -f 'APP','REFERENCE','CALCULATED','REASON') -ForegroundColor DarkGray
     foreach ($a in $apps) {
-        $ref=$KnownGoodReference[$a]
+        $ref=if ($KnownGoodReference.ContainsKey($a)) { $KnownGoodReference[$a] } else { $finalConfig[$a] }
         $reqM=[math]::Round((Convert-CpuToM $finalConfig[$a].requestCpu))
         $refReqM=[math]::Round((Convert-CpuToM $ref.requestCpu))
         $tgt=[int]$finalConfig[$a].hpaTarget
@@ -5916,41 +5933,244 @@ function New-ExperimentCandidate([hashtable]$bestConfig,$recommendation,[string]
     return $candidate
 }
 
-function Invoke-ExternalProfileSweep {
+function Get-ExternalProfileClusterSample([datetime]$ProfileStartedAt) {
+    Assert-RequiredResourcesPresent
+    $nodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
+    $readyNodes=@($nodes.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count }).Count
+    $hpaJson=((& kubectl -n $Namespace get hpa -o json) -join '') | ConvertFrom-Json
+    $podJson=((& kubectl -n $Namespace get pods -o json) -join '') | ConvertFrom-Json
+    $deployJson=((& kubectl -n $Namespace get deployments -o json) -join '') | ConvertFrom-Json
+    $metricsJson=$null
+    try { $metricsJson=((& kubectl get --raw "/apis/metrics.k8s.io/v1beta1/namespaces/$Namespace/pods" 2>$null) -join '') | ConvertFrom-Json } catch { }
+    $hpa=@{}
+    foreach ($item in @($hpaJson.items)) {
+        $metric=@($item.status.currentMetrics | Where-Object { $_.type -eq 'Resource' -and $_.resource.name -eq 'cpu' } | Select-Object -First 1)
+        $util=if ($metric.Count -and $null -ne $metric[0].resource.current.averageUtilization) { [int]$metric[0].resource.current.averageUtilization } else { $null }
+        $target=@($item.spec.metrics | Where-Object { $_.type -eq 'Resource' -and $_.resource.name -eq 'cpu' } | Select-Object -First 1)
+        $hpa[[string]$item.metadata.name]=[pscustomobject]@{
+            Current=[int]$item.status.currentReplicas;Desired=[int]$item.status.desiredReplicas
+            Min=[int]$item.spec.minReplicas;Max=[int]$item.spec.maxReplicas
+            CpuUtil=$util;Target=$(if ($target.Count) { [int]$target[0].resource.target.averageUtilization } else { $null })
+        }
+    }
+    $usage=@{}
+    foreach ($app in $apps) {
+        $deployment=@($deployJson.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
+        $names=[System.Collections.Generic.List[string]]::new()
+        if ($deployment.Count) {
+            $selector=@($deployment[0].spec.selector.matchLabels.PSObject.Properties)
+            foreach ($pod in @($podJson.items)) {
+                $match=$true
+                foreach ($property in $selector) { if ([string]$pod.metadata.labels.PSObject.Properties[$property.Name].Value -ne [string]$property.Value) { $match=$false; break } }
+                if ($match) { $names.Add([string]$pod.metadata.name) }
+            }
+        }
+        $cpu=0.0; $mem=0.0; $metricPods=0
+        foreach ($podMetric in @($metricsJson.items | Where-Object { $_.metadata.name -in $names })) {
+            $metricPods++
+            foreach ($container in @($podMetric.containers)) { $cpu += [double](Convert-CpuToM $container.usage.cpu); $mem += [double](Convert-MemoryToMi $container.usage.memory) }
+        }
+        $usage[$app]=[pscustomobject]@{CpuTotalM=$cpu;MemoryTotalMi=$mem;MetricPods=$metricPods;CpuPerPodM=$(if($metricPods){$cpu/$metricPods}else{$null});MemoryPerPodMi=$(if($metricPods){$mem/$metricPods}else{$null})}
+    }
+    $pending=[System.Collections.Generic.List[object]]::new()
+    foreach ($pod in @($podJson.items | Where-Object { $_.status.phase -eq 'Pending' })) {
+        $messages=[System.Collections.Generic.List[string]]::new()
+        foreach ($condition in @($pod.status.conditions)) { if ($condition.reason) { $messages.Add([string]$condition.reason) }; if ($condition.message) { $messages.Add([string]$condition.message) } }
+        foreach ($cs in @($pod.status.containerStatuses)) { if ($cs.state.waiting.reason) { $messages.Add([string]$cs.state.waiting.reason) } }
+        $pending.Add([pscustomobject]@{Pod=[string]$pod.metadata.name;Reason=($messages -join '; ')})
+    }
+    $cniErrors=0
+    try {
+        $events=((& kubectl get events -A --field-selector reason=FailedCreatePodSandBox -o json 2>$null) -join '') | ConvertFrom-Json
+        foreach ($event in @($events.items)) {
+            $stamp=$event.eventTime; if (-not $stamp) { $stamp=$event.lastTimestamp }; if (-not $stamp) { $stamp=$event.firstTimestamp }
+            if ($stamp -and ([datetime]$stamp).ToUniversalTime() -ge $ProfileStartedAt.ToUniversalTime()) { $cniErrors++ }
+        }
+    } catch { }
+    return [pscustomobject]@{Timestamp=(Get-Date -Format o);ReadyNodes=$readyNodes;Hpa=$hpa;Usage=$usage;Pending=@($pending);CniErrors=$cniErrors}
+}
+
+function Get-ExternalSweepObjective($Results,[string]$CandidateName,[string]$ConfigFingerprint) {
+    $valid=@($Results | Where-Object { $_.Score -and $null -ne $_.Score.total40 })
+    if ($valid.Count -ne 3) { return [pscustomobject]@{Candidate=$CandidateName;Valid=$false;AllPerformanceGuards=$false;PrimaryScore=-1.0;AverageScore=-1.0;AverageNodes=[double]::PositiveInfinity;Results=$Results;ConfigFingerprint=$ConfigFingerprint} }
+    $totals=@($valid | ForEach-Object { [double]$_.Score.total40 })
+    $perf=@($valid | ForEach-Object { [double]$_.Score.performance.score })
+    $guards=@($valid | Where-Object { [double]$_.Score.availability.score -ge [double]$_.Score.availability.max -and [double]$_.Score.performance.score -ge $ProfilePerformanceGuard })
+    $avgNodes=@($valid | ForEach-Object { [double]$_.Score.avg_ec2 })
+    return [pscustomobject]@{
+        Candidate=$CandidateName;Valid=$true;AllPerformanceGuards=($guards.Count -eq 3)
+        PrimaryScore=[double](($totals | Measure-Object -Minimum).Minimum)
+        AverageScore=[double](($totals | Measure-Object -Average).Average)
+        MinimumPerformanceScore=[double](($perf | Measure-Object -Minimum).Minimum)
+        AverageNodes=[double](($avgNodes | Measure-Object -Average).Average)
+        Results=$Results;ConfigFingerprint=$ConfigFingerprint
+    }
+}
+
+function Test-SweepCandidateBetter($Candidate,$Best) {
+    if (-not $Candidate.Valid) { return $false }
+    if ($Candidate.AllPerformanceGuards -ne $Best.AllPerformanceGuards) { return [bool]$Candidate.AllPerformanceGuards }
+    if ([double]$Best.PrimaryScore -ge $ProfileTargetScore -and [double]$Candidate.PrimaryScore -lt $ProfileTargetScore) { return $false }
+    if ([double]$Candidate.PrimaryScore -gt ([double]$Best.PrimaryScore+$SweepNoiseTolerance)) { return $true }
+    if ([math]::Abs([double]$Candidate.PrimaryScore-[double]$Best.PrimaryScore) -le $SweepNoiseTolerance -and [double]$Candidate.AverageNodes -lt ([double]$Best.AverageNodes-0.10)) { return $true }
+    return $false
+}
+
+function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[string[]]$RejectedSignatures) {
+    $samples=@($BestEvaluation.Results | ForEach-Object { @($_.Samples) })
+    $generatorLimited=@($BestEvaluation.Results | Where-Object {
+        ([double](Get-OptionalPropertyValue $_.Status 'dropped' 0) -gt 0) -or
+        ([double](Get-OptionalPropertyValue $_.Status 'target_rps' 0) -gt 0 -and [double](Get-OptionalPropertyValue $_.Status 'sent_rps' 0) -lt [double](Get-OptionalPropertyValue $_.Status 'target_rps' 0)*0.90)
+    })
+    if ($generatorLimited.Count) { return [pscustomobject]@{Type='GENERATOR_LIMIT';Signature='GENERATOR_LIMIT';App=$null;Reason='external generator did not deliver requested load'} }
+    if (@($samples | Where-Object { [int]$_.CniErrors -gt 0 }).Count) {
+        return [pscustomobject]@{Type='CNI_IP_CAPACITY';Signature='CNI_IP_CAPACITY';App=$null;Reason='FailedCreatePodSandBox; application capacity must not be increased'}
+    }
+    $pending=@($samples | ForEach-Object { @($_.Pending) })
+    if (@($pending | Where-Object { $_.Reason -match 'Insufficient cpu' }).Count) { return [pscustomobject]@{Type='NODE_CPU_CAPACITY';Signature='NODE_CPU_CAPACITY';App=$null;Reason='Pending Insufficient cpu'} }
+    if (@($pending | Where-Object { $_.Reason -match 'Insufficient memory' }).Count) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Signature='NODE_MEMORY_CAPACITY';App=$null;Reason='Pending Insufficient memory'} }
+    if ($pending.Count) { return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Signature='SCHEDULER_PLACEMENT';App=$null;Reason=(@($pending.Reason) -join '; ')} }
+
+    foreach ($app in $apps) {
+        $ceiling=@($samples | Where-Object {
+            $m=$_.Hpa[$app]; $m -and [int]$m.Desired -ge [int]$m.Max -and $null -ne $m.CpuUtil -and [int]$m.CpuUtil -gt [int]$m.Target
+        })
+        $sig="HPA_MAX:${app}:$([int]$BestConfig[$app].maxReplicas+1)"
+        if ($ceiling.Count -and $sig -notin $RejectedSignatures) {
+            return [pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=[int]$BestConfig[$app].maxReplicas;To=[int]$BestConfig[$app].maxReplicas+1;Reason='measured Desired>=Max and CPU>target'}
+        }
+    }
+
+    if ($BestEvaluation.AllPerformanceGuards) {
+        foreach ($app in @($apps | Sort-Object { -1*[int]$BestConfig[$_].minReplicas })) {
+            $cur=[int]$BestConfig[$app].minReplicas
+            $sig="MIN_REPLICA:${app}:$($cur-1)"
+            if ($cur -gt 1 -and $sig -notin $RejectedSignatures) { return [pscustomobject]@{Type='MIN_REPLICA_COST';Signature=$sig;App=$app;From=$cur;To=$cur-1;Reason='performance guards pass; one-field cost delta'} }
+        }
+        foreach ($app in $apps) {
+            $utils=@($samples | ForEach-Object { $m=$_.Hpa[$app]; if ($m -and $null -ne $m.CpuUtil) { [double]$m.CpuUtil } })
+            if (-not $utils.Count) { continue }
+            $peakUtil=[double](($utils | Measure-Object -Maximum).Maximum)
+            $oldReq=[double](Convert-CpuToM $BestConfig[$app].requestCpu); $oldTarget=[double]$BestConfig[$app].hpaTarget
+            if ($peakUtil -ge $oldTarget*0.70) { continue }
+            $measuredCpu=@($samples | ForEach-Object { $u=$_.Usage[$app]; if ($u -and $null -ne $u.CpuPerPodM) { [double]$u.CpuPerPodM } })
+            $observedPeak=if ($measuredCpu.Count) { [double](($measuredCpu | Measure-Object -Maximum).Maximum) } else { $oldReq*$peakUtil/100.0 }
+            $newReq=[math]::Ceiling(([math]::Max([double]$cpuRequestMinimum[$app],$observedPeak*1.25))/$CpuRequestStep)*$CpuRequestStep
+            if ($newReq -ge $oldReq*0.90) { continue }
+            $absoluteTrigger=$oldReq*$oldTarget/100.0
+            $newTarget=[int][math]::Round(100.0*$absoluteTrigger/$newReq)
+            if ($newTarget -lt $HpaTargetLowerBound -or $newTarget -gt $HpaTargetUpperBound) { continue }
+            $sig="REQUEST_CP:${app}:${newReq}:$newTarget"
+            if ($sig -notin $RejectedSignatures) { return [pscustomobject]@{Type='REQUEST_OVERSIZED';Signature=$sig;App=$app;From=$oldReq;To=$newReq;OldTarget=$oldTarget;NewTarget=$newTarget;Reason="peak utilization $peakUtil%; preserve absolute trigger $absoluteTrigger m"} }
+        }
+    }
+    return $null
+}
+
+function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[string]$Name) {
+    $candidate=Copy-Config $BestConfig $Name
+    switch ($Recommendation.Type) {
+        'HPA_CEILING' { $candidate[$Recommendation.App].maxReplicas=[int]$Recommendation.To }
+        'MIN_REPLICA_COST' { $candidate[$Recommendation.App].minReplicas=[int]$Recommendation.To; $candidate[$Recommendation.App].replicas=[int]$Recommendation.To }
+        'REQUEST_OVERSIZED' {
+            $oldCp=(Convert-CpuToM $BestConfig[$Recommendation.App].requestCpu)*[double]$BestConfig[$Recommendation.App].hpaTarget/100.0
+            $candidate[$Recommendation.App].requestCpu=Format-Cpu ([double]$Recommendation.To)
+            $actualRequest=Convert-CpuToM $candidate[$Recommendation.App].requestCpu
+            $candidate[$Recommendation.App].hpaTarget=[int][math]::Round(100.0*$oldCp/$actualRequest)
+            if ($candidate[$Recommendation.App].hpaTarget -lt $HpaTargetLowerBound -or $candidate[$Recommendation.App].hpaTarget -gt $HpaTargetUpperBound) { throw 'CONTROL_POINT_TARGET_OUT_OF_RANGE' }
+            $newCp=$actualRequest*[double]$candidate[$Recommendation.App].hpaTarget/100.0
+            if ([math]::Abs($oldCp-$newCp) -gt [math]::Max(1.0,$oldCp*0.03)) { throw "CONTROL_POINT_DRIFT: $oldCp -> $newCp" }
+        }
+        default { throw "NO_APPLICATION_DELTA: $($Recommendation.Type)" }
+    }
+    $diffs=@(Compare-Config $BestConfig $candidate @())
+    if ($Recommendation.Type -eq 'REQUEST_OVERSIZED') {
+        $allowed=@($diffs | Where-Object { $_.App -eq $Recommendation.App -and $_.Field -in @('requestCpu','hpaTarget') })
+        if ($diffs.Count -ne 2 -or $allowed.Count -ne 2) { throw 'ONE_DELTA_VIOLATION: request/control-point candidate changed unrelated fields' }
+    } elseif ($diffs.Count -ne 1) { throw "ONE_DELTA_VIOLATION: expected one field, got $($diffs.Count)" }
+    return $candidate
+}
+
+function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[switch]$FreshVerification) {
     $profiles=@('Default','Default-spike2','순차증가')
     $results=[System.Collections.Generic.List[object]]::new()
     foreach ($profileName in $profiles) {
-        Write-Host "`n===== EXTERNAL PROFILE: $profileName =====" -ForegroundColor Cyan
+        Write-Host "`n===== EXTERNAL PROFILE: $CandidateName / $profileName =====" -ForegroundColor Cyan
         $body=@{template=$profileName} | ConvertTo-Json -Compress
         $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
-        $runId=[string]$run.run_id; $started=Get-Date; $expected=[int]([double](Get-OptionalPropertyValue $run 'expected_end_min' 15)*60)
-        $restarts=0
+        $runId=[string]$run.run_id; $started=Get-Date; $expected=[int]([double](Get-OptionalPropertyValue $run 'expected_end_min' 15)*60); $restarts=0
+        $samples=[System.Collections.Generic.List[object]]::new(); $completed=$false
         while (((Get-Date)-$started).TotalSeconds -lt ($expected+120)) {
             Start-Sleep -Seconds 30
             $status=Invoke-RestMethod -Uri ("$LoadServer/api/load/status") -TimeoutSec 20
             $score=Invoke-RestMethod -Uri ("$LoadServer/api/score") -TimeoutSec 20
-            try { Assert-RequiredResourcesPresent } catch {
+            try { $samples.Add((Get-ExternalProfileClusterSample $started)) } catch {
                 try { Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/stop") -Body '{}' -ContentType 'application/json' -TimeoutSec 20 | Out-Null } catch { }
-                Stop-AndRecordResourceLoss ("profile=$profileName; run=$runId; $($_.Exception.Message)") ([pscustomobject]@{Status=$status;Score=$score})
+                Stop-AndRecordResourceLoss ("candidate=$CandidateName; profile=$profileName; run=$runId; $($_.Exception.Message)") ([pscustomobject]@{Status=$status;Score=$score;Samples=@($samples)})
             }
-            Write-Host ("{0}: elapsed={1}s score={2} performance={3}" -f $profileName,$status.elapsed_sec,$score.total40,$score.performance.score) -ForegroundColor DarkGray
+            Write-Host ("{0}: elapsed={1}s total={2} perf={3} nodes={4}" -f $profileName,$status.elapsed_sec,$score.total40,$score.performance.score,$score.avg_ec2) -ForegroundColor DarkGray
             if ([string]$status.run_id -ne $runId) { throw "PROFILE_RUN_CHANGED: $profileName" }
             if (-not [bool]$status.running) {
                 if ([int]$status.elapsed_sec -lt [math]::Max(120,$expected-60) -and $restarts -lt 1) {
                     $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
-                    $runId=[string]$run.run_id; $started=Get-Date; $restarts++; Write-Warning "조기 중지 감지: $profileName 재시작($restarts)"; continue
+                    $runId=[string]$run.run_id; $started=Get-Date; $samples.Clear(); $restarts++; Write-Warning "조기 중지·리소스 정상: $profileName fresh 재시작"; continue
                 }
-                $results.Add([pscustomobject]@{Profile=$profileName;RunId=$runId;Score=$score;Status=$status;Restarts=$restarts}); break
+                $results.Add([pscustomobject]@{Profile=$profileName;RunId=$runId;Score=$score;Status=$status;Restarts=$restarts;Samples=@($samples);Fresh=[bool]$FreshVerification}); $completed=$true; break
             }
         }
+        if (-not $completed) {
+            try { Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/stop") -Body '{}' -ContentType 'application/json' -TimeoutSec 20 | Out-Null } catch { }
+            throw "PROFILE_TIMEOUT: $profileName"
+        }
     }
+    $fingerprint=Get-ConfigFingerprintFromValues $Config
+    $evaluation=Get-ExternalSweepObjective -Results @($results) -CandidateName $CandidateName -ConfigFingerprint $fingerprint
     New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
-    $path=Join-Path $OutputDir 'profile-sweep-results.json'
-    $results | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $path -Encoding UTF8
-    Write-Host "PROFILE_SWEEP_COMPLETE: $path" -ForegroundColor Green
+    $safeName=$CandidateName -replace '[^A-Za-z0-9_.-]','_'
+    $path=Join-Path $OutputDir ("profile-sweep-{0}.json" -f $safeName)
+    # Deep serialization makes every measured result immutable on disk.
+    $evaluation | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $path -Encoding UTF8
+    Write-Host ("PROFILE_SWEEP: candidate={0} guard={1} minScore={2:N1} avgNodes={3:N2} file={4}" -f $CandidateName,$evaluation.AllPerformanceGuards,$evaluation.PrimaryScore,$evaluation.AverageNodes,$path) -ForegroundColor Green
+    return $evaluation
 }
 
-Require kubectl;Require k6;Require $script:curlCmd;Require aws
+function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase) {
+    $bestConfig=Copy-Config $MeasuredBase 'MEASURED_BEST'
+    $best=Invoke-ExternalProfileSweep -CandidateName 'BASE' -Config $bestConfig
+    $history=[System.Collections.Generic.List[object]]::new(); $rejected=[System.Collections.Generic.List[string]]::new()
+    for ($i=1; $i -le $MaxProfileCandidates; $i++) {
+        $rec=Get-DynamicSweepRecommendation $bestConfig $best @($rejected)
+        if ($null -eq $rec) { Write-Warning 'NO_SAFE_MEASURED_DELTA: optimization stopped'; break }
+        if ($rec.Type -in @('CNI_IP_CAPACITY','NODE_CPU_CAPACITY','NODE_MEMORY_CAPACITY','SCHEDULER_PLACEMENT','GENERATOR_LIMIT')) {
+            $record=[pscustomobject]@{Timestamp=(Get-Date -Format o);StopReason=$rec.Type;Recommendation=$rec;Best=$best}
+            New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+            $record | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $OutputDir 'profile-sweep-infra-stop.json') -Encoding UTF8
+            Write-Warning "INFRASTRUCTURE_STOP: $($rec.Type) — no application value changed"; break
+        }
+        $candidate=New-DynamicSweepCandidate $bestConfig $rec "CANDIDATE_$i"
+        $script:hardDeadline=(Get-Date).AddMinutes(15); $script:tuningDeadline=$script:hardDeadline.AddMinutes(-2)
+        if (-not $NoApply -and -not (Apply-CandidateSafely $candidate Hard)) { $rejected.Add($rec.Signature); continue }
+        $measured=Invoke-ExternalProfileSweep -CandidateName "CANDIDATE_$i" -Config $candidate
+        $keep=Test-SweepCandidateBetter $measured $best
+        $history.Add([pscustomobject]@{Iteration=$i;Recommendation=$rec;Decision=$(if($keep){'KEEP'}else{'REJECT'});Objective=$measured})
+        if ($keep) { $best=$measured; $bestConfig=Copy-Config $candidate 'MEASURED_BEST' }
+        else {
+            $rejected.Add($rec.Signature)
+            if (-not $NoApply) { $script:hardDeadline=(Get-Date).AddMinutes(15); Apply-CandidateSafely $bestConfig Hard | Out-Null }
+        }
+    }
+    if (-not $NoApply) { $script:hardDeadline=(Get-Date).AddMinutes(15); Apply-CandidateSafely $bestConfig Hard | Out-Null }
+    # Final validation is always three new load runs, never cached re-scoring.
+    $fresh=Invoke-ExternalProfileSweep -CandidateName 'FINAL_FRESH' -Config $bestConfig -FreshVerification
+    $accepted=([bool]$fresh.AllPerformanceGuards -and [double]$fresh.PrimaryScore -ge $ProfileTargetScore)
+    $lifecycle=[pscustomobject]@{GeneratedAt=(Get-Date -Format o);SelectionObjective='performance guards, then maximize min(TotalScore), then minimize AverageNodes';TargetScore=$ProfileTargetScore;Accepted=$accepted;BestConfig=$bestConfig;SelectedMeasured=$best;FinalFresh=$fresh;History=@($history)}
+    if (-not $accepted) { Write-Warning ("FINAL_FRESH_NOT_ACCEPTED: minScore={0:N1}, guards={1}; next execution resumes from live measured BASE" -f $fresh.PrimaryScore,$fresh.AllPerformanceGuards) }
+    $lifecycle | ConvertTo-Json -Depth 60 | Set-Content -LiteralPath (Join-Path $OutputDir 'profile-sweep-lifecycle.json') -Encoding UTF8
+    return $lifecycle
+}
+
+Require kubectl;Require $script:curlCmd;Require aws
+if (-not $ProfileSweepOnly) { Require k6 }
 if (-not $SkipKubeconfig) {
     Write-Host "[tune] kubeconfig 갱신: aws eks update-kubeconfig --name $ClusterName --region $Region" -ForegroundColor Cyan
     & aws eks update-kubeconfig --name $ClusterName --region $Region
@@ -5966,38 +6186,25 @@ if ($ProbeDurationSec -lt $minimumProfileDuration -or $FinalDurationSec -lt $min
 }
 
 try {
+    try { Initialize-ManagedApplicationDiscovery }
+    catch { if ($ProfileSweepOnly) { Stop-AndRecordResourceLoss ("startup discovery: " + $_.Exception.Message) }; throw }
+    if ($SelfTestOnly) { . (Join-Path $PSScriptRoot "tune\selftest.ps1"); $runFailed=$false; return }
+    if ($ProfileSweepOnly) {
+        Write-Host "`n========== UNKNOWN-APPLICATION PROFILE SWEEP ==========" -ForegroundColor Green
+        $measuredBase=Get-LiveConfig 'MEASURED_LIVE_BASE'
+        Initialize-HpaControlPointModel
+        Show-Config $measuredBase 'Measured BASE (live, immutable seed)'
+        Invoke-ProfileSweepOptimization $measuredBase | Out-Null
+        $runFailed=$false
+        return
+    }
     Initialize-EndpointAndData
     if (-not [string]::IsNullOrWhiteSpace($ExternalResultDir)) { Import-ExternalEvidence | Out-Null }
-    if ($PerformanceGateOnly -or $ProfileSweepOnly) {
-        if (-not $script:Is38PointAppSet) { throw 'PERFORMANCE_GATE_PROFILE requires user/product/stress app set' }
-        Write-Host "`n========== PERFORMANCE GATE PROFILE ==========" -ForegroundColor Green
-        # This is the sole source of HPA/request/limit values for this mode.
-        # Keep enough replicas warm before the external peak profile starts.
-        $gate=Copy-Config $BaseConfig 'PERFORMANCE_GATE'
-        $gate.user.requestCpu='70m'; $gate.user.requestMemory='64Mi'; $gate.user.limitCpu=$null; $gate.user.limitMemory='256Mi'; $gate.user.hpaTarget=33; $gate.user.minReplicas=2; $gate.user.maxReplicas=80
-        $gate.product.requestCpu='70m'; $gate.product.requestMemory='64Mi'; $gate.product.limitCpu=$null; $gate.product.limitMemory='256Mi'; $gate.product.hpaTarget=29; $gate.product.minReplicas=2; $gate.product.maxReplicas=20
-        $gate.stress.requestCpu='600m'; $gate.stress.requestMemory='640Mi'; $gate.stress.limitCpu='2000m'; $gate.stress.limitMemory='1536Mi'; $gate.stress.hpaTarget=55; $gate.stress.minReplicas=1; $gate.stress.maxReplicas=8
-        $fastScaleUp=@{stabilizationWindowSeconds=0;selectPolicy='Max';policies=@(@{type='Percent';value=100;periodSeconds=15},@{type='Pods';value=20;periodSeconds=15})}
-        $slowScaleDown=@{stabilizationWindowSeconds=300;selectPolicy='Min';policies=@(@{type='Percent';value=25;periodSeconds=60})}
-        foreach ($app in $apps) { $gate[$app].behavior=@{scaleUp=$fastScaleUp;scaleDown=$slowScaleDown}; $gate[$app].replicas=[int]$gate[$app].minReplicas }
-        $script:HpaBehaviorAction=@{user='TUNE_SCALE_UP';product='TUNE_SCALE_UP';stress='TUNE_SCALE_UP'}
-        Show-Config $gate 'PERFORMANCE_GATE score-first config'
-        Ensure-38PointStressTopology -ApplyPlacement
-        $gateCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $gateCluster
-        if (-not $NoApply) {
-            # Explicit scale-down is part of the script-managed recovery; it
-            # releases CNI IPs before the verified profile is reapplied.
-            foreach ($app in $apps) { Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app",("--replicas={0}" -f [int]$gate[$app].replicas)) }
-            if (-not (Apply-CandidateSafely $gate Hard)) { throw 'PERFORMANCE_GATE_ROLLOUT_NOT_READY' }
-            Assert-MeasurementReady 180
-        }
-        Write-Host 'PERFORMANCE_GATE_READY: HPA/resources applied by tune.ps1; capacity retained.' -ForegroundColor Green
-        if ($ProfileSweepOnly) { Invoke-ExternalProfileSweep }
-        return
+    if ($PerformanceGateOnly) {
+        throw 'PerformanceGateOnly is deprecated: use measured -ProfileSweepOnly; application-specific fixed values are forbidden.'
     }
     if ($BaseExperiment -and -not $LegacyAdaptive) {
         Write-Host "`n========== BASE EXPERIMENT MODE ==========" -ForegroundColor Green
-        if ($SelfTestOnly) { . (Join-Path $PSScriptRoot "tune\selftest.ps1"); return }
         $envStatus = Get-VpcCniStatus
         # Get-VpcCniStatus exposes PrefixDelegation/WarmPrefixTarget; the old
         # Enabled/MaxPods property names silently produced a blank precondition.
@@ -6011,19 +6218,12 @@ try {
             throw "BASE_ENVIRONMENT_INVALID: WARM_PREFIX_TARGET=$($envStatus.WarmPrefixTarget)"
         }
         Write-Host "CNI: PREFIX_DELEGATION=true WARM_PREFIX_TARGET=$($envStatus.WarmPrefixTarget)" -ForegroundColor DarkGray
-        Write-Host "`n===== BASELINE CONTROL =====" -ForegroundColor Green
-        foreach ($app in $apps) { $bc=$BaseConfig[$app]; $lim=if($bc.limitCpu){$bc.limitCpu}else{'none'}; Write-Host ("  {0}: {1}/{2} limit={3}/{4} HPA={5}% {6}..{7} ({8})" -f $app,$bc.requestCpu,$bc.requestMemory,$lim,$bc.limitMemory,$bc.hpaTarget,$bc.minReplicas,$bc.maxReplicas,$bc.placement) }
+        Write-Host "`n===== MEASURED LIVE BASELINE =====" -ForegroundColor Green
         $originalConfig=Get-LiveConfig 'Original'
-        # 38점 앱 세트에서는 이전 tune 실행이 남긴 HPA/resource를 seed로
-        # 재사용하지 않는다. 매번 검증된 기준 구성에서 시작해야
-        # `terraform apply -> tune.ps1` 재현성이 유지된다.
-        $baseSeed=if ($script:Is38PointAppSet) {
-            Write-Host 'BASE seed: 38점 재현 구성(오염된 live HPA/resource 무시)' -ForegroundColor Yellow
-            Copy-Config $BaseConfig 'BASE_SEED'
-        } else {
-            Write-Host 'BASE seed: live Deployment/HPA (범용 앱 세트)' -ForegroundColor DarkGray
-            Copy-Config $originalConfig 'BASE_SEED'
-        }
+        Show-Config $originalConfig 'BASE seed: discovered live Deployment/HPA'
+        # Golden/BEST is the immutable measured baseline from this execution.
+        # A regression oracle is never copied into a production candidate.
+        $baseSeed=Copy-Config $originalConfig 'BASE_SEED'
         foreach ($app in $apps) {
             # BASE candidate의 max는 seed 설정이 기준이다. 직전 실행의
             # 실험용 max가 다음 실행의 축소 불가 floor가 되지 않게 한다.
@@ -6042,7 +6242,7 @@ try {
         foreach($app in $apps){ Write-Host ("BASE live {0}: req={1}/{2} limit={3}/{4} HPA={5}..{6}" -f $app,$baseLive[$app].requestCpu,$baseLive[$app].requestMemory,$baseLive[$app].limitCpu,$baseLive[$app].limitMemory,$baseLive[$app].minReplicas,$baseLive[$app].maxReplicas) -ForegroundColor DarkGray }
         $baseDiff=@(Compare-Config $baseCfg $baseLive @())
         if ($baseDiff.Count -ne 0) { throw "BASE_CONFIG_DRIFT: $([string]::Join(',',@($baseDiff | ForEach-Object { $_.App+'.'+$_.Field })))" }
-        Write-Host 'BASE_CONFIG_EXACT: live fingerprint matches immutable BaseConfig' -ForegroundColor Green
+        Write-Host 'BASE_CONFIG_EXACT: live fingerprint matches this run measured BASE' -ForegroundColor Green
         $baseCluster=Get-ClusterCapacitySnapshot; Set-KarpenterNodeLimit $baseCluster
         if (-not $NoApply) {
             $withinBudget=Wait-ReadyNodeCountAtMost $CostBaselineNodes 180 Hard
@@ -6755,7 +6955,7 @@ try {
         $oom=[int](Get-OptionalPropertyValue $m 'OOMKilledDelta' 0)
         $limitNow=[string]$finalConfig[$app].limitCpu
         if ($limitNow -ne '' -and $slo -ge 0.95 -and $thr -lt 0.05 -and $oom -le 0) {
-            Write-Host ("  {0}: CPU limit 제거 ({1} -> none) source=ELASTIC_DENSITY+REFERENCE_PRIOR (throttle={2:P1} slo={3:P1} oom={4})" -f $app,$limitNow,$thr,$slo,$oom) -ForegroundColor Yellow
+            Write-Host ("  {0}: CPU limit 제거 ({1} -> none) source=MEASURED_ELASTIC_DENSITY (throttle={2:P1} slo={3:P1} oom={4})" -f $app,$limitNow,$thr,$slo,$oom) -ForegroundColor Yellow
             $finalConfig[$app].limitCpu=''
         } else {
             $reason=if ($limitNow -eq '') { 'ALREADY_REMOVED' } elseif ($slo -lt 0.95) { 'SLO_BELOW_95' } elseif ($thr -ge 0.05) { 'THROTTLING' } else { 'OOM_RISK' }
