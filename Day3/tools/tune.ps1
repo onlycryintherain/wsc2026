@@ -6196,38 +6196,63 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
 }
 
 function Set-MeasuredWorkerNodeCeiling([hashtable]$Config,[int]$TotalCeiling) {
-    if($TotalCeiling-le0){return}
+    if ($TotalCeiling -le 0) { return }
     $nodes=((& kubectl get nodes -o json)-join'')|ConvertFrom-Json
-    $managed=@($nodes.items|Where-Object{-not $_.metadata.labels.PSObject.Properties['karpenter.sh/nodepool']}).Count
+    $nodeItems=@($nodes.items)
+    if (-not $nodeItems.Count) { throw 'NODE_CEILING_NO_NODES' }
+    $managed=@($nodeItems|Where-Object{-not $_.metadata.labels.PSObject.Properties['karpenter.sh/nodepool']}).Count
     $slots=$TotalCeiling-$managed
-    if($slots-lt1){throw "NODE_CEILING_INVALID: total=$TotalCeiling managed=$managed"}
+    if ($slots -lt 1) { throw "NODE_CEILING_INVALID: total=$TotalCeiling managed=$managed" }
     $poolJson=((& kubectl get nodepool -o json)-join'')|ConvertFrom-Json
     $deployJson=((& kubectl -n $Namespace get deployments -o json)-join'')|ConvertFrom-Json
-    $demand=@{};$poolObjects=@($poolJson.items)
-    foreach($pool in $poolObjects){$demand[[string]$pool.metadata.name]=0.0}
-    foreach($app in $apps){
+    $poolObjects=@($poolJson.items);$demand=@{}
+    foreach ($poolObject in $poolObjects) { $demand[[string]$poolObject.metadata.name]=0.0 }
+    foreach ($app in $apps) {
         $deployment=@($deployJson.items|Where-Object{$_.metadata.name-eq$app}|Select-Object -First 1)
-        if(-not$deployment.Count){continue}
-        $selector=$deployment[0].spec.template.spec.nodeSelector
-        $matched=@($poolObjects|Where-Object{
-            $labels=$_.spec.template.metadata.labels;$ok=$true
-            foreach($property in @($selector.PSObject.Properties)){if([string]$labels.PSObject.Properties[$property.Name].Value-ne[string]$property.Value){$ok=$false;break}}
-            $ok-and@($selector.PSObject.Properties).Count-gt0
-        })
-        if(-not$matched.Count){$matched=@($poolObjects|Where-Object{-not@($_.spec.template.spec.taints).Count}|Select-Object -First 1)}
-        if($matched.Count){$pool=[string]$matched[0].metadata.name;$demand[$pool]+=[double](Convert-CpuToM $Config[$app].requestCpu)*[int]$Config[$app].maxReplicas}
+        if (-not $deployment.Count) { continue }
+        $selectorProperties=if($deployment[0].spec.template.spec.nodeSelector){@($deployment[0].spec.template.spec.nodeSelector.PSObject.Properties)}else{@()}
+        $targetPool=$null
+        if ($selectorProperties.Count) {
+            foreach ($poolObject in $poolObjects) {
+                $labels=$poolObject.spec.template.metadata.labels;$matches=$true
+                foreach ($property in $selectorProperties) {
+                    $actual=if($labels){$labels.PSObject.Properties[$property.Name].Value}else{$null}
+                    if ([string]$actual -ne [string]$property.Value) { $matches=$false;break }
+                }
+                if ($matches) { $targetPool=$poolObject;break }
+            }
+        }
+        if ($null -eq $targetPool) {
+            $untainted=@($poolObjects|Where-Object{@($_.spec.template.spec.taints).Count-eq0}|Select-Object -First 1)
+            if($untainted.Count){$targetPool=$untainted[0]}
+        }
+        if ($null -eq $targetPool) { throw "NODE_CEILING_POOL_MAPPING_FAILED: app=$app" }
+        $poolName=[string]$targetPool.metadata.name
+        $demand[$poolName]+=[double](Convert-CpuToM $Config[$app].requestCpu)*[int]$Config[$app].maxReplicas
     }
     $active=@($demand.Keys|Where-Object{$demand[$_]-gt0})
-    if($active.Count-gt$slots){throw "NODE_CEILING_DOMAINS_EXCEED_BUDGET: domains=$($active.Count) slots=$slots"}
-    $totalDemand=[double](($active|ForEach-Object{$demand[$_]}|Measure-Object -Sum).Sum);$allocation=@{};$remainders=@()
-    foreach($pool in $active){$quota=$slots*$demand[$pool]/$totalDemand;$allocation[$pool]=[math]::Max(1,[math]::Floor($quota));$remainders+=[pscustomobject]@{Pool=$pool;Remainder=$quota-[math]::Floor($quota)}}
-    while([int](($allocation.Values|Measure-Object -Sum).Sum)-gt$slots){$victim=@($allocation.Keys|Where-Object{$allocation[$_]-gt1}|Sort-Object{$demand[$_]})[0];$allocation[$victim]--}
-    while([int](($allocation.Values|Measure-Object -Sum).Sum)-lt$slots){$winner=@($remainders|Sort-Object Remainder -Descending|Select-Object -First 1).Pool;$allocation[$winner]++;$remainders=@($remainders|Where-Object{$_.Pool-ne$winner})}
-    $firstNode=@($nodes.items|Select-Object -First 1)[0]
-    $nodeCpu=[double](Convert-CpuToM $firstNode.status.capacity.cpu)
-    foreach($pool in $poolObjects){
-        $name=[string]$pool.metadata.name
-        if(-not$allocation.ContainsKey($name)){continue}
+    if (-not $active.Count) { throw 'NODE_CEILING_NO_ACTIVE_POOLS' }
+    if ($active.Count -gt $slots) { throw "NODE_CEILING_DOMAINS_EXCEED_BUDGET: domains=$($active.Count) slots=$slots" }
+    $totalDemand=[double](($active|ForEach-Object{$demand[$_]}|Measure-Object -Sum).Sum)
+    $allocation=@{};$remainders=[System.Collections.Generic.List[object]]::new()
+    foreach ($poolName in $active) {
+        $quota=$slots*$demand[$poolName]/$totalDemand
+        $allocation[$poolName]=[math]::Max(1,[math]::Floor($quota))
+        $remainders.Add([pscustomobject]@{Pool=$poolName;Remainder=$quota-[math]::Floor($quota)})
+    }
+    while ([int](($allocation.Values|Measure-Object -Sum).Sum) -gt $slots) {
+        $victims=@($allocation.Keys|Where-Object{$allocation[$_]-gt1}|Sort-Object{$demand[$_]})
+        if (-not $victims.Count) { throw 'NODE_CEILING_ALLOCATION_OVERFLOW' }
+        $allocation[[string]$victims[0]]--
+    }
+    foreach ($entry in @($remainders|Sort-Object Remainder -Descending)) {
+        if ([int](($allocation.Values|Measure-Object -Sum).Sum) -ge $slots) { break }
+        $allocation[[string]$entry.Pool]++
+    }
+    $firstNode=$nodeItems[0];$nodeCpu=[double](Convert-CpuToM $firstNode.status.capacity.cpu)
+    foreach ($poolObject in $poolObjects) {
+        $name=[string]$poolObject.metadata.name
+        if (-not $allocation.ContainsKey($name)) { continue }
         $cpu=Format-Cpu ($allocation[$name]*$nodeCpu)
         $patch=@{spec=@{limits=@{cpu=$cpu}}}|ConvertTo-Json -Compress -Depth 5
         Invoke-Kubectl @('patch','nodepool',$name,'--type=merge','-p',$patch)

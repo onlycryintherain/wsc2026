@@ -296,6 +296,9 @@ Generic allocation method:
   - Current demand: shared user/product vs dedicated stress.
   - Expected total ceiling: managed 1 + Karpenter 5 = 6.
   - NodePool limits are applied through tune.ps1 only.
+  - First diagnostic apply failed before mutation with a recoverable null-index
+    error in generic pool mapping; no NodePool limit changed and no load started.
+  - Pool mapping/allocation was rewritten with explicit null/empty guards before retry.
 
 Topology caveat:
   - With stress dedicated selector/taint and min=1, physical idle floor is 2,
