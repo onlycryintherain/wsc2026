@@ -187,6 +187,18 @@ if ($BaseExperiment) {
         if ($body.template -ne 'Default' -or $body.endpoint -ne 'https://new.example') { throw 'run endpoint missing or stale' }
     }
 
+    # TEST 21: passing performance keeps measured high-load headroom but trims unused max.
+    Assert-Test 'Dynamic max retains measured headroom' {
+        $best=Copy-Config $BaseConfig 'best'
+        $h=@{}
+        foreach($app in $apps){$h[$app]=[pscustomobject]@{Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget}}
+        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=@{}}
+        $result=[pscustomobject]@{Status=[pscustomobject]@{dropped=0;target_rps=10;sent_rps=10};Samples=@($sample)}
+        $evaluation=[pscustomobject]@{AllPerformanceGuards=$true;Results=@($result,$result,$result)}
+        $rec=Get-DynamicSweepRecommendation $best $evaluation @()
+        if ($rec.Type -ne 'HPA_MAX_COST' -or [int]$rec.To -lt 3) { throw "unexpected max recommendation $($rec.Type) $($rec.To)" }
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
     if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }

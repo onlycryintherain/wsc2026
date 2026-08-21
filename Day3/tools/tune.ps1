@@ -87,7 +87,10 @@ param(
     [ValidateRange(0, 12)][double]$ProfilePerformanceGuard = 9.0,
     [ValidateRange(1, 40)][double]$ProfileTargetScore = 30.0,
     [ValidateRange(0, 2)][double]$SweepNoiseTolerance = 0.5,
-    [ValidateRange(1, 100)][int]$MaxProfileCandidates = 20
+    [ValidateRange(1, 100)][int]$MaxProfileCandidates = 20,
+    # A finished high-load profile must return to its measured low-load node
+    # floor before the next profile starts, otherwise the next cost window is polluted.
+    [ValidateRange(60, 600)][int]$ExternalProfileCooldownSec = 360
 )
 
 # The only production path discovers unknown workloads and uses external fresh
@@ -6041,12 +6044,23 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
             $m=$_.Hpa[$app]; $m -and [int]$m.Desired -ge [int]$m.Max -and $null -ne $m.CpuUtil -and [int]$m.CpuUtil -gt [int]$m.Target
         })
         $sig="HPA_MAX:${app}:$([int]$BestConfig[$app].maxReplicas+1)"
-        if ($ceiling.Count -and $sig -notin $RejectedSignatures) {
-            return [pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=[int]$BestConfig[$app].maxReplicas;To=[int]$BestConfig[$app].maxReplicas+1;Reason='measured Desired>=Max and CPU>target'}
+        if ($ceiling.Count -and -not $BestEvaluation.AllPerformanceGuards -and $sig -notin $RejectedSignatures) {
+            return [pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=[int]$BestConfig[$app].maxReplicas;To=[int]$BestConfig[$app].maxReplicas+1;Reason='performance guard failed with measured Desired>=Max and CPU>target'}
         }
     }
 
     if ($BestEvaluation.AllPerformanceGuards) {
+        # Max remains a high-load ceiling. Reduce only demonstrably unused excess
+        # while retaining 20% measured peak headroom; Min handles low-load cost.
+        foreach ($app in $apps) {
+            $desired=@($samples | ForEach-Object { $m=$_.Hpa[$app]; if ($m) { [int]$m.Desired } })
+            if (-not $desired.Count) { continue }
+            $peak=[int](($desired | Measure-Object -Maximum).Maximum)
+            $current=[int]$BestConfig[$app].maxReplicas
+            $proposed=[int][math]::Max([int]$BestConfig[$app].minReplicas+1,[math]::Ceiling($peak*1.20))
+            $sig="HPA_MAX_COST:${app}:$proposed"
+            if ($proposed -le $current-2 -and $sig -notin $RejectedSignatures) { return [pscustomobject]@{Type='HPA_MAX_COST';Signature=$sig;App=$app;From=$current;To=$proposed;Reason="measured peak desired=$peak; retain 20% headroom"} }
+        }
         foreach ($app in @($apps | Sort-Object { -1*[int]$BestConfig[$_].minReplicas })) {
             $cur=[int]$BestConfig[$app].minReplicas
             $sig="MIN_REPLICA:${app}:$($cur-1)"
@@ -6076,6 +6090,7 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
     $candidate=Copy-Config $BestConfig $Name
     switch ($Recommendation.Type) {
         'HPA_CEILING' { $candidate[$Recommendation.App].maxReplicas=[int]$Recommendation.To }
+        'HPA_MAX_COST' { $candidate[$Recommendation.App].maxReplicas=[int]$Recommendation.To }
         'MIN_REPLICA_COST' { $candidate[$Recommendation.App].minReplicas=[int]$Recommendation.To; $candidate[$Recommendation.App].replicas=[int]$Recommendation.To }
         'REQUEST_OVERSIZED' {
             $oldCp=(Convert-CpuToM $BestConfig[$Recommendation.App].requestCpu)*[double]$BestConfig[$Recommendation.App].hpaTarget/100.0
@@ -6096,6 +6111,21 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
     return $candidate
 }
 
+function Wait-ExternalProfileLowLoadFloor([int]$NodeFloor) {
+    $started=Get-Date
+    while (((Get-Date)-$started).TotalSeconds -lt $ExternalProfileCooldownSec) {
+        Assert-RequiredResourcesPresent
+        $nodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
+        $ready=@($nodes.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count }).Count
+        $hpas=((& kubectl -n $Namespace get hpa -o json) -join '') | ConvertFrom-Json
+        $atMin=@($hpas.items | Where-Object { [int]$_.status.currentReplicas -le [int]$_.spec.minReplicas -and [int]$_.status.desiredReplicas -le [int]$_.spec.minReplicas }).Count -eq @($hpas.items).Count
+        if ($ready -le $NodeFloor -and $atMin) { Write-Host "PROFILE_COOLDOWN_READY: nodes=$ready floor=$NodeFloor" -ForegroundColor Green; return }
+        Write-Host "PROFILE_COOLDOWN: nodes=$ready->$NodeFloor hpaAtMin=$atMin" -ForegroundColor DarkGray
+        Start-Sleep -Seconds 15
+    }
+    Write-Warning "PROFILE_COOLDOWN_TIMEOUT: node floor $NodeFloor not reached; next profile cost may include prior capacity"
+}
+
 function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) {
     if ([string]::IsNullOrWhiteSpace($RunEndpoint)) { throw 'EXTERNAL_LOAD_ENDPOINT_EMPTY' }
     return (@{template=$ProfileName;endpoint=$RunEndpoint.TrimEnd('/')} | ConvertTo-Json -Compress)
@@ -6104,7 +6134,10 @@ function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) 
 function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[switch]$FreshVerification) {
     $profiles=@('Default','Default-spike2','순차증가')
     $results=[System.Collections.Generic.List[object]]::new()
+    $profileIndex=0
     foreach ($profileName in $profiles) {
+        if ($profileIndex -gt 0 -or $CandidateName -ne 'BASE') { Wait-ExternalProfileLowLoadFloor ([int]$script:ExternalSweepNodeFloor) }
+        $profileIndex++
         Write-Host "`n===== EXTERNAL PROFILE: $CandidateName / $profileName =====" -ForegroundColor Cyan
         # The grading server keeps endpoint per run; never rely on a stale/default
         # endpoint after infrastructure recreation.
@@ -6148,6 +6181,9 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
 
 function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase) {
     $bestConfig=Copy-Config $MeasuredBase 'MEASURED_BEST'
+    $floorNodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
+    $script:ExternalSweepNodeFloor=[math]::Max(1,@($floorNodes.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count }).Count)
+    Write-Host "MEASURED_LOW_LOAD_NODE_FLOOR=$script:ExternalSweepNodeFloor" -ForegroundColor Cyan
     $best=Invoke-ExternalProfileSweep -CandidateName 'BASE' -Config $bestConfig
     $history=[System.Collections.Generic.List[object]]::new(); $rejected=[System.Collections.Generic.List[string]]::new()
     for ($i=1; $i -le $MaxProfileCandidates; $i++) {
