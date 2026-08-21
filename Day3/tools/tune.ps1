@@ -98,7 +98,8 @@ param(
     [string[]]$SweepProfiles = @('Default','Default-spike2','순차증가'),
     [switch]$DiagnosticSweepOnly,
     [switch]$NodeCeilingOnly,
-    [string]$RestoreConfigFingerprint = ''
+    [string]$RestoreConfigFingerprint = '',
+    [string[]]$RejectedSweepSignatures = @()
 )
 
 # The only production path discovers unknown workloads and uses external fresh
@@ -6144,7 +6145,7 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
         $perf=@($BestEvaluation.Results | ForEach-Object { $value=Get-OptionalPropertyValue $_.Score "${app}_perf" $null; if($null-ne$value){[double]$value} })
         $worstPerf=if($perf.Count){[double](($perf|Measure-Object -Minimum).Minimum)}else{100.0}
         $sig="HPA_MAX:${app}:$next"
-        if ($sig -notin $RejectedSignatures) { $ceilingCandidates.Add([pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=$current;To=$next;WorstAppPerformance=$worstPerf;Reason="measured ceiling; uncapped desired peak=$uncappedPeak; grow 20%"}) }
+        if ($worstPerf -lt 90.0 -and $sig -notin $RejectedSignatures) { $ceilingCandidates.Add([pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=$current;To=$next;WorstAppPerformance=$worstPerf;Reason="measured ceiling; uncapped desired peak=$uncappedPeak; grow 20%"}) }
     }
     if ($ceilingCandidates.Count) { return @($ceilingCandidates | Sort-Object WorstAppPerformance,App)[0] }
 
@@ -6161,7 +6162,8 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
             if (-not $utils.Count) { continue }
             $peakUtil=[double](($utils | Measure-Object -Maximum).Maximum)
             $currentTarget=[int]$BestConfig[$app].hpaTarget
-            if ($peakDesired -lt [int]$BestConfig[$app].maxReplicas -and $peakUtil -gt $currentTarget*1.20 -and $currentTarget -gt $HpaTargetLowerBound+5) {
+            $rejectedMax="HPA_MAX:${app}:$([int][math]::Ceiling([int]$BestConfig[$app].maxReplicas*1.20))" -in $RejectedSignatures
+            if (($peakDesired -lt [int]$BestConfig[$app].maxReplicas -or $rejectedMax) -and $peakUtil -gt $currentTarget*1.20 -and $currentTarget -gt $HpaTargetLowerBound+5) {
                 $nextTarget=[int][math]::Max($HpaTargetLowerBound,$currentTarget-5)
                 $sig="HPA_TARGET_RECOVERY:${app}:$nextTarget"
                 if ($sig -notin $RejectedSignatures) { $recovery.Add([pscustomobject]@{Type='HPA_TARGET_RECOVERY';Signature=$sig;App=$app;From=$currentTarget;To=$nextTarget;WorstAppPerformance=$worstPerf;Reason="guard deficit with sustained CPU signal; desired peak=$peakDesired below max; utilization peak=$peakUtil%"}) }
@@ -6479,7 +6481,8 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
         $best=$InitialEvaluation
         Write-Host "RESUME_IMMUTABLE_BASE: minScore=$($best.PrimaryScore) fingerprint=$actual" -ForegroundColor Cyan
     } else { $best=Invoke-ExternalProfileSweep -CandidateName 'BASE' -Config $bestConfig }
-    $history=[System.Collections.Generic.List[object]]::new(); $rejected=[System.Collections.Generic.List[string]]::new()
+    $history=[System.Collections.Generic.List[object]]::new();$rejected=[System.Collections.Generic.List[string]]::new()
+    foreach($signature in @($RejectedSweepSignatures)){if(-not[string]::IsNullOrWhiteSpace($signature)){$rejected.Add($signature)}}
     for ($i=1; $i -le $MaxProfileCandidates; $i++) {
         $script:ExternalSweepClusterCapacity=Get-ClusterCapacitySnapshot
         $rec=Get-DynamicSweepRecommendation $bestConfig $best @($rejected)
