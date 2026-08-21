@@ -6383,8 +6383,7 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
     return $evaluation
 }
 
-function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvaluation=$null) {
-    $bestConfig=Copy-Config $MeasuredBase 'MEASURED_BEST'
+function Initialize-ExternalSweepNodeFloor([hashtable]$MeasuredBase) {
     # Derive the low-load floor from stable topology, never from leftover nodes
     # of the previous run. Managed nodes host shared minima; each distinct
     # non-empty nodeSelector domain with min>0 needs one additional floor node.
@@ -6404,6 +6403,11 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
     }
     $script:ExternalSweepNodeFloor=[math]::Max(1,$managedReady+$domains.Count)
     Write-Host "MEASURED_LOW_LOAD_NODE_FLOOR=$script:ExternalSweepNodeFloor (managed=$managedReady dedicatedDomains=$($domains.Count))" -ForegroundColor Cyan
+}
+
+function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvaluation=$null) {
+    $bestConfig=Copy-Config $MeasuredBase 'MEASURED_BEST'
+    Initialize-ExternalSweepNodeFloor $MeasuredBase
     if ($InitialEvaluation) {
         $expected=Get-ConfigFingerprintFromValues $bestConfig
         $actual=[string](Get-OptionalPropertyValue $InitialEvaluation 'ConfigFingerprint' '')
@@ -6473,7 +6477,7 @@ try {
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'
         if($WorkerNodeCeiling-gt0){Set-MeasuredWorkerNodeCeiling $measuredBase $WorkerNodeCeiling}
         if($NodeCeilingOnly){$runFailed=$false;return}
-        if($DiagnosticSweepOnly){Invoke-ExternalProfileSweep -CandidateName 'DIAGNOSTIC' -Config $measuredBase|Out-Null;$runFailed=$false;return}
+        if($DiagnosticSweepOnly){Initialize-ExternalSweepNodeFloor $measuredBase;Invoke-ExternalProfileSweep -CandidateName 'DIAGNOSTIC' -Config $measuredBase|Out-Null;$runFailed=$false;return}
         $resume=$null
         if (-not [string]::IsNullOrWhiteSpace($ResumeSweepEvidence)) {
             if (-not (Test-Path -LiteralPath $ResumeSweepEvidence)) { throw "Resume evidence not found: $ResumeSweepEvidence" }
