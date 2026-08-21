@@ -286,6 +286,14 @@ if ($BaseExperiment) {
         try{$script:ExternalSweepClusterCapacity=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150};$rec=Get-DynamicSweepRecommendation $best $evaluation @();if($rec.Type-ne'REQUEST_PACKING'-or$rec.App-ne'stress'){throw "unexpected $($rec.Type) $($rec.App)"}}finally{$script:ExternalSweepClusterCapacity=$oldCluster}
     }
 
+    # TEST 29: immutable evidence fingerprint can restore a rejected live delta.
+    Assert-Test 'Fingerprint restore roundtrip' {
+        $fingerprint=Get-ConfigFingerprintFromValues $BaseConfig
+        $mutated=Copy-Config $BaseConfig mutated;$mutated.stress.requestCpu='550m';$mutated.stress.hpaTarget=60
+        $restored=ConvertFrom-ConfigFingerprint $fingerprint $mutated
+        if((Get-ConfigFingerprintFromValues $restored)-ne$fingerprint){throw 'fingerprint restore drift'}
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
     if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }

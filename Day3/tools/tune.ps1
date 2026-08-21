@@ -97,7 +97,8 @@ param(
     [ValidateRange(0, 20)][int]$WorkerNodeCeiling = 0,
     [string[]]$SweepProfiles = @('Default','Default-spike2','순차증가'),
     [switch]$DiagnosticSweepOnly,
-    [switch]$NodeCeilingOnly
+    [switch]$NodeCeilingOnly,
+    [string]$RestoreConfigFingerprint = ''
 )
 
 # The only production path discovers unknown workloads and uses external fresh
@@ -6238,6 +6239,23 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
     return $candidate
 }
 
+function ConvertFrom-ConfigFingerprint([string]$Fingerprint,[hashtable]$Template) {
+    $config=Copy-Config $Template 'RESTORE_FINGERPRINT'
+    $seen=[System.Collections.Generic.HashSet[string]]::new()
+    foreach($segment in @($Fingerprint-split';')){
+        $p=@([regex]::Split($segment,'\|'))
+        if($p.Count-ne8-or$p[0]-notin$apps){throw "RESTORE_FINGERPRINT_INVALID: $segment"}
+        $app=[string]$p[0];[void]$seen.Add($app)
+        $config[$app].requestCpu=[string]$p[1];$config[$app].requestMemory=[string]$p[2]
+        $config[$app].limitCpu=[string]$p[3];$config[$app].limitMemory=[string]$p[4]
+        $config[$app].hpaTarget=[int]$p[5];$config[$app].minReplicas=[int]$p[6]
+        $config[$app].maxReplicas=[int]$p[7];$config[$app].replicas=[int]$p[6]
+    }
+    if($seen.Count-ne$apps.Count){throw "RESTORE_FINGERPRINT_INCOMPLETE: expected=$($apps.Count) actual=$($seen.Count)"}
+    if((Get-ConfigFingerprintFromValues $config)-ne$Fingerprint){throw 'RESTORE_FINGERPRINT_ROUNDTRIP_FAILED'}
+    return $config
+}
+
 function Set-MeasuredWorkerNodeCeiling([hashtable]$Config,[int]$TotalCeiling) {
     if ($TotalCeiling -le 0) { return }
     $nodes=((& kubectl get nodes -o json)-join'')|ConvertFrom-Json
@@ -6521,6 +6539,13 @@ try {
         $measuredBase=Get-LiveConfig 'MEASURED_LIVE_BASE'
         Initialize-HpaControlPointModel
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'
+        if(-not[string]::IsNullOrWhiteSpace($RestoreConfigFingerprint)){
+            $restore=ConvertFrom-ConfigFingerprint $RestoreConfigFingerprint $measuredBase
+            $script:hardDeadline=(Get-Date).AddMinutes(15)
+            if(-not(Apply-CandidateSafely $restore Hard)){throw 'RESTORE_FINGERPRINT_APPLY_FAILED'}
+            Write-Host "RESTORE_FINGERPRINT_APPLIED: $(Get-ConfigFingerprintFromValues $restore)" -ForegroundColor Green
+            $runFailed=$false;return
+        }
         if($WorkerNodeCeiling-gt0){Set-MeasuredWorkerNodeCeiling $measuredBase $WorkerNodeCeiling}
         if($NodeCeilingOnly){$runFailed=$false;return}
         if($DiagnosticSweepOnly){Initialize-ExternalSweepNodeFloor $measuredBase;Invoke-ExternalProfileSweep -CandidateName 'DIAGNOSTIC' -Config $measuredBase|Out-Null;$runFailed=$false;return}

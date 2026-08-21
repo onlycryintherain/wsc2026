@@ -382,6 +382,17 @@ Dual-gate policy after rejection:
   - Final acceptance requires performance, availability, and cost guards together.
   - When cost is below gate, measured request packing is evaluated before adding
     replicas; Min replicas remain unchanged to preserve the two-node low-load floor.
+
+Rejected stress packing experiment (early stop):
+  Delta: stress request/target 600m@55% -> 550m@60%; absolute trigger 330m preserved
+  Fresh Run ID: run-1787305449 (new run reset the dashboard counters)
+  Start state: two-node topology floor; low-load score reached 40/40
+  During spike2: performance fell to 5/12; user 28.26%, stress 66.29%
+  Decision: immediate REJECT at owner dual-gate stop condition; load stopped
+  before the 30-minute run completed, so it is not comparable final evidence.
+  Rollback: immutable fingerprint restored stress to 600m@55%; all other values unchanged.
+  Conclusion: scheduler packing that removes request headroom cannot be used merely
+  to improve cost when it switches off the performance gate.
 ====================================================
 
 ====================================================
