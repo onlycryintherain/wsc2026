@@ -309,6 +309,30 @@ Topology caveat:
     not 1 (managed shared node + stress node).
   - Reaching one total node would require a separately measured placement
     experiment that removes stress isolation; this diagnostic preserves it.
+
+Final 순차증가 diagnostic:
+  Run ID: run-1787294395
+  Score: 16.5 / 40
+  Availability: user 99.95%, product 99.96%, stress 49.13%
+  Performance: user 25.09%, product 101.32%, stress 23.52%
+  Average EC2: 4.73 (cost score 0/12)
+  dropped: 0
+  Evidence: C:\Users\competitor\AppData\Local\Temp\wsi-sequential-node6-final-20260821-1529\profile-sweep-DIAGNOSTIC.json
+
+Invalid infrastructure evidence:
+  - Karpenter requested three additional stress c5.large instances, but they
+    remained NodeClaim Ready=Unknown and never registered as Kubernetes Nodes.
+  - They launched in pod-capacity subnet 10.0.8.0/22, whose
+    map_public_ip_on_launch=false and which has no NAT path.
+  - EC2 therefore counted toward average cost while providing zero schedulable
+    capacity. HPA requested stress=8, but only the original stress node served it.
+  - Root cause: EC2NodeClass selects every subnet tagged
+    kubernetes.io/cluster/<cluster>=shared, including the CNI-only subnets.
+  - This is an invalid capacity measurement, not proof that c5.large itself is
+    incapable of serving the application.
+  - After load ended, all unregistered NodeClaims/instances were deleted;
+    load running=false and the three original Kubernetes Nodes are Ready.
+  - Per owner request, execution stopped without applying another experiment.
 ====================================================
 
 ====================================================
