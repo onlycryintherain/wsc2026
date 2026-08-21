@@ -6459,6 +6459,20 @@ function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) 
     return (@{template=$ProfileName;endpoint=$RunEndpoint.TrimEnd('/')} | ConvertTo-Json -Compress)
 }
 
+function Sync-ExternalLoadServerEndpoint([string]$RunEndpoint) {
+    if ([string]::IsNullOrWhiteSpace($RunEndpoint)) { throw 'EXTERNAL_LOAD_ENDPOINT_EMPTY' }
+    $expected=$RunEndpoint.TrimEnd('/')
+    # The v2 load API accepts endpoint in /load/start but its injector may still
+    # read the persisted meta endpoint after CloudFront recreation. Synchronize
+    # and verify both sources before creating a score window.
+    $body=@{endpoint=$expected} | ConvertTo-Json -Compress
+    Invoke-RestMethod -Method Put -Uri ("$LoadServer/api/config/meta") -Body $body -ContentType 'application/json' -TimeoutSec 20 | Out-Null
+    $meta=Invoke-RestMethod -Uri ("$LoadServer/api/config/meta") -TimeoutSec 20
+    $actual=[string](Get-OptionalPropertyValue $meta.meta 'endpoint' '')
+    if ($actual.TrimEnd('/') -ne $expected) { throw "EXTERNAL_LOAD_ENDPOINT_SYNC_FAILED: expected=$expected actual=$actual" }
+    Write-Host "EXTERNAL_LOAD_ENDPOINT_READY: $expected" -ForegroundColor Green
+}
+
 function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[switch]$FreshVerification) {
     $profiles=@($SweepProfiles)
     $results=[System.Collections.Generic.List[object]]::new()
@@ -6468,8 +6482,9 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
         Wait-ExternalProfileLowLoadFloor ([int]$script:ExternalSweepNodeFloor)
         $profileIndex++
         Write-Host "`n===== EXTERNAL PROFILE: $CandidateName / $profileName =====" -ForegroundColor Cyan
-        # The grading server keeps endpoint per run; never rely on a stale/default
-        # endpoint after infrastructure recreation.
+        # The grading server keeps endpoint per run and in persisted injector
+        # metadata. Synchronize both after infrastructure recreation.
+        Sync-ExternalLoadServerEndpoint $script:Endpoint
         $body=New-ExternalLoadRequestBody $profileName $script:Endpoint
         $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
         $runId=[string]$run.run_id; $started=Get-Date; $expected=[int]([double](Get-OptionalPropertyValue $run 'expected_end_min' 15)*60); $restarts=0

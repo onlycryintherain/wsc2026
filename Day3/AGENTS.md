@@ -188,6 +188,7 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-22 | pending | 인프라 재생성 후 새 CloudFront `do876irwkqghf.cloudfront.net`은 정상이나 load server persisted meta endpoint가 삭제된 `d3tmuvdlyjyjyk.cloudfront.net`에 남아 `run-1787356534`가 2xx=0/0점이 된 것을 탐지·즉시 중지. `tune.ps1`이 매 profile 시작 전에 `/api/config/meta` endpoint를 현재 발견한 CloudFront로 PUT·GET 검증한 후 `/api/load/start`에도 명시하도록 보강. self-test 34/34·terraform validate 통과. |
 | 2026-08-22 | pending | HPA 300s scale-down 안정화 + user Max32 rollback 상태 fresh `run-1787339949`: 33/40, 가용성12, 성능9(게이트 통과), 비용8, user/product/stress 성능 76.62/105.40/88.26%, 평균 EC2 3.76. 스파이크 동안 user32·product17~19·stress4를 유지하고 가용성 99.99~100%, dropped/CNI 0. 성능 게이트가 꺼지지 않아 추가 코드 변이는 중단하고 300s 안정화 후 idle floor 복귀를 확인한다. |
 | 2026-08-22 | pending | user Max40 후보는 1차 `run-1787335919` 34.5/40·성능10.5로 KEEP됐으나 FINAL_FRESH `run-1787337791`이 33.5/40·성능8.5로 게이트 off. live HPA scaleDown=0s/100%로 spike2 replica가 29~35 사이에서 흔들린 원인을 반영해 external sweep 시작 전 scaleUp=0s·scaleDown=300s/Min을 강제 검증하고, FINAL_FRESH dual gate 실패 시 직전 measured BEST 자동 롤백 및 rejected signature 기록을 추가. self-test 34/34 통과. |
 | 2026-08-22 | pending | `tune.ps1`의 live Max 안전 상한을 측정 seed의 1.5배로 분리하고, aggregate 성능 게이트가 통과해도 개별 앱 성능<90%·실측 HPA ceiling·비용 게이트 통과 시 Max를 20~25% bounded one-delta로 확장하도록 개선. 0.25x 증거의 user 32/32·uncapped 41을 user Max 40 후보로 산출하며 self-test 32/32 통과. |
