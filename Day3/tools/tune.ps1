@@ -6213,19 +6213,49 @@ function Repair-InvalidPdbPrerequisite {
     }
 }
 
-function Wait-ExternalProfileLowLoadFloor([int]$NodeFloor) {
-    $started=Get-Date
-    while (((Get-Date)-$started).TotalSeconds -lt $ExternalProfileCooldownSec) {
-        Assert-RequiredResourcesPresent
-        $nodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
-        $ready=@($nodes.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count }).Count
-        $hpas=((& kubectl -n $Namespace get hpa -o json) -join '') | ConvertFrom-Json
-        $atMin=@($hpas.items | Where-Object { [int]$_.status.currentReplicas -le [int]$_.spec.minReplicas -and [int]$_.status.desiredReplicas -le [int]$_.spec.minReplicas }).Count -eq @($hpas.items).Count
-        if ($ready -le $NodeFloor -and $atMin) { Write-Host "PROFILE_COOLDOWN_READY: nodes=$ready floor=$NodeFloor" -ForegroundColor Green; return }
-        Write-Host "PROFILE_COOLDOWN: nodes=$ready->$NodeFloor hpaAtMin=$atMin" -ForegroundColor DarkGray
-        Start-Sleep -Seconds 15
+function Set-CooldownPdbRelaxation {
+    $saved=@{}
+    $pdbs=((& kubectl -n $Namespace get pdb -o json 2>$null)-join'')|ConvertFrom-Json
+    $deployments=((& kubectl -n $Namespace get deployments -o json)-join'')|ConvertFrom-Json
+    foreach($app in $apps){
+        $deployment=@($deployments.items|Where-Object{$_.metadata.name-eq$app}|Select-Object -First 1)
+        $pdb=@($pdbs.items|Where-Object{$_.metadata.name-eq$app}|Select-Object -First 1)
+        if(-not$deployment.Count-or-not$pdb.Count){continue}
+        # Dedicated selector domains define the floor and must keep their PDB.
+        if($deployment[0].spec.template.spec.nodeSelector -and @($deployment[0].spec.template.spec.nodeSelector.PSObject.Properties).Count){continue}
+        $value=$pdb[0].spec.minAvailable
+        if($null-eq$value-or($value-is[string]-and$value-match'%$')-or[int]$value-le0){continue}
+        $saved[$app]=[int]$value
+        Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p','{"spec":{"minAvailable":0}}')
+        Write-Host "PROFILE_COOLDOWN_PDB_RELAX: $app $value->0" -ForegroundColor DarkGray
     }
-    Write-Warning "PROFILE_COOLDOWN_TIMEOUT: node floor $NodeFloor not reached; next profile cost may include prior capacity"
+    return $saved
+}
+
+function Restore-CooldownPdbRelaxation($Saved) {
+    foreach($app in @($Saved.Keys)){
+        $patch=@{spec=@{minAvailable=[int]$Saved[$app]}}|ConvertTo-Json -Compress
+        Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p',$patch)
+        Write-Host "PROFILE_COOLDOWN_PDB_RESTORE: $app ->$($Saved[$app])" -ForegroundColor DarkGray
+    }
+}
+
+function Wait-ExternalProfileLowLoadFloor([int]$NodeFloor) {
+    $started=Get-Date;$relaxed=$null
+    try {
+        while (((Get-Date)-$started).TotalSeconds -lt $ExternalProfileCooldownSec) {
+            Assert-RequiredResourcesPresent
+            $nodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
+            $ready=@($nodes.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count }).Count
+            $hpas=((& kubectl -n $Namespace get hpa -o json) -join '') | ConvertFrom-Json
+            $atMin=@($hpas.items | Where-Object { [int]$_.status.currentReplicas -le [int]$_.spec.minReplicas -and [int]$_.status.desiredReplicas -le [int]$_.spec.minReplicas }).Count -eq @($hpas.items).Count
+            if ($ready -le $NodeFloor -and $atMin) { Write-Host "PROFILE_COOLDOWN_READY: nodes=$ready floor=$NodeFloor" -ForegroundColor Green; return }
+            if($atMin-and$ready-gt$NodeFloor-and$null-eq$relaxed){$relaxed=Set-CooldownPdbRelaxation}
+            Write-Host "PROFILE_COOLDOWN: nodes=$ready->$NodeFloor hpaAtMin=$atMin" -ForegroundColor DarkGray
+            Start-Sleep -Seconds 15
+        }
+        Write-Warning "PROFILE_COOLDOWN_TIMEOUT: node floor $NodeFloor not reached; next profile cost may include prior capacity"
+    } finally { if($relaxed){Restore-CooldownPdbRelaxation $relaxed} }
 }
 
 function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) {

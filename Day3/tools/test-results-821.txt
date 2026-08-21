@@ -252,6 +252,36 @@ Low-floor blocker found after load:
 ====================================================
 
 ====================================================
+CNI Capacity and Cooldown Remediation
+Date: 2026-08-21 14:15 KST
+====================================================
+CNI evidence from fresh BASE:
+  Default:        0 FailedCreatePodSandBox events
+  Default-spike2: repeated failed to assign an IP address to container
+  순차증가:       repeated failed to assign an IP address to container
+  Historical event count: 266 IP assignment failures
+  Result: high-load BASE is invalid for application candidate comparison until
+          the infrastructure prerequisite is repaired.
+
+Terraform remediation applied (targeted plan only):
+  10.0.4.0/22, ap-northeast-2a, kubernetes.io/role/cni=1
+    subnet-0f19366a982da0fec, 1019 free IPs at creation
+  10.0.8.0/22, ap-northeast-2b, kubernetes.io/role/cni=1
+    subnet-0afef9b3961c2e18b, 1019 free IPs at creation
+  Route-table associations: 2
+  Apply result: 4 added, 0 changed, 0 destroyed
+  VPC CNI enhanced subnet discovery remains enabled.
+
+Cooldown consolidation remediation:
+  - A shared Karpenter node held both user replicas.
+  - Persistent PDB minAvailable=1 allowed only one disruption, so Karpenter
+    could not remove the node even though all Pods fit the managed node.
+  - During no-traffic/HPA-min cooldown only, shared-domain PDBs are temporarily
+    relaxed to 0 and restored before the next load starts.
+  - Dedicated-domain PDBs are never relaxed because those nodes define floor.
+====================================================
+
+====================================================
 Continuous Execution State
 Date: 2026-08-21
 ====================================================
