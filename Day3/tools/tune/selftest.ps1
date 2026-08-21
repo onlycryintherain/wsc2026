@@ -218,7 +218,8 @@ if ($BaseExperiment) {
         $result=[pscustomobject]@{Score=$score;Status=[pscustomobject]@{dropped=0};Samples=@($sample)}
         $evaluation=[pscustomobject]@{AllPerformanceGuards=$false;Results=@($result,$result,$result)}
         $rec=Get-DynamicSweepRecommendation $best $evaluation @()
-        if ($rec.Type -ne 'HPA_CEILING' -or $rec.App -ne 'user' -or [int]$rec.To -ne [math]::Ceiling([int]$best.user.maxReplicas*1.2)) { throw "unexpected $($rec.Type) $($rec.App) $($rec.To)" }
+        $expected=Get-MeasuredHpaMaxGrowth ([int]$best.user.maxReplicas) ([int][math]::Ceiling([int]$best.user.maxReplicas*100/[int]$best.user.hpaTarget))
+        if ($rec.Type -ne 'HPA_CEILING' -or $rec.App -ne 'user' -or [int]$rec.To -ne $expected) { throw "unexpected $($rec.Type) $($rec.App) $($rec.To)" }
     }
 
     # TEST 24: guard-deficit recovery can KEEP one-profile improvement without collateral regression.
@@ -316,6 +317,19 @@ if ($BaseExperiment) {
         $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=$u};$result=[pscustomobject]@{Score=[pscustomobject]@{user_perf=25;product_perf=100;stress_perf=85};Status=[pscustomobject]@{dropped=0};Samples=@($sample)}
         $evaluation=[pscustomobject]@{AllPerformanceGuards=$false;AllCostGuards=$false;Results=@($result)};$oldCluster=$script:ExternalSweepClusterCapacity
         try{$script:ExternalSweepClusterCapacity=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150};$rec=Get-DynamicSweepRecommendation $best $evaluation @('REQUEST_PACKING:stress:550:60','HPA_MAX:user:24','HPA_TARGET_RECOVERY:user:28');if($rec.Type-ne'HPA_TARGET_RECOVERY'-or$rec.To-ne23){throw "unexpected $($rec.Type) $($rec.To)"}}finally{$script:ExternalSweepClusterCapacity=$oldCluster}
+    }
+
+    # TEST 32: an aggregate passing gate must not hide an individual app that is
+    # below 90% and pinned at its measured HPA ceiling.
+    Assert-Test 'Passing aggregate gate still recovers app ceiling' {
+        $best=Copy-Config $BaseConfig 'best';$best.user.maxReplicas=32;$h=@{};$u=@{}
+        foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget};$u[$app]=[pscustomobject]@{CpuTotalM=100}}
+        $h.user=[pscustomobject]@{Current=32;Desired=32;Max=32;CpuUtil=42;Target=33}
+        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=$u}
+        $result=[pscustomobject]@{Score=[pscustomobject]@{user_perf=84.16;product_perf=109.47;stress_perf=86.27};Status=[pscustomobject]@{dropped=0};Samples=@($sample)}
+        $evaluation=[pscustomobject]@{AllPerformanceGuards=$true;AllCostGuards=$true;Results=@($result)}
+        $oldHard=$script:HardSafetyMaxByApp.user
+        try{$script:HardSafetyMaxByApp.user=48;$rec=Get-DynamicSweepRecommendation $best $evaluation @();if($rec.Type-ne'HPA_CEILING'-or$rec.App-ne'user'-or$rec.To-ne40){throw "unexpected $($rec.Type) $($rec.App) $($rec.To)"}}finally{$script:HardSafetyMaxByApp.user=$oldHard}
     }
 
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})

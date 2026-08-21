@@ -38,6 +38,10 @@ param(
     # Grader cost baseline is two c5.large nodes (one managed + one Karpenter).
     [ValidateRange(1, 20)][int]$CostBaselineNodes = 2,
     [ValidateRange(2, 30)][int]$MaxAutoReplicas = 12,
+    # Live Max is the immutable seed, not a permanent ceiling. Measured external
+    # saturation may grow it within this safety envelope; WorkerNodeCeiling still
+    # bounds physical EC2 capacity and fresh scoring decides KEEP/REJECT.
+    [ValidateRange(1.20, 2.00)][double]$MeasuredHpaMaxSafetyMultiplier = 1.50,
     # arrival-rate 목표를 생성할 수 있도록 VU 여유를 확보한다.
     # 요청률/Stress length는 변경하지 않고 k6 generator saturation만 방지한다.
     [ValidateRange(1, 1000)][int]$PreAllocatedVUs = 128,
@@ -779,7 +783,8 @@ function Initialize-ManagedApplicationDiscovery {
         if (-not $sloMs.ContainsKey($app)) { $sloMs[$app]=1000.0 }
         $appResourceWeight[$app]=1
         $hpaMaxMinimum[$app]=[int][math]::Max(1,$oracle.maxReplicas)
-        $script:HardSafetyMaxByApp[$app]=[int][math]::Max([int]$oracle.maxReplicas,$MaxAutoReplicas)
+        $liveSafetySeed=[int][math]::Max([int]$oracle.maxReplicas,$MaxAutoReplicas)
+        $script:HardSafetyMaxByApp[$app]=[int][math]::Ceiling($liveSafetySeed*$MeasuredHpaMaxSafetyMultiplier)
         $script:HpaBehaviorAction[$app]='KEEP'
     }
     $script:ElasticDensityApps=@($script:apps)
@@ -6111,6 +6116,16 @@ function Get-CostAwarePackingRecommendation([hashtable]$BestConfig,$Samples,[str
     return $null
 }
 
+function Get-MeasuredHpaMaxGrowth([int]$Current,[int]$UncappedPeak) {
+    if ($Current -lt 1) { throw 'HPA_MAX_GROWTH_INVALID_CURRENT' }
+    # Always add 20%, but allow measured demand to pull the one-field candidate
+    # up to a bounded 25% step. This avoids both +1 under-reaction and a single
+    # transient utilization sample causing an unbounded replica jump.
+    $minimum=[int][math]::Ceiling($Current*1.20)
+    $maximum=[int][math]::Ceiling($Current*1.25)
+    return [int][math]::Max($minimum,[math]::Min($maximum,[math]::Max($Current,$UncappedPeak)))
+}
+
 function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[string[]]$RejectedSignatures) {
     $samples=@($BestEvaluation.Results | ForEach-Object { @($_.Samples) })
     # The final status is an instantaneous RPS sample and naturally oscillates
@@ -6145,15 +6160,20 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
         $ceiling=@($samples | Where-Object {
             $m=$_.Hpa[$app]; $m -and [int]$m.Desired -ge [int]$m.Max -and $null -ne $m.CpuUtil -and [int]$m.CpuUtil -gt [int]$m.Target
         })
-        if (-not $ceiling.Count -or $BestEvaluation.AllPerformanceGuards) { continue }
+        if (-not $ceiling.Count) { continue }
         $current=[int]$BestConfig[$app].maxReplicas
-        $next=[int][math]::Ceiling($current*1.20)
         $uncapped=@($ceiling | ForEach-Object { $m=$_.Hpa[$app]; [math]::Ceiling([double]$m.Current*[double]$m.CpuUtil/[math]::Max(1,[double]$m.Target)) })
         $uncappedPeak=if($uncapped.Count){[int](($uncapped|Measure-Object -Maximum).Maximum)}else{$current}
+        $next=Get-MeasuredHpaMaxGrowth $current $uncappedPeak
+        $hard=[int](Get-OptionalPropertyValue $script:HardSafetyMaxByApp $app $next)
+        $next=[int][math]::Min($hard,$next)
         $perf=@($BestEvaluation.Results | ForEach-Object { $value=Get-OptionalPropertyValue $_.Score "${app}_perf" $null; if($null-ne$value){[double]$value} })
         $worstPerf=if($perf.Count){[double](($perf|Measure-Object -Minimum).Minimum)}else{100.0}
         $sig="HPA_MAX:${app}:$next"
-        if ($worstPerf -lt 90.0 -and $sig -notin $RejectedSignatures) { $ceilingCandidates.Add([pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=$current;To=$next;WorstAppPerformance=$worstPerf;Reason="measured ceiling; uncapped desired peak=$uncappedPeak; grow 20%"}) }
+        # Aggregate performance gate passing is only the minimum acceptance bar.
+        # Continue evidence-backed recovery for an individual app below 90% while
+        # the independent cost gate remains enabled; fresh score still decides.
+        if ($next -gt $current -and $worstPerf -lt 90.0 -and [bool](Get-OptionalPropertyValue $BestEvaluation 'AllCostGuards' $true) -and $sig -notin $RejectedSignatures) { $ceilingCandidates.Add([pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=$current;To=$next;WorstAppPerformance=$worstPerf;Reason="measured ceiling; uncapped desired peak=$uncappedPeak; bounded growth 20-25%; aggregate guard=$($BestEvaluation.AllPerformanceGuards)"}) }
     }
     if ($ceilingCandidates.Count) { return @($ceilingCandidates | Sort-Object WorstAppPerformance,App)[0] }
 
