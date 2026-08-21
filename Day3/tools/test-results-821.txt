@@ -282,6 +282,29 @@ Cooldown consolidation remediation:
 ====================================================
 
 ====================================================
+Bounded Node Ceiling Diagnostic
+Date: 2026-08-21 15:26 KST
+====================================================
+Requested experiment:
+  - Allow worker count to expand up to total 6.
+  - Measure only 순차증가.
+
+Generic allocation method:
+  - Managed nodes are counted first.
+  - Remaining Karpenter slots are allocated to live NodePools in proportion to
+    HPA max CPU demand derived from discovered Deployments/HPAs.
+  - Current demand: shared user/product vs dedicated stress.
+  - Expected total ceiling: managed 1 + Karpenter 5 = 6.
+  - NodePool limits are applied through tune.ps1 only.
+
+Topology caveat:
+  - With stress dedicated selector/taint and min=1, physical idle floor is 2,
+    not 1 (managed shared node + stress node).
+  - Reaching one total node would require a separately measured placement
+    experiment that removes stress isolation; this diagnostic preserves it.
+====================================================
+
+====================================================
 Continuous Execution State
 Date: 2026-08-21
 ====================================================

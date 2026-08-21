@@ -92,7 +92,10 @@ param(
     # floor before the next profile starts, otherwise the next cost window is polluted.
     [ValidateRange(60, 600)][int]$ExternalProfileCooldownSec = 360,
     # Resume only from immutable evidence whose fingerprint matches live BASE.
-    [string]$ResumeSweepEvidence = ''
+    [string]$ResumeSweepEvidence = '',
+    [ValidateRange(0, 20)][int]$WorkerNodeCeiling = 0,
+    [string[]]$SweepProfiles = @('Default','Default-spike2','순차증가'),
+    [switch]$DiagnosticSweepOnly
 )
 
 # The only production path discovers unknown workloads and uses external fresh
@@ -6002,7 +6005,8 @@ function Get-ExternalProfileClusterSample([datetime]$ProfileStartedAt) {
 
 function Get-ExternalSweepObjective($Results,[string]$CandidateName,[string]$ConfigFingerprint) {
     $valid=@($Results | Where-Object { $_.Score -and $null -ne $_.Score.total40 })
-    if ($valid.Count -ne 3) { return [pscustomobject]@{Candidate=$CandidateName;Valid=$false;AllPerformanceGuards=$false;PrimaryScore=-1.0;AverageScore=-1.0;AverageNodes=[double]::PositiveInfinity;Results=$Results;ConfigFingerprint=$ConfigFingerprint} }
+    $expectedProfiles=@($SweepProfiles).Count
+    if ($valid.Count -ne $expectedProfiles) { return [pscustomobject]@{Candidate=$CandidateName;Valid=$false;AllPerformanceGuards=$false;PrimaryScore=-1.0;AverageScore=-1.0;AverageNodes=[double]::PositiveInfinity;Results=$Results;ConfigFingerprint=$ConfigFingerprint} }
     $totals=@($valid | ForEach-Object { [double]$_.Score.total40 })
     $perf=@($valid | ForEach-Object { [double]$_.Score.performance.score })
     $guards=@($valid | Where-Object { [double]$_.Score.availability.score -ge [double]$_.Score.availability.max -and [double]$_.Score.performance.score -ge $ProfilePerformanceGuard })
@@ -6015,7 +6019,7 @@ function Get-ExternalSweepObjective($Results,[string]$CandidateName,[string]$Con
         $guardDeficit += [math]::Max(0.0,$ProfilePerformanceGuard-[double]$result.Score.performance.score)
     }
     return [pscustomobject]@{
-        Candidate=$CandidateName;Valid=$true;AllPerformanceGuards=($guards.Count -eq 3)
+        Candidate=$CandidateName;Valid=$true;AllPerformanceGuards=($guards.Count -eq $expectedProfiles)
         PrimaryScore=[double](($totals | Measure-Object -Minimum).Minimum)
         AverageScore=[double](($totals | Measure-Object -Average).Average)
         MinimumPerformanceScore=[double](($perf | Measure-Object -Minimum).Minimum)
@@ -6191,6 +6195,47 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
     return $candidate
 }
 
+function Set-MeasuredWorkerNodeCeiling([hashtable]$Config,[int]$TotalCeiling) {
+    if($TotalCeiling-le0){return}
+    $nodes=((& kubectl get nodes -o json)-join'')|ConvertFrom-Json
+    $managed=@($nodes.items|Where-Object{-not $_.metadata.labels.PSObject.Properties['karpenter.sh/nodepool']}).Count
+    $slots=$TotalCeiling-$managed
+    if($slots-lt1){throw "NODE_CEILING_INVALID: total=$TotalCeiling managed=$managed"}
+    $poolJson=((& kubectl get nodepool -o json)-join'')|ConvertFrom-Json
+    $deployJson=((& kubectl -n $Namespace get deployments -o json)-join'')|ConvertFrom-Json
+    $demand=@{};$poolObjects=@($poolJson.items)
+    foreach($pool in $poolObjects){$demand[[string]$pool.metadata.name]=0.0}
+    foreach($app in $apps){
+        $deployment=@($deployJson.items|Where-Object{$_.metadata.name-eq$app}|Select-Object -First 1)
+        if(-not$deployment.Count){continue}
+        $selector=$deployment[0].spec.template.spec.nodeSelector
+        $matched=@($poolObjects|Where-Object{
+            $labels=$_.spec.template.metadata.labels;$ok=$true
+            foreach($property in @($selector.PSObject.Properties)){if([string]$labels.PSObject.Properties[$property.Name].Value-ne[string]$property.Value){$ok=$false;break}}
+            $ok-and@($selector.PSObject.Properties).Count-gt0
+        })
+        if(-not$matched.Count){$matched=@($poolObjects|Where-Object{-not@($_.spec.template.spec.taints).Count}|Select-Object -First 1)}
+        if($matched.Count){$pool=[string]$matched[0].metadata.name;$demand[$pool]+=[double](Convert-CpuToM $Config[$app].requestCpu)*[int]$Config[$app].maxReplicas}
+    }
+    $active=@($demand.Keys|Where-Object{$demand[$_]-gt0})
+    if($active.Count-gt$slots){throw "NODE_CEILING_DOMAINS_EXCEED_BUDGET: domains=$($active.Count) slots=$slots"}
+    $totalDemand=[double](($active|ForEach-Object{$demand[$_]}|Measure-Object -Sum).Sum);$allocation=@{};$remainders=@()
+    foreach($pool in $active){$quota=$slots*$demand[$pool]/$totalDemand;$allocation[$pool]=[math]::Max(1,[math]::Floor($quota));$remainders+=[pscustomobject]@{Pool=$pool;Remainder=$quota-[math]::Floor($quota)}}
+    while([int](($allocation.Values|Measure-Object -Sum).Sum)-gt$slots){$victim=@($allocation.Keys|Where-Object{$allocation[$_]-gt1}|Sort-Object{$demand[$_]})[0];$allocation[$victim]--}
+    while([int](($allocation.Values|Measure-Object -Sum).Sum)-lt$slots){$winner=@($remainders|Sort-Object Remainder -Descending|Select-Object -First 1).Pool;$allocation[$winner]++;$remainders=@($remainders|Where-Object{$_.Pool-ne$winner})}
+    $firstNode=@($nodes.items|Select-Object -First 1)[0]
+    $nodeCpu=[double](Convert-CpuToM $firstNode.status.capacity.cpu)
+    foreach($pool in $poolObjects){
+        $name=[string]$pool.metadata.name
+        if(-not$allocation.ContainsKey($name)){continue}
+        $cpu=Format-Cpu ($allocation[$name]*$nodeCpu)
+        $patch=@{spec=@{limits=@{cpu=$cpu}}}|ConvertTo-Json -Compress -Depth 5
+        Invoke-Kubectl @('patch','nodepool',$name,'--type=merge','-p',$patch)
+        Write-Host "NODE_CEILING_APPLIED: pool=$name nodes=$($allocation[$name]) cpu=$cpu demand=$([math]::Round($demand[$name],0))m" -ForegroundColor Yellow
+    }
+    Write-Host "NODE_CEILING_TOTAL: managed=$managed karpenter=$slots total=$TotalCeiling" -ForegroundColor Yellow
+}
+
 function Repair-InvalidPdbPrerequisite {
     # A PDB whose minAvailable exceeds the HPA low-load replica floor makes
     # normal consolidation mathematically impossible. Repair only that invalid
@@ -6264,7 +6309,7 @@ function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) 
 }
 
 function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[switch]$FreshVerification) {
-    $profiles=@('Default','Default-spike2','순차증가')
+    $profiles=@($SweepProfiles)
     $results=[System.Collections.Generic.List[object]]::new()
     $profileIndex=0
     foreach ($profileName in $profiles) {
@@ -6400,6 +6445,8 @@ try {
         $measuredBase=Get-LiveConfig 'MEASURED_LIVE_BASE'
         Initialize-HpaControlPointModel
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'
+        if($WorkerNodeCeiling-gt0){Set-MeasuredWorkerNodeCeiling $measuredBase $WorkerNodeCeiling}
+        if($DiagnosticSweepOnly){Invoke-ExternalProfileSweep -CandidateName 'DIAGNOSTIC' -Config $measuredBase|Out-Null;$runFailed=$false;return}
         $resume=$null
         if (-not [string]::IsNullOrWhiteSpace($ResumeSweepEvidence)) {
             if (-not (Test-Path -LiteralPath $ResumeSweepEvidence)) { throw "Resume evidence not found: $ResumeSweepEvidence" }
