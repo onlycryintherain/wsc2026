@@ -233,7 +233,7 @@ if ($BaseExperiment) {
         $best=Copy-Config $BaseConfig 'best'; $h=@{}
         foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget}}
         $h.stress.Current=6;$h.stress.Desired=6
-        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=@{}}
+        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=@{stress=[pscustomobject]@{CpuTotalM=2000};user=[pscustomobject]@{CpuTotalM=100};product=[pscustomobject]@{CpuTotalM=100}}}
         $score=[pscustomobject]@{user_perf=100;product_perf=100;stress_perf=100}
         $result=[pscustomobject]@{Score=$score;Status=[pscustomobject]@{dropped=0};Samples=@($sample)}
         $evaluation=[pscustomobject]@{AllPerformanceGuards=$true;Results=@($result,$result,$result)}
@@ -262,6 +262,28 @@ if ($BaseExperiment) {
         $evaluation=[pscustomobject]@{AllPerformanceGuards=$false;Results=@($result)}
         $rec=Get-DynamicSweepRecommendation $best $evaluation @()
         if($rec.Type-ne'HPA_CEILING'-or$rec.App-ne'user'){throw "transient Pending incorrectly classified as $($rec.Type)"}
+    }
+
+    # TEST 27: cost gate regression cannot be exchanged for performance.
+    Assert-Test 'Dual gate rejects cost regression' {
+        $best=[pscustomobject]@{Valid=$true;AllPerformanceGuards=$false;AllCostGuards=$true;PerformanceGuardDeficit=2;CostGuardDeficit=0;MinimumAvailabilityScore=12;PrimaryScore=25;AverageNodes=3;ProfileTotals=@{Sequential=25}}
+        $candidate=[pscustomobject]@{Valid=$true;AllPerformanceGuards=$true;AllCostGuards=$false;PerformanceGuardDeficit=0;CostGuardDeficit=1;MinimumAvailabilityScore=12;PrimaryScore=30;AverageNodes=5;ProfileTotals=@{Sequential=30}}
+        if(Test-SweepCandidateBetter $candidate $best){throw 'cost gate was traded for performance'}
+    }
+
+    # TEST 28: failed cost gate chooses measured packing before adding replicas.
+    Assert-Test 'Cost deficit prioritizes packing' {
+        $best=Copy-Config $BaseConfig 'best';$samples=@()
+        for($i=0;$i-lt20;$i++){
+            $h=@{};$u=@{}
+            foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget};$u[$app]=[pscustomobject]@{CpuTotalM=100}}
+            $h.stress=[pscustomobject]@{Current=12;Desired=12;Max=12;CpuUtil=80;Target=[int]$best.stress.hpaTarget};$u.stress=[pscustomobject]@{CpuTotalM=3000}
+            $samples+=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=$u}
+        }
+        $result=[pscustomobject]@{Score=[pscustomobject]@{user_perf=25;product_perf=100;stress_perf=85};Status=[pscustomobject]@{dropped=0};Samples=$samples}
+        $evaluation=[pscustomobject]@{AllPerformanceGuards=$false;AllCostGuards=$false;Results=@($result)}
+        $oldCluster=$script:ExternalSweepClusterCapacity
+        try{$script:ExternalSweepClusterCapacity=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150};$rec=Get-DynamicSweepRecommendation $best $evaluation @();if($rec.Type-ne'REQUEST_PACKING'-or$rec.App-ne'stress'){throw "unexpected $($rec.Type) $($rec.App)"}}finally{$script:ExternalSweepClusterCapacity=$oldCluster}
     }
 
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})

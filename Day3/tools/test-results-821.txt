@@ -364,6 +364,24 @@ Decision/evidence:
   - Remaining primary bottleneck is user at its measured HPA ceiling 20/20.
   - After measurement, extra Karpenter capacity was removed only after load
     stopped; all apps Ready at the topology floor of two nodes.
+
+Rejected one-delta user Max experiment:
+  Candidate: user HPA Max 20 -> 24; Min/requests/node ceiling unchanged
+  Run ID: run-1787302469
+  Score: 22.0 / 40; avg EC2 4.50; cost 0/12
+  Availability: 12/12
+  Performance: 6/12 (user 25.09%, product 98.44%, stress 81.54%)
+  Decision: REJECT and restore user Max=20
+  Reason: no user gate recovery, performance regressed 7->6, and cost gate
+  remained off. Performance must never be purchased by worsening cost.
+  Evidence: C:\Users\competitor\AppData\Local\Temp\wsi-user-max24-20260821-1755\profile-sweep-CANDIDATE_1.json
+
+Dual-gate policy after rejection:
+  - A candidate may not worsen either performance/availability guard deficit or
+    cost guard deficit while improving the other.
+  - Final acceptance requires performance, availability, and cost guards together.
+  - When cost is below gate, measured request packing is evaluated before adding
+    replicas; Min replicas remain unchanged to preserve the two-node low-load floor.
 ====================================================
 
 ====================================================
