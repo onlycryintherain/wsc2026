@@ -191,6 +191,25 @@ Important:
 ====================================================
 
 ====================================================
+Low-load Floor Correction
+Date: 2026-08-21 13:05 KST
+====================================================
+Observed problem:
+  - A new process started while 5 nodes from the previous profile still existed.
+  - The previous implementation captured current Ready nodes as low-load floor.
+  - It incorrectly logged MEASURED_LOW_LOAD_NODE_FLOOR=5 instead of 2.
+  - This polluted the next BASE cost measurement.
+
+Correction:
+  - Low-load floor is now derived from stable topology, not current leftovers.
+  - Floor = Ready managed nodes + distinct non-empty nodeSelector domains
+    that have an application HPA min greater than zero.
+  - Current topology result: managed 1 + stress dedicated domain 1 = 2 nodes.
+  - Future profile/candidate cooldowns therefore wait for 2 nodes.
+  - Self-test remains 22/22 passed.
+====================================================
+
+====================================================
 Continuous Execution State
 Date: 2026-08-21
 ====================================================

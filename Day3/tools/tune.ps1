@@ -6181,9 +6181,25 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
 
 function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase) {
     $bestConfig=Copy-Config $MeasuredBase 'MEASURED_BEST'
+    # Derive the low-load floor from stable topology, never from leftover nodes
+    # of the previous run. Managed nodes host shared minima; each distinct
+    # non-empty nodeSelector domain with min>0 needs one additional floor node.
     $floorNodes=((& kubectl get nodes -o json) -join '') | ConvertFrom-Json
-    $script:ExternalSweepNodeFloor=[math]::Max(1,@($floorNodes.items | Where-Object { @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count }).Count)
-    Write-Host "MEASURED_LOW_LOAD_NODE_FLOOR=$script:ExternalSweepNodeFloor" -ForegroundColor Cyan
+    $managedReady=@($floorNodes.items | Where-Object {
+        -not $_.metadata.labels.PSObject.Properties['karpenter.sh/nodepool'] -and
+        @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count
+    }).Count
+    $deployments=((& kubectl -n $Namespace get deployments -o json) -join '') | ConvertFrom-Json
+    $domains=[System.Collections.Generic.HashSet[string]]::new()
+    foreach ($app in $apps) {
+        if ([int]$MeasuredBase[$app].minReplicas -le 0) { continue }
+        $deployment=@($deployments.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
+        if (-not $deployment.Count) { continue }
+        $selector=$deployment[0].spec.template.spec.nodeSelector
+        if ($selector -and @($selector.PSObject.Properties).Count) { [void]$domains.Add(($selector | ConvertTo-Json -Compress)) }
+    }
+    $script:ExternalSweepNodeFloor=[math]::Max(1,$managedReady+$domains.Count)
+    Write-Host "MEASURED_LOW_LOAD_NODE_FLOOR=$script:ExternalSweepNodeFloor (managed=$managedReady dedicatedDomains=$($domains.Count))" -ForegroundColor Cyan
     $best=Invoke-ExternalProfileSweep -CandidateName 'BASE' -Config $bestConfig
     $history=[System.Collections.Generic.List[object]]::new(); $rejected=[System.Collections.Generic.List[string]]::new()
     for ($i=1; $i -le $MaxProfileCandidates; $i++) {
