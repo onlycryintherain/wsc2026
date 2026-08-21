@@ -299,6 +299,10 @@ Generic allocation method:
   - First diagnostic apply failed before mutation with a recoverable null-index
     error in generic pool mapping; no NodePool limit changed and no load started.
   - Pool mapping/allocation was rewritten with explicit null/empty guards before retry.
+  - Second dry apply exposed Kubernetes null taints deserializing as a one-element
+    PowerShell array; explicit `$null` handling fixed it.
+  - Verified applied limits: default=2000m (1 node), stress=8000m (4 nodes),
+    managed=1, total ceiling=6.
 
 Topology caveat:
   - With stress dedicated selector/taint and min=1, physical idle floor is 2,

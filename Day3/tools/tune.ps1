@@ -95,7 +95,8 @@ param(
     [string]$ResumeSweepEvidence = '',
     [ValidateRange(0, 20)][int]$WorkerNodeCeiling = 0,
     [string[]]$SweepProfiles = @('Default','Default-spike2','순차증가'),
-    [switch]$DiagnosticSweepOnly
+    [switch]$DiagnosticSweepOnly,
+    [switch]$NodeCeilingOnly
 )
 
 # The only production path discovers unknown workloads and uses external fresh
@@ -6223,7 +6224,7 @@ function Set-MeasuredWorkerNodeCeiling([hashtable]$Config,[int]$TotalCeiling) {
             }
         }
         if ($null -eq $targetPool) {
-            $untainted=@($poolObjects|Where-Object{@($_.spec.template.spec.taints).Count-eq0}|Select-Object -First 1)
+            $untainted=@($poolObjects | Where-Object { $null -eq $_.spec.template.spec.taints -or @($_.spec.template.spec.taints).Count -eq 0 } | Select-Object -First 1)
             if($untainted.Count){$targetPool=$untainted[0]}
         }
         if ($null -eq $targetPool) { throw "NODE_CEILING_POOL_MAPPING_FAILED: app=$app" }
@@ -6471,6 +6472,7 @@ try {
         Initialize-HpaControlPointModel
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'
         if($WorkerNodeCeiling-gt0){Set-MeasuredWorkerNodeCeiling $measuredBase $WorkerNodeCeiling}
+        if($NodeCeilingOnly){$runFailed=$false;return}
         if($DiagnosticSweepOnly){Invoke-ExternalProfileSweep -CandidateName 'DIAGNOSTIC' -Config $measuredBase|Out-Null;$runFailed=$false;return}
         $resume=$null
         if (-not [string]::IsNullOrWhiteSpace($ResumeSweepEvidence)) {
