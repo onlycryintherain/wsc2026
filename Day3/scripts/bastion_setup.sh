@@ -560,7 +560,7 @@ spec:
       name: cpu
       target:
         type: Utilization
-        averageUtilization: 18
+        averageUtilization: 33
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -640,7 +640,7 @@ spec:
       name: cpu
       target:
         type: Utilization
-        averageUtilization: 35
+        averageUtilization: 55
 HPA
 
 cat <<'PDB' | kubectl apply -f -

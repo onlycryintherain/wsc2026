@@ -410,15 +410,19 @@ Elastic low/high operating policy:
     Karpenter consolidateAfter = 1m
     Verified physical floor = managed 1 + dedicated stress 1 = 2 nodes
   High traffic:
-    HPA target user/product/stress = 18%/29%/35%
     HPA Max = 20/20/12
     Worker hard ceiling = managed 1 + default 1 + stress 4 = 6 nodes
     Dedicated stress spread/isolation retained
-  Intent:
-    user target 18 preserved the performance gate throughout spike1 in
-    run-1787309253; stress target 35 pre-scales dedicated capacity during
-    moderate traffic before the larger spike. Min remains unchanged, so the
-    earlier scale signal does not increase true idle node count.
+
+Rejected early-trigger combination:
+  HPA target user/product/stress = 18%/29%/35%
+  Run ID: run-1787311291
+  Score: 22.5/40; avg EC2 4.33; performance 6.5/12; cost 0/12
+  user/product/stress performance: 22.85% / 98.35% / 84.76%
+  Although spike1 pre-warmed five nodes, spike2 steady-state user performance
+  did not improve. The rejected trigger combination was restored to 33%/29%/55%.
+  Retained changes are only the proven two-node low-load packing, one-minute
+  consolidation, public-subnet provisioning, and total six-node ceiling.
 ====================================================
 
 ====================================================

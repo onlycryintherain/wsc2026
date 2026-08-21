@@ -2710,14 +2710,25 @@ function Write-HpaSpikeGuardLog($app,$guard) {
 }
 
 function Ensure-TopologySpread([string]$app) {
-    # Dedicated CPU-heavy workloads retain their explicit spread/isolation.
-    # Shared workloads must pack onto the managed node at low traffic; preferred
-    # hostname spread makes Karpenter retain an otherwise unnecessary node.
-    if ($app -eq $DedicatedApp) { return }
+    # Dedicated selector domains retain spread for CPU-heavy replicas. Shared
+    # workloads pack onto managed capacity at low traffic so Karpenter can remove
+    # the otherwise unnecessary default node.
     $deploy=$null
     try { $deploy=((Invoke-Kubectl @('-n',$Namespace,'get','deploy',$app,'-o','json')) -join '') | ConvertFrom-Json } catch { return }
-    if (-not $deploy -or $null-eq$deploy.spec.template.spec.topologySpreadConstraints) { return }
-    $patch=@{spec=@{template=@{spec=@{topologySpreadConstraints=$null}}}} | ConvertTo-Json -Compress -Depth 8
+    if(-not$deploy){return}
+    $selector=$deploy.spec.template.spec.nodeSelector
+    $dedicated=($selector-and@($selector.PSObject.Properties).Count-gt0)
+    $existing=@($deploy.spec.template.spec.topologySpreadConstraints|Where-Object{$null-ne$_})
+    if($dedicated){
+        if(@($existing|Where-Object{$_.topologyKey-eq'kubernetes.io/hostname'}).Count){return}
+        $spread=@(@{maxSkew=1;topologyKey='kubernetes.io/hostname';whenUnsatisfiable='ScheduleAnyway';labelSelector=@{matchLabels=@{app=$app}}})
+        $patch=@{spec=@{template=@{spec=@{topologySpreadConstraints=$spread}}}}|ConvertTo-Json -Compress -Depth 12
+        Invoke-Kubectl @('-n',$Namespace,'patch','deploy',$app,'--type=merge','-p',$patch)
+        Write-Host ("Dedicated spread [{0}] restored" -f $app) -ForegroundColor DarkGray
+        return
+    }
+    if(-not$existing.Count){return}
+    $patch=@{spec=@{template=@{spec=@{topologySpreadConstraints=$null}}}}|ConvertTo-Json -Compress -Depth 8
     Invoke-Kubectl @('-n',$Namespace,'patch','deploy',$app,'--type=merge','-p',$patch)
     Write-Host ("Shared packing [{0}] removed preferred hostname spread" -f $app) -ForegroundColor DarkGray
 }
