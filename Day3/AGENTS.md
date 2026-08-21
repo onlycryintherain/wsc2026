@@ -205,6 +205,7 @@ terraform plan -var-file=terraform.tfvars
 | 2026-08-21 | pending | Karpenter EC2NodeClass subnet selector에 `kubernetes.io/role/elb=1`을 추가해 Public subnet 2개만 노드용으로 선택하도록 live/`bastion_setup.sh` 반영. 1200m stress probe로 신규 `stress-q6srz`가 37초 내 Ready, public subnet `subnet-0e7ef5168e828794d`/public IP 사용 확인 후 probe와 임시 NodeClaim/EC2 삭제, 기존 3노드 및 앱 건강 확인. |
 | 2026-08-21 | pending | 단일 `DiagnosticSweepOnly`도 최적화 경로와 동일한 topology-derived low-load floor를 초기화하도록 공통 함수화. 기존 진단의 잘못된 floor=0 대기/timeout을 제거하고 stress isolation 기준 floor=2에서 순차증가 재측정 준비. |
 | 2026-08-21 | pending | Public subnet 수정 후 순차증가 `run-1787298425`: 23/40, user/product/stress 가용성 99.97/99.98/99.33%, 성능 24.77/101.11/85.48%, 평균 EC2 4.53, nodes 3→6, dropped=0, CNI=0. stress 병목은 복구됐고 user HPA 20/20 ceiling(peak CPU 1496m)이 주 병목. 종료 후 추가 Karpenter capacity를 정리해 topology floor 2노드와 앱 Ready 확인. |
+| 2026-08-21 | pending | 성능 게이트 복구 실험 전, 중단된 cooldown이 shared PDB를 0으로 남긴 상태를 startup에서 자동 복구하도록 보강. HPA min>1이고 PDB minAvailable=0이면 `max(1,min-1)`로 복구하여 저부하 노드 floor는 유지하면서 rollout/노드 disruption 가용성을 보호. |
 | 2026-08-20 | superseded | 3대 프로필 실측 — stress 성능 4.69%, user 8.51%로 성능 게이트 실패. 600m stress 6개를 안정적으로 수용하려면 stress NodePool 3대분(CPU 6)이 필요함을 확인 |
 | 2026-08-20 | pending | 안정 프로필로 전환 — default CPU 2, stress CPU 6(전용 3대), HPA user/product 2~20·stress 1~6, 저부하 consolidation 5m 유지 |
 | 2026-08-20 | pending | spike2 결과 반영 — stress HPA 6개 중 3개만 Ready, stress 5xx 175건·P95 30초로 확인되어 NodePool stress 한도를 4 CPU(2대분)로 확대해 총 4대까지 허용하고 request 500m 기준을 소스에 반영 |

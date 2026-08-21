@@ -6275,8 +6275,12 @@ function Repair-InvalidPdbPrerequisite {
         $minAvailable=$pdb[0].spec.minAvailable
         if($minAvailable -is [string] -and $minAvailable -match '%$'){continue}
         $hpaMin=[int]$hpa[0].spec.minReplicas
-        if($null-ne$minAvailable -and [int]$minAvailable -gt $hpaMin){
-            $safe=[math]::Max(1,$hpaMin-1)
+        $safe=[math]::Max(1,$hpaMin-1)
+        if($null-ne$minAvailable -and [int]$minAvailable -eq 0 -and $hpaMin -gt 1){
+            $patch=@{spec=@{minAvailable=$safe}}|ConvertTo-Json -Compress
+            Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p',$patch)
+            Write-Warning "PDB_PREREQUISITE_RESTORED: $app minAvailable 0->$safe (HPA min=$hpaMin)"
+        } elseif($null-ne$minAvailable -and [int]$minAvailable -gt $hpaMin){
             $patch=@{spec=@{minAvailable=$safe}}|ConvertTo-Json -Compress
             Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p',$patch)
             Write-Warning "PDB_PREREQUISITE_REPAIRED: $app minAvailable $minAvailable->$safe (HPA min=$hpaMin)"
