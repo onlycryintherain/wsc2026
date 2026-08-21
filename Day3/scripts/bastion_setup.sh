@@ -240,15 +240,14 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
-  # peak2 프로필: Managed 1대 + default 1대 + stress 6대 = 최대 8대.
-  # stress 12개(600m request)를 수용하며 저부하에서는 빈 노드를 회수한다.
+  # Managed 1대 + default 1대 + stress 4대 = 최대 6대.
+  # Min replica는 건드리지 않고 저부하 빈 노드를 빠르게 회수한다.
   limits:
     cpu: "2"
     memory: 1000Gi
   disruption:
-    # 저부하에서 빈/저활용 노드를 회수하고 부하 중에는 5분 유예한다.
     consolidationPolicy: WhenEmptyOrUnderutilized
-    consolidateAfter: 5m
+    consolidateAfter: 1m
 NODEPOOL
 # 38점 기준: stress는 별도 NodePool + taint로 격리한다.
 # default NodePool은 user/product만 수용하고 stress NodePool만 workload-class=stress를 제공한다.
@@ -282,15 +281,14 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
-  # stress 12개 × 600m request를 수용할 수 있는 전용 6대분.
-  # c5/t3.medium allocatable과 daemonset overhead를 고려하면 노드당 2개만 안정 배치한다.
-  # 저부하에서는 빈/저활용 stress 노드가 5분 후 회수된다.
+  # 대규모 트래픽에서 성능을 우선하되 총 worker ceiling 6을 넘지 않는 전용 4대분.
+  # 저부하에서는 1분 후 회수되어 managed 1 + stress 1 topology floor로 복귀한다.
   limits:
-    cpu: "12"
+    cpu: "8"
     memory: 1000Gi
   disruption:
     consolidationPolicy: WhenEmptyOrUnderutilized
-    consolidateAfter: 5m
+    consolidateAfter: 1m
 STRESS_NODEPOOL
 
 # NodePool에 taint가 있으면(스트레스 격리) aws-node/kube-proxy가 그 노드에
@@ -356,12 +354,6 @@ spec:
           periodSeconds: 2
           timeoutSeconds: 2
           failureThreshold: 3
-      topologySpreadConstraints:
-      - maxSkew: 1
-        topologyKey: kubernetes.io/hostname
-        whenUnsatisfiable: ScheduleAnyway
-        labelSelector:
-          matchLabels: {app: user}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -407,12 +399,6 @@ spec:
           periodSeconds: 3
           timeoutSeconds: 2
           failureThreshold: 3
-      topologySpreadConstraints:
-      - maxSkew: 1
-        topologyKey: kubernetes.io/hostname
-        whenUnsatisfiable: ScheduleAnyway
-        labelSelector:
-          matchLabels: {app: product}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -574,7 +560,7 @@ spec:
       name: cpu
       target:
         type: Utilization
-        averageUtilization: 33
+        averageUtilization: 18
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -654,7 +640,7 @@ spec:
       name: cpu
       target:
         type: Utilization
-        averageUtilization: 55
+        averageUtilization: 35
 HPA
 
 cat <<'PDB' | kubectl apply -f -

@@ -99,7 +99,8 @@ param(
     [switch]$DiagnosticSweepOnly,
     [switch]$NodeCeilingOnly,
     [string]$RestoreConfigFingerprint = '',
-    [string]$RejectedSweepSignatures = ''
+    [string]$RejectedSweepSignatures = '',
+    [switch]$SharedPackingOnly
 )
 
 # The only production path discovers unknown workloads and uses external fresh
@@ -2709,20 +2710,16 @@ function Write-HpaSpikeGuardLog($app,$guard) {
 }
 
 function Ensure-TopologySpread([string]$app) {
-    # shared workload에 node 단위 균등 배치: maxSkew=1 hostname, ScheduleAnyway.
-    # 이미 hostname constraint가 있으면 보존(merge/reuse) — 중복 추가/삭제 없음.
-    # stress는 dedicated placement(DENSE/SPREAD)가 노드 배치를 관리하므로 spread를 추가하지
-    # 않는다 — ScheduleAnyway spread가 DENSE(2 pods/node)에서 새 노드 생성을 유발할 수 있다.
+    # Dedicated CPU-heavy workloads retain their explicit spread/isolation.
+    # Shared workloads must pack onto the managed node at low traffic; preferred
+    # hostname spread makes Karpenter retain an otherwise unnecessary node.
     if ($app -eq $DedicatedApp) { return }
     $deploy=$null
     try { $deploy=((Invoke-Kubectl @('-n',$Namespace,'get','deploy',$app,'-o','json')) -join '') | ConvertFrom-Json } catch { return }
-    if (-not $deploy) { return }
-    $existing=@($deploy.spec.template.spec.topologySpreadConstraints | Where-Object { $null -ne $_ })
-    if (@($existing | Where-Object { $_.topologyKey -eq 'kubernetes.io/hostname' }).Count -gt 0) { return }
-    $spread=@(@{maxSkew=1;topologyKey='kubernetes.io/hostname';whenUnsatisfiable='ScheduleAnyway';labelSelector=@{matchLabels=@{app=$app}}})
-    $patch=@{spec=@{template=@{spec=@{topologySpreadConstraints=$spread}}}} | ConvertTo-Json -Compress -Depth 12
+    if (-not $deploy -or $null-eq$deploy.spec.template.spec.topologySpreadConstraints) { return }
+    $patch=@{spec=@{template=@{spec=@{topologySpreadConstraints=$null}}}} | ConvertTo-Json -Compress -Depth 8
     Invoke-Kubectl @('-n',$Namespace,'patch','deploy',$app,'--type=merge','-p',$patch)
-    Write-Host ("Pod spread [{0}] topologyKey=kubernetes.io/hostname maxSkew=1 whenUnsatisfiable=ScheduleAnyway" -f $app) -ForegroundColor DarkGray
+    Write-Host ("Shared packing [{0}] removed preferred hostname spread" -f $app) -ForegroundColor DarkGray
 }
 
 function Guard-HpaAgainstBudget($config,$cluster) {
@@ -6242,6 +6239,20 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
     return $candidate
 }
 
+function Set-SharedLowLoadPacking {
+    $deployments=((& kubectl -n $Namespace get deployments -o json)-join'')|ConvertFrom-Json
+    foreach($deployment in @($deployments.items)){
+        $selector=$deployment.spec.template.spec.nodeSelector
+        if($selector-and@($selector.PSObject.Properties).Count){continue}
+        $constraints=$deployment.spec.template.spec.topologySpreadConstraints
+        if($null-eq$constraints-or@($constraints).Count-eq0){continue}
+        $name=[string]$deployment.metadata.name
+        Invoke-Kubectl @('-n',$Namespace,'patch','deployment',$name,'--type=json','-p','[{"op":"remove","path":"/spec/template/spec/topologySpreadConstraints"}]')
+        Invoke-Kubectl @('-n',$Namespace,'rollout','status',"deployment/$name",'--timeout=600s')
+        Write-Host "SHARED_LOW_LOAD_PACKING_APPLIED: $name topologySpreadConstraints removed" -ForegroundColor Yellow
+    }
+}
+
 function ConvertFrom-ConfigFingerprint([string]$Fingerprint,[hashtable]$Template) {
     $config=Copy-Config $Template 'RESTORE_FINGERPRINT'
     $seen=[System.Collections.Generic.HashSet[string]]::new()
@@ -6543,6 +6554,7 @@ try {
         $measuredBase=Get-LiveConfig 'MEASURED_LIVE_BASE'
         Initialize-HpaControlPointModel
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'
+        if($SharedPackingOnly){Set-SharedLowLoadPacking;$runFailed=$false;return}
         if(-not[string]::IsNullOrWhiteSpace($RestoreConfigFingerprint)){
             $restore=ConvertFrom-ConfigFingerprint $RestoreConfigFingerprint $measuredBase
             $script:hardDeadline=(Get-Date).AddMinutes(15)

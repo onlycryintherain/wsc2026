@@ -402,6 +402,23 @@ Rejected user early-scaling experiment:
   Decision: immediate stop/REJECT under dual-gate invariant; immutable BASE restored.
   Next measured axis: stronger baseline-signal target recovery while retaining
   Min=2, so true idle traffic still returns to the two-node topology floor.
+
+Elastic low/high operating policy:
+  Low traffic:
+    HPA Min user/product/stress = 2/2/1
+    Shared user/product preferred hostname spread removed
+    Karpenter consolidateAfter = 1m
+    Verified physical floor = managed 1 + dedicated stress 1 = 2 nodes
+  High traffic:
+    HPA target user/product/stress = 18%/29%/35%
+    HPA Max = 20/20/12
+    Worker hard ceiling = managed 1 + default 1 + stress 4 = 6 nodes
+    Dedicated stress spread/isolation retained
+  Intent:
+    user target 18 preserved the performance gate throughout spike1 in
+    run-1787309253; stress target 35 pre-scales dedicated capacity during
+    moderate traffic before the larger spike. Min remains unchanged, so the
+    earlier scale signal does not increase true idle node count.
 ====================================================
 
 ====================================================
