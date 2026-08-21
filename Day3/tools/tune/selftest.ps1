@@ -181,6 +181,12 @@ if ($BaseExperiment) {
         if ($candidate.product.requestCpu -ne $best.product.requestCpu -or $candidate.user.minReplicas -ne $best.user.minReplicas) { throw 'request candidate changed another axis' }
     }
 
+    # TEST 20: every external run explicitly binds the freshly discovered endpoint.
+    Assert-Test 'External run body includes endpoint' {
+        $body=New-ExternalLoadRequestBody 'Default' 'https://new.example/' | ConvertFrom-Json
+        if ($body.template -ne 'Default' -or $body.endpoint -ne 'https://new.example') { throw 'run endpoint missing or stale' }
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
     if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }

@@ -6096,12 +6096,19 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
     return $candidate
 }
 
+function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) {
+    if ([string]::IsNullOrWhiteSpace($RunEndpoint)) { throw 'EXTERNAL_LOAD_ENDPOINT_EMPTY' }
+    return (@{template=$ProfileName;endpoint=$RunEndpoint.TrimEnd('/')} | ConvertTo-Json -Compress)
+}
+
 function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[switch]$FreshVerification) {
     $profiles=@('Default','Default-spike2','순차증가')
     $results=[System.Collections.Generic.List[object]]::new()
     foreach ($profileName in $profiles) {
         Write-Host "`n===== EXTERNAL PROFILE: $CandidateName / $profileName =====" -ForegroundColor Cyan
-        $body=@{template=$profileName} | ConvertTo-Json -Compress
+        # The grading server keeps endpoint per run; never rely on a stale/default
+        # endpoint after infrastructure recreation.
+        $body=New-ExternalLoadRequestBody $profileName $script:Endpoint
         $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
         $runId=[string]$run.run_id; $started=Get-Date; $expected=[int]([double](Get-OptionalPropertyValue $run 'expected_end_min' 15)*60); $restarts=0
         $samples=[System.Collections.Generic.List[object]]::new(); $completed=$false
