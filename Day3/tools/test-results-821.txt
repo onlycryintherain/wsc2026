@@ -210,6 +210,41 @@ Correction:
 ====================================================
 
 ====================================================
+Fresh BASE After Reference Review
+Date: 2026-08-21 12:48–13:57 KST
+Evidence: wsi-continuous-loop/round-20260821-124853/profile-sweep-BASE.json
+====================================================
+  Default:         35.5/40, perf=11.5, cost=8.0, avg_ec2=3.80
+                   user=91.89%, product=108.95%, stress=89.44%
+  Default-spike2:  21.5/40, perf=5.5, cost=0.0, avg_ec2=6.07
+                   user=6.46%, product=99.02%, stress=76.61%
+  순차증가:         16.5/40, perf=4.0, availability=8.5, cost=0.0,
+                   avg_ec2=4.37
+                   user=22.94%, product=100.99%, stress=23.70%
+                   stress availability=49.37%
+  Worst profile:   16.5/40
+
+Measured peak signals:
+  Default-spike2 user: desired/max=20/20, max CPU utilization=887%
+  Default-spike2 product: desired/max=20/20, performance remains about 99%
+  Default-spike2 stress: desired peak=10/12, max CPU/pod about 1028m
+  순차증가 stress: desired peak=6/12, max CPU/pod about 990m
+
+Decision-tree corrections based on evidence:
+  - Ceiling candidates are ranked by worst external app performance.
+  - HPA Max recovery grows by ceil(current*1.20), so user 20 -> 24 first.
+  - Product remains locked while its performance is healthy.
+  - Non-ceiling guard deficit with sustained CPU signal uses target -5 candidate.
+  - Guard recovery can KEEP a worst-profile improvement without requiring every
+    profile to improve, but availability or >1 point collateral regression rejects it.
+  - After all guards pass, request packing crosses a live node-density boundary
+    and adjusts target to preserve the absolute HPA trigger.
+  - Immutable evidence can be resumed only when its config fingerprint exactly
+    matches live configuration.
+  - Self-test: 25/25 passed.
+====================================================
+
+====================================================
 Continuous Execution State
 Date: 2026-08-21
 ====================================================

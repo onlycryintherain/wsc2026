@@ -90,7 +90,9 @@ param(
     [ValidateRange(1, 100)][int]$MaxProfileCandidates = 20,
     # A finished high-load profile must return to its measured low-load node
     # floor before the next profile starts, otherwise the next cost window is polluted.
-    [ValidateRange(60, 600)][int]$ExternalProfileCooldownSec = 360
+    [ValidateRange(60, 600)][int]$ExternalProfileCooldownSec = 360,
+    # Resume only from immutable evidence whose fingerprint matches live BASE.
+    [string]$ResumeSweepEvidence = ''
 )
 
 # The only production path discovers unknown workloads and uses external fresh
@@ -6005,11 +6007,20 @@ function Get-ExternalSweepObjective($Results,[string]$CandidateName,[string]$Con
     $perf=@($valid | ForEach-Object { [double]$_.Score.performance.score })
     $guards=@($valid | Where-Object { [double]$_.Score.availability.score -ge [double]$_.Score.availability.max -and [double]$_.Score.performance.score -ge $ProfilePerformanceGuard })
     $avgNodes=@($valid | ForEach-Object { [double]$_.Score.avg_ec2 })
+    $availabilityScores=@($valid | ForEach-Object { [double]$_.Score.availability.score })
+    $guardDeficit=0.0; $profileTotals=@{}
+    foreach ($result in $valid) {
+        $profileTotals[[string]$result.Profile]=[double]$result.Score.total40
+        $guardDeficit += [math]::Max(0.0,[double]$result.Score.availability.max-[double]$result.Score.availability.score)
+        $guardDeficit += [math]::Max(0.0,$ProfilePerformanceGuard-[double]$result.Score.performance.score)
+    }
     return [pscustomobject]@{
         Candidate=$CandidateName;Valid=$true;AllPerformanceGuards=($guards.Count -eq 3)
         PrimaryScore=[double](($totals | Measure-Object -Minimum).Minimum)
         AverageScore=[double](($totals | Measure-Object -Average).Average)
         MinimumPerformanceScore=[double](($perf | Measure-Object -Minimum).Minimum)
+        MinimumAvailabilityScore=[double](($availabilityScores | Measure-Object -Minimum).Minimum)
+        GuardDeficit=[double]$guardDeficit;ProfileTotals=$profileTotals
         AverageNodes=[double](($avgNodes | Measure-Object -Average).Average)
         Results=$Results;ConfigFingerprint=$ConfigFingerprint
     }
@@ -6017,7 +6028,20 @@ function Get-ExternalSweepObjective($Results,[string]$CandidateName,[string]$Con
 
 function Test-SweepCandidateBetter($Candidate,$Best) {
     if (-not $Candidate.Valid) { return $false }
+    $candidateAvailability=[double](Get-OptionalPropertyValue $Candidate 'MinimumAvailabilityScore' 0)
+    $bestAvailability=[double](Get-OptionalPropertyValue $Best 'MinimumAvailabilityScore' 0)
+    if ($candidateAvailability -lt $bestAvailability-0.5) { return $false }
+    $significantRegression=$false
+    $bestTotals=Get-OptionalPropertyValue $Best 'ProfileTotals' @{}
+    $candidateTotals=Get-OptionalPropertyValue $Candidate 'ProfileTotals' @{}
+    foreach ($profile in @($bestTotals.Keys)) {
+        if ($candidateTotals.ContainsKey($profile) -and [double]$candidateTotals[$profile] -lt [double]$bestTotals[$profile]-1.0) { $significantRegression=$true; break }
+    }
+    if ($significantRegression) { return $false }
     if ($Candidate.AllPerformanceGuards -ne $Best.AllPerformanceGuards) { return [bool]$Candidate.AllPerformanceGuards }
+    $candidateDeficit=[double](Get-OptionalPropertyValue $Candidate 'GuardDeficit' 999)
+    $bestDeficit=[double](Get-OptionalPropertyValue $Best 'GuardDeficit' 999)
+    if ($candidateDeficit -lt $bestDeficit-0.5) { return $true }
     if ([double]$Best.PrimaryScore -ge $ProfileTargetScore -and [double]$Candidate.PrimaryScore -lt $ProfileTargetScore) { return $false }
     if ([double]$Candidate.PrimaryScore -gt ([double]$Best.PrimaryScore+$SweepNoiseTolerance)) { return $true }
     if ([math]::Abs([double]$Candidate.PrimaryScore-[double]$Best.PrimaryScore) -le $SweepNoiseTolerance -and [double]$Candidate.AverageNodes -lt ([double]$Best.AverageNodes-0.10)) { return $true }
@@ -6039,17 +6063,72 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
     if (@($pending | Where-Object { $_.Reason -match 'Insufficient memory' }).Count) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Signature='NODE_MEMORY_CAPACITY';App=$null;Reason='Pending Insufficient memory'} }
     if ($pending.Count) { return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Signature='SCHEDULER_PLACEMENT';App=$null;Reason=(@($pending.Reason) -join '; ')} }
 
+    $ceilingCandidates=[System.Collections.Generic.List[object]]::new()
     foreach ($app in $apps) {
         $ceiling=@($samples | Where-Object {
             $m=$_.Hpa[$app]; $m -and [int]$m.Desired -ge [int]$m.Max -and $null -ne $m.CpuUtil -and [int]$m.CpuUtil -gt [int]$m.Target
         })
-        $sig="HPA_MAX:${app}:$([int]$BestConfig[$app].maxReplicas+1)"
-        if ($ceiling.Count -and -not $BestEvaluation.AllPerformanceGuards -and $sig -notin $RejectedSignatures) {
-            return [pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=[int]$BestConfig[$app].maxReplicas;To=[int]$BestConfig[$app].maxReplicas+1;Reason='performance guard failed with measured Desired>=Max and CPU>target'}
+        if (-not $ceiling.Count -or $BestEvaluation.AllPerformanceGuards) { continue }
+        $current=[int]$BestConfig[$app].maxReplicas
+        $next=[int][math]::Ceiling($current*1.20)
+        $uncapped=@($ceiling | ForEach-Object { $m=$_.Hpa[$app]; [math]::Ceiling([double]$m.Current*[double]$m.CpuUtil/[math]::Max(1,[double]$m.Target)) })
+        $uncappedPeak=if($uncapped.Count){[int](($uncapped|Measure-Object -Maximum).Maximum)}else{$current}
+        $perf=@($BestEvaluation.Results | ForEach-Object { $value=Get-OptionalPropertyValue $_.Score "${app}_perf" $null; if($null-ne$value){[double]$value} })
+        $worstPerf=if($perf.Count){[double](($perf|Measure-Object -Minimum).Minimum)}else{100.0}
+        $sig="HPA_MAX:${app}:$next"
+        if ($sig -notin $RejectedSignatures) { $ceilingCandidates.Add([pscustomobject]@{Type='HPA_CEILING';Signature=$sig;App=$app;From=$current;To=$next;WorstAppPerformance=$worstPerf;Reason="measured ceiling; uncapped desired peak=$uncappedPeak; grow 20%"}) }
+    }
+    if ($ceilingCandidates.Count) { return @($ceilingCandidates | Sort-Object WorstAppPerformance,App)[0] }
+
+    if (-not $BestEvaluation.AllPerformanceGuards) {
+        $recovery=[System.Collections.Generic.List[object]]::new()
+        foreach ($app in $apps) {
+            $perf=@($BestEvaluation.Results | ForEach-Object { $value=Get-OptionalPropertyValue $_.Score "${app}_perf" $null; if($null-ne$value){[double]$value} })
+            $worstPerf=if($perf.Count){[double](($perf|Measure-Object -Minimum).Minimum)}else{100.0}
+            if ($worstPerf -ge 90.0) { continue }
+            $metrics=@($samples | ForEach-Object { $m=$_.Hpa[$app]; if($m){$m} })
+            if (-not $metrics.Count) { continue }
+            $peakDesired=[int](($metrics | ForEach-Object {[int]$_.Desired} | Measure-Object -Maximum).Maximum)
+            $utils=@($metrics | Where-Object {$null-ne$_.CpuUtil} | ForEach-Object {[double]$_.CpuUtil})
+            if (-not $utils.Count) { continue }
+            $peakUtil=[double](($utils | Measure-Object -Maximum).Maximum)
+            $currentTarget=[int]$BestConfig[$app].hpaTarget
+            if ($peakDesired -lt [int]$BestConfig[$app].maxReplicas -and $peakUtil -gt $currentTarget*1.20 -and $currentTarget -gt $HpaTargetLowerBound+5) {
+                $nextTarget=[int][math]::Max($HpaTargetLowerBound,$currentTarget-5)
+                $sig="HPA_TARGET_RECOVERY:${app}:$nextTarget"
+                if ($sig -notin $RejectedSignatures) { $recovery.Add([pscustomobject]@{Type='HPA_TARGET_RECOVERY';Signature=$sig;App=$app;From=$currentTarget;To=$nextTarget;WorstAppPerformance=$worstPerf;Reason="guard deficit with sustained CPU signal; desired peak=$peakDesired below max; utilization peak=$peakUtil%"}) }
+            }
         }
+        if ($recovery.Count) { return @($recovery | Sort-Object WorstAppPerformance,App)[0] }
     }
 
     if ($BestEvaluation.AllPerformanceGuards) {
+        # First compress scheduler packing at a real node-density boundary while
+        # preserving the absolute HPA trigger. This can remove a whole peak node;
+        # reducing Min cannot help when topology already fixes the idle floor.
+        $cluster=$script:ExternalSweepClusterCapacity
+        $usableCpu=if($cluster){[double]$cluster.NodeAllocatableCPU-[double]$cluster.DaemonSetCPUPerNode-([double]$cluster.NodeAllocatableCPU*$ClusterSchedulingReservePercent/100.0)}else{0.0}
+        $packing=[System.Collections.Generic.List[object]]::new()
+        foreach ($app in $apps) {
+            $currentRequest=[double](Convert-CpuToM $BestConfig[$app].requestCpu)
+            if ($currentRequest -le 0 -or $usableCpu -le 0) { continue }
+            $currentDensity=[math]::Max(1,[math]::Floor($usableCpu/$currentRequest))
+            $nextDensity=$currentDensity+1
+            $newRequest=[math]::Floor(($usableCpu/$nextDensity)/$CpuRequestStep)*$CpuRequestStep
+            if ($newRequest -le 0 -or $newRequest -ge $currentRequest) { continue }
+            $absoluteTrigger=$currentRequest*[double]$BestConfig[$app].hpaTarget/100.0
+            $newTarget=[int][math]::Round(100.0*$absoluteTrigger/$newRequest)
+            if ($newTarget -lt $HpaTargetLowerBound -or $newTarget -gt $HpaTargetUpperBound) { continue }
+            $desired=@($samples | ForEach-Object { $m=$_.Hpa[$app]; if($m){[int]$m.Desired} })
+            if (-not $desired.Count) { continue }
+            $peak=[int](($desired|Measure-Object -Maximum).Maximum)
+            $oldNodes=[math]::Ceiling($peak/$currentDensity); $newNodes=[math]::Ceiling($peak/$nextDensity)
+            if ($newNodes -ge $oldNodes) { continue }
+            $sig="REQUEST_PACKING:${app}:${newRequest}:$newTarget"
+            if ($sig -notin $RejectedSignatures) { $packing.Add([pscustomobject]@{Type='REQUEST_PACKING';Signature=$sig;App=$app;From=$currentRequest;To=$newRequest;OldTarget=[int]$BestConfig[$app].hpaTarget;NewTarget=$newTarget;NodeSaving=$oldNodes-$newNodes;Reason="live usable CPU ${usableCpu}m; density $currentDensity->$nextDensity; peak nodes $oldNodes->$newNodes; preserve trigger ${absoluteTrigger}m"}) }
+        }
+        if ($packing.Count) { return @($packing | Sort-Object @{Expression='NodeSaving';Descending=$true},App)[0] }
+
         # Max remains a high-load ceiling. Reduce only demonstrably unused excess
         # while retaining 20% measured peak headroom; Min handles low-load cost.
         foreach ($app in $apps) {
@@ -6091,8 +6170,9 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
     switch ($Recommendation.Type) {
         'HPA_CEILING' { $candidate[$Recommendation.App].maxReplicas=[int]$Recommendation.To }
         'HPA_MAX_COST' { $candidate[$Recommendation.App].maxReplicas=[int]$Recommendation.To }
+        'HPA_TARGET_RECOVERY' { $candidate[$Recommendation.App].hpaTarget=[int]$Recommendation.To }
         'MIN_REPLICA_COST' { $candidate[$Recommendation.App].minReplicas=[int]$Recommendation.To; $candidate[$Recommendation.App].replicas=[int]$Recommendation.To }
-        'REQUEST_OVERSIZED' {
+        {$_ -in @('REQUEST_OVERSIZED','REQUEST_PACKING')} {
             $oldCp=(Convert-CpuToM $BestConfig[$Recommendation.App].requestCpu)*[double]$BestConfig[$Recommendation.App].hpaTarget/100.0
             $candidate[$Recommendation.App].requestCpu=Format-Cpu ([double]$Recommendation.To)
             $actualRequest=Convert-CpuToM $candidate[$Recommendation.App].requestCpu
@@ -6104,7 +6184,7 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
         default { throw "NO_APPLICATION_DELTA: $($Recommendation.Type)" }
     }
     $diffs=@(Compare-Config $BestConfig $candidate @())
-    if ($Recommendation.Type -eq 'REQUEST_OVERSIZED') {
+    if ($Recommendation.Type -in @('REQUEST_OVERSIZED','REQUEST_PACKING')) {
         $allowed=@($diffs | Where-Object { $_.App -eq $Recommendation.App -and $_.Field -in @('requestCpu','hpaTarget') })
         if ($diffs.Count -ne 2 -or $allowed.Count -ne 2) { throw 'ONE_DELTA_VIOLATION: request/control-point candidate changed unrelated fields' }
     } elseif ($diffs.Count -ne 1) { throw "ONE_DELTA_VIOLATION: expected one field, got $($diffs.Count)" }
@@ -6179,7 +6259,7 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
     return $evaluation
 }
 
-function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase) {
+function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvaluation=$null) {
     $bestConfig=Copy-Config $MeasuredBase 'MEASURED_BEST'
     # Derive the low-load floor from stable topology, never from leftover nodes
     # of the previous run. Managed nodes host shared minima; each distinct
@@ -6200,9 +6280,16 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase) {
     }
     $script:ExternalSweepNodeFloor=[math]::Max(1,$managedReady+$domains.Count)
     Write-Host "MEASURED_LOW_LOAD_NODE_FLOOR=$script:ExternalSweepNodeFloor (managed=$managedReady dedicatedDomains=$($domains.Count))" -ForegroundColor Cyan
-    $best=Invoke-ExternalProfileSweep -CandidateName 'BASE' -Config $bestConfig
+    if ($InitialEvaluation) {
+        $expected=Get-ConfigFingerprintFromValues $bestConfig
+        $actual=[string](Get-OptionalPropertyValue $InitialEvaluation 'ConfigFingerprint' '')
+        if ($actual -ne $expected) { throw "RESUME_FINGERPRINT_MISMATCH: evidence=$actual live=$expected" }
+        $best=$InitialEvaluation
+        Write-Host "RESUME_IMMUTABLE_BASE: minScore=$($best.PrimaryScore) fingerprint=$actual" -ForegroundColor Cyan
+    } else { $best=Invoke-ExternalProfileSweep -CandidateName 'BASE' -Config $bestConfig }
     $history=[System.Collections.Generic.List[object]]::new(); $rejected=[System.Collections.Generic.List[string]]::new()
     for ($i=1; $i -le $MaxProfileCandidates; $i++) {
+        $script:ExternalSweepClusterCapacity=Get-ClusterCapacitySnapshot
         $rec=Get-DynamicSweepRecommendation $bestConfig $best @($rejected)
         if ($null -eq $rec) { Write-Warning 'NO_SAFE_MEASURED_DELTA: optimization stopped'; break }
         if ($rec.Type -in @('CNI_IP_CAPACITY','NODE_CPU_CAPACITY','NODE_MEMORY_CAPACITY','SCHEDULER_PLACEMENT','GENERATOR_LIMIT')) {
@@ -6259,7 +6346,13 @@ try {
         $measuredBase=Get-LiveConfig 'MEASURED_LIVE_BASE'
         Initialize-HpaControlPointModel
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'
-        Invoke-ProfileSweepOptimization $measuredBase | Out-Null
+        $resume=$null
+        if (-not [string]::IsNullOrWhiteSpace($ResumeSweepEvidence)) {
+            if (-not (Test-Path -LiteralPath $ResumeSweepEvidence)) { throw "Resume evidence not found: $ResumeSweepEvidence" }
+            $loaded=Get-Content -Raw -LiteralPath $ResumeSweepEvidence | ConvertFrom-Json -AsHashtable
+            $resume=Get-ExternalSweepObjective -Results @($loaded.Results) -CandidateName ([string]$loaded.Candidate) -ConfigFingerprint ([string]$loaded.ConfigFingerprint)
+        }
+        Invoke-ProfileSweepOptimization $measuredBase $resume | Out-Null
         $runFailed=$false
         return
     }

@@ -202,11 +202,51 @@ if ($BaseExperiment) {
     # TEST 22: instantaneous sent-RPS jitter is not a generator limit.
     Assert-Test 'Generator jitter does not stop search' {
         $best=Copy-Config $BaseConfig 'best'; $h=@{}
-        foreach($app in $apps){$h[$app]=[pscustomobject]@{Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget}}
+        foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget}}
         $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=@{}}
         $result=[pscustomobject]@{Status=[pscustomobject]@{dropped=0;target_rps=4.6;sent_rps=4.0};Samples=@($sample)}
         $evaluation=[pscustomobject]@{AllPerformanceGuards=$true;Results=@($result,$result,$result)}
         if ((Get-DynamicSweepRecommendation $best $evaluation @()).Type -eq 'GENERATOR_LIMIT') { throw 'RPS jitter classified as saturation' }
+    }
+
+    # TEST 23: ceiling recovery prioritizes worst app and grows Max by 20%.
+    Assert-Test 'Ceiling recovery selects worst app' {
+        $best=Copy-Config $BaseConfig 'best'; $h=@{}
+        foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=[int]$best[$app].maxReplicas;Desired=[int]$best[$app].maxReplicas;Max=[int]$best[$app].maxReplicas;CpuUtil=100;Target=[int]$best[$app].hpaTarget}}
+        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=@{}}
+        $score=[pscustomobject]@{user_perf=6;product_perf=100;stress_perf=76}
+        $result=[pscustomobject]@{Score=$score;Status=[pscustomobject]@{dropped=0};Samples=@($sample)}
+        $evaluation=[pscustomobject]@{AllPerformanceGuards=$false;Results=@($result,$result,$result)}
+        $rec=Get-DynamicSweepRecommendation $best $evaluation @()
+        if ($rec.Type -ne 'HPA_CEILING' -or $rec.App -ne 'user' -or [int]$rec.To -ne [math]::Ceiling([int]$best.user.maxReplicas*1.2)) { throw "unexpected $($rec.Type) $($rec.App) $($rec.To)" }
+    }
+
+    # TEST 24: guard-deficit recovery can KEEP one-profile improvement without collateral regression.
+    Assert-Test 'Guard recovery keeps worst-profile gain' {
+        $best=[pscustomobject]@{Valid=$true;AllPerformanceGuards=$false;MinimumAvailabilityScore=12;GuardDeficit=8;PrimaryScore=20;AverageNodes=5;ProfileTotals=@{Default=35;Peak=20;Sequential=22}}
+        $candidate=[pscustomobject]@{Valid=$true;AllPerformanceGuards=$false;MinimumAvailabilityScore=12;GuardDeficit=5;PrimaryScore=23;AverageNodes=5;ProfileTotals=@{Default=35;Peak=23;Sequential=22}}
+        if (-not (Test-SweepCandidateBetter $candidate $best)) { throw 'guard recovery improvement rejected' }
+    }
+
+    # TEST 25: packing candidate crosses a live CPU density boundary and preserves trigger.
+    Assert-Test 'Request packing boundary preserves trigger' {
+        $best=Copy-Config $BaseConfig 'best'; $h=@{}
+        foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget}}
+        $h.stress.Current=6;$h.stress.Desired=6
+        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=@{}}
+        $score=[pscustomobject]@{user_perf=100;product_perf=100;stress_perf=100}
+        $result=[pscustomobject]@{Score=$score;Status=[pscustomobject]@{dropped=0};Samples=@($sample)}
+        $evaluation=[pscustomobject]@{AllPerformanceGuards=$true;Results=@($result,$result,$result)}
+        $oldCluster=$script:ExternalSweepClusterCapacity
+        try {
+            $script:ExternalSweepClusterCapacity=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150}
+            $rec=Get-DynamicSweepRecommendation $best $evaluation @()
+            if($rec.Type-ne'REQUEST_PACKING'-or$rec.App-ne'stress'){throw "unexpected $($rec.Type) $($rec.App)"}
+            $candidate=New-DynamicSweepCandidate $best $rec candidate
+            $old=(Convert-CpuToM $best.stress.requestCpu)*$best.stress.hpaTarget/100
+            $new=(Convert-CpuToM $candidate.stress.requestCpu)*$candidate.stress.hpaTarget/100
+            if([math]::Abs($old-$new)-gt[math]::Max(1,$old*.03)){throw "trigger drift $old->$new"}
+        } finally { $script:ExternalSweepClusterCapacity=$oldCluster }
     }
 
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
