@@ -461,3 +461,31 @@ Loop policy:
   -> Generate next safe unexplored candidate
   -> Continue until explicit user stop or actual resource/session loss
 ====================================================
+
+====================================================
+0.25x Sequential Diagnostic
+Date: 2026-08-22 KST
+Run ID: run-1787333608
+Evidence: C:\Users\competitor\AppData\Local\Temp\wsi-multiplier025-retry-sequential-20260822-0233\profile-sweep-DIAGNOSTIC.json
+====================================================
+  Score: 33.5/40 (availability 12, performance 9.5, cost 8)
+  Performance: user 84.16%, product 109.47%, stress 86.27%
+  Availability: user 99.85%, product 99.97%, stress 98.72%
+  Nodes: average 3.73, peak 6, idle floor 2
+  Quality: dropped=0, CNI errors=0, transient Pending samples=3
+  HPA peaks: user 32/32, product 19/20, stress 6/12
+  User stayed at Max in 15/48 samples; spike2 steady p95 was 222-256ms.
+  Stress spike2 p95 was commonly 1.2-1.7s despite only 3-5 replicas.
+  Scale-out cold start caused the largest first-minute spike penalties.
+
+Decision:
+  Keep the measured configuration unchanged for now.
+  First one-delta candidate: user HPA Max 32 -> 40. Aggregate measured CPU
+  predicts roughly 36-37 desired replicas and existing three shared nodes have
+  sufficient request capacity, so this may improve user performance without
+  increasing the observed node count. Validate fresh before keeping.
+  Second candidate only after that: stress HPA target 55 -> 45.
+  Do not raise Min replicas or delay consolidation first; those changes would
+  spend cost points across the full low-traffic window for limited score gain.
+  This 0.25x diagnostic is not directly comparable to official 0.5x evidence.
+====================================================

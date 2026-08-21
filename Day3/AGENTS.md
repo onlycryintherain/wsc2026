@@ -188,6 +188,7 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-22 | pending | 사용자 지정 0.25x `순차증가` 진단 `run-1787333608`: 33.5/40(가용성 12, 성능 9.5, 비용 8), user/product/stress 성능 84.16/109.47/86.27%, 평균 EC2 3.73·peak 6·dropped/CNI 0. user HPA 32 ceiling 15/48 sample과 spike2 steady user p95 222~256ms를 확인해 다음 단일 후보를 user Max 32→40으로 선정하되 아직 적용하지 않음. 공식 0.5x 결과와 직접 비교하지 않는다. |
 | 2026-08-21 | pending | `tune.ps1 -PerformanceGateOnly`를 통해 HPA/request/limit을 스크립트로만 적용하고, CNI IP 할당 실패 대응으로 10.0.4.0/22·10.0.8.0/22 pod-capacity subnet을 추가. Node Type/RDS Instance Type은 유지. Default-spike2 10분 실측: 성능 11/12, user 89.39%, product 112.14%, stress 88.32%, 총 27/40(평균 EC2 9.45로 비용 0). | 
 | 2026-08-21 | pending | 저트래픽 min=2, 빠른 HPA scale-up(15초), 5분 scale-down stabilization을 `tune.ps1`에 반영. 동일 프로필 Default/Default-spike2/순차증가를 수용하며, 리소스 소실 시 즉시 중지·JSON 기록하는 `RESOURCE_LOSS_STOP` guard 추가. Adaptive Default-spike2 15분: 성능 10.5/12, user 89.46%, product 111.88%, stress 85.64%, 총 26.5/40. |
 | 2026-08-21 | pending | `skills-server:8003` 3개 프로필 실측 완료 — Default 28/40(성능 12/12, user 99.21%, stress 90.93%), Default-spike2 26/40(성능 10/12, user 90.19%, stress 80.56%), 순차증가 27/40(성능 11/12, user 88.12%, stress 87.85%). 리소스 소실 없음. `-ProfileSweepOnly`에 3개 프로필 순차 실행·조기중지 재시작·소실 기록을 추가. |
