@@ -489,3 +489,33 @@ Decision:
   spend cost points across the full low-traffic window for limited score gain.
   This 0.25x diagnostic is not directly comparable to official 0.5x evidence.
 ====================================================
+
+====================================================
+HPA Stability / Final Gate Recovery
+Date: 2026-08-22 KST
+====================================================
+  Candidate run (user Max 32 -> 40): run-1787335919
+    34.5/40, performance 10.5, cost 8, average EC2 3.83
+    user/product/stress performance 87.05/110.05/88.34%
+  Candidate FINAL_FRESH: run-1787337791
+    33.5/40, performance 8.5 (gate OFF), cost 9, average EC2 3.43
+    user/product/stress performance 78.90/107.94/86.62%
+  Decision: REJECT Max40 due fresh performance-gate failure; restore Max32.
+
+  tune.ps1 correction:
+    - external sweep HPA behavior is applied and verified as scaleUp=0s,
+      scaleDown=300s, selectPolicy=Min, 25%/60s.
+    - FINAL_FRESH dual-gate failure now restores the preceding measured BEST
+      and records the rejected candidate signature.
+    - self-test 34/34.
+
+  Corrected fresh run: run-1787339949
+    33.0/40, availability 12, performance 9 (gate ON), cost 8
+    user/product/stress performance 76.62/105.40/88.26%
+    average EC2 3.76, dropped=0, CNI=0
+  Evidence:
+    C:\Users\competitor\AppData\Local\Temp\wsi-hpa-stable300-user32-025-20260822-0420\profile-sweep-DIAGNOSTIC.json
+  Decision: KEEP the safe Max32 rollback and HPA anti-flap behavior. The
+  requested performance gate stayed enabled, so do not start another mutation
+  cycle from this 0.25x diagnostic.
+====================================================
