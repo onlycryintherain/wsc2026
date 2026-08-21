@@ -6191,6 +6191,28 @@ function New-DynamicSweepCandidate([hashtable]$BestConfig,$Recommendation,[strin
     return $candidate
 }
 
+function Repair-InvalidPdbPrerequisite {
+    # A PDB whose minAvailable exceeds the HPA low-load replica floor makes
+    # normal consolidation mathematically impossible. Repair only that invalid
+    # relation; valid PDBs are left untouched.
+    $pdbs=((& kubectl -n $Namespace get pdb -o json 2>$null) -join '') | ConvertFrom-Json
+    $hpas=((& kubectl -n $Namespace get hpa -o json) -join '') | ConvertFrom-Json
+    foreach($app in $apps) {
+        $pdb=@($pdbs.items | Where-Object {$_.metadata.name-eq$app} | Select-Object -First 1)
+        $hpa=@($hpas.items | Where-Object {$_.metadata.name-eq$app} | Select-Object -First 1)
+        if(-not$pdb.Count-or-not$hpa.Count){continue}
+        $minAvailable=$pdb[0].spec.minAvailable
+        if($minAvailable -is [string] -and $minAvailable -match '%$'){continue}
+        $hpaMin=[int]$hpa[0].spec.minReplicas
+        if($null-ne$minAvailable -and [int]$minAvailable -gt $hpaMin){
+            $safe=[math]::Max(1,$hpaMin-1)
+            $patch=@{spec=@{minAvailable=$safe}}|ConvertTo-Json -Compress
+            Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p',$patch)
+            Write-Warning "PDB_PREREQUISITE_REPAIRED: $app minAvailable $minAvailable->$safe (HPA min=$hpaMin)"
+        }
+    }
+}
+
 function Wait-ExternalProfileLowLoadFloor([int]$NodeFloor) {
     $started=Get-Date
     while (((Get-Date)-$started).TotalSeconds -lt $ExternalProfileCooldownSec) {
@@ -6343,6 +6365,7 @@ try {
     if ($ProfileSweepOnly) {
         Write-Host "`n========== UNKNOWN-APPLICATION PROFILE SWEEP ==========" -ForegroundColor Green
         Initialize-EndpointAndData
+        Repair-InvalidPdbPrerequisite
         $measuredBase=Get-LiveConfig 'MEASURED_LIVE_BASE'
         Initialize-HpaControlPointModel
         Show-Config $measuredBase 'Measured BASE (live, immutable seed)'

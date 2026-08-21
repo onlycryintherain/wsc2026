@@ -242,6 +242,13 @@ Decision-tree corrections based on evidence:
   - Immutable evidence can be resumed only when its config fingerprint exactly
     matches live configuration.
   - Self-test: 25/25 passed.
+
+Low-floor blocker found after load:
+  - user PDB minAvailable=3 while user HPA min=2/current=2.
+  - Karpenter reported DisruptionBlocked and retained a third node indefinitely.
+  - tune lifecycle now repairs only mathematically invalid PDB relations where
+    minAvailable > HPA min, using safe minAvailable=max(1,HPA min-1).
+  - Valid PDBs are not changed.
 ====================================================
 
 ====================================================
