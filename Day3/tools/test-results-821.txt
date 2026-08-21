@@ -333,6 +333,17 @@ Invalid infrastructure evidence:
   - After load ended, all unregistered NodeClaims/instances were deleted;
     load running=false and the three original Kubernetes Nodes are Ready.
   - Per owner request, execution stopped without applying another experiment.
+
+Karpenter subnet selector repair (after explicit owner approval):
+  - EC2NodeClass subnet selector now requires both cluster=shared and
+    kubernetes.io/role/elb=1.
+  - Resolved status subnets: public 10.0.0.0/24 (2a) and 10.0.1.0/24 (2b) only.
+  - Live provisioning probe requested 1200m CPU in the stress domain.
+  - New NodeClaim stress-q6srz became Ready in 37 seconds.
+  - Instance i-04197b43126666443 joined from public subnet
+    subnet-0e7ef5168e828794d with a public IP.
+  - Probe Pod reached Running; it and its temporary NodeClaim/EC2 were then
+    deleted, and the original three nodes/apps remained healthy.
 ====================================================
 
 ====================================================

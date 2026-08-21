@@ -207,9 +207,12 @@ spec:
   role: ${node_role}
   kubelet:
     maxPods: 110
+  # Worker nodes require public egress because this environment has no NAT.
+  # role/elb excludes role/cni pod-capacity subnets from node placement.
   subnetSelectorTerms:
     - tags:
         kubernetes.io/cluster/${cluster_name}: shared
+        kubernetes.io/role/elb: "1"
   securityGroupSelectorTerms:
     - tags:
         kubernetes.io/cluster/${cluster_name}: shared
