@@ -6288,7 +6288,7 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
             $currentMax=[int]$BestConfig[$app].maxReplicas
             $rejectedMax="HPA_MAX:${app}:$([int][math]::Ceiling($currentMax*1.20))" -in $RejectedSignatures
             $strongCpuSignal=$peakUtil-gt$currentTarget*1.20
-            $severeNearCeiling=$worstPerf-lt75.0-and$peakDesired-ge[math]::Ceiling($currentMax*0.90)-and$peakUtil-ge$currentTarget*0.90
+            $severeNearCeiling=$worstPerf-lt75.0-and$peakDesired-ge[math]::Ceiling($currentMax*0.80)-and$peakUtil-ge$currentTarget*0.90
             if (($peakDesired -lt $currentMax -or $rejectedMax) -and ($strongCpuSignal -or $severeNearCeiling) -and $currentTarget -gt $HpaTargetLowerBound+5) {
                 $rejectedTargetCount=@($RejectedSignatures|Where-Object{$_-like"HPA_TARGET_RECOVERY:${app}:*"}).Count
                 $nextTarget=[int][math]::Max($HpaTargetLowerBound,$currentTarget-(5*($rejectedTargetCount+1)))
@@ -6617,7 +6617,7 @@ function Get-ExternalOnlineRecoverySignal($Score,$Samples) {
         $pinned=@($recent|Where-Object{
             $m=$_.Hpa[$app];if(-not$m-or$null-eq$m.CpuUtil){return $false}
             $hardCeiling=[int]$m.Desired-ge[int]$m.Max-and[double]$m.CpuUtil-gt[double]$m.Target
-            $severeNearCeiling=[double]$perf-lt75.0-and[int]$m.Desired-ge[math]::Ceiling([int]$m.Max*0.90)-and[double]$m.CpuUtil-ge[double]$m.Target*0.90
+            $severeNearCeiling=[double]$perf-lt75.0-and[int]$m.Desired-ge[math]::Ceiling([int]$m.Max*0.80)-and[double]$m.CpuUtil-ge[double]$m.Target*0.90
             return $hardCeiling-or$severeNearCeiling
         })
         if($pinned.Count-eq$recent.Count){$signals.Add([pscustomobject]@{App=$app;Performance=[double]$perf;Reason="three sustained hard/near HPA ceiling samples with CPU signal"})}
