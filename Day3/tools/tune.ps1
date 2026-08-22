@@ -88,6 +88,10 @@ param(
     # Run the external grading server's three named profiles sequentially.
     [switch]$ProfileSweepOnly,
     [string]$LoadServer = 'http://skills-server:8003',
+    # Explicit UI-supported external grading strength. Zero preserves the
+    # server-selected value; non-zero is re-applied after /load/start because
+    # that endpoint refreshes the user-scoped multiplier to its stored default.
+    [ValidateRange(0.0, 1.0)][double]$ExternalLoadMultiplier = 0.0,
     [ValidateRange(0, 12)][double]$ProfilePerformanceGuard = 9.0,
     [ValidateRange(0, 12)][double]$ProfileCostGuard = 1.0,
     [ValidateRange(1, 40)][double]$ProfileTargetScore = 30.0,
@@ -6494,6 +6498,23 @@ function Sync-ExternalLoadServerEndpoint([string]$RunEndpoint) {
     Write-Host "EXTERNAL_LOAD_ENDPOINT_READY: $expected" -ForegroundColor Green
 }
 
+function Set-ExternalLoadMultiplierAfterStart([double]$Multiplier) {
+    if($Multiplier-le0){return}
+    $meta=Invoke-ExternalLoadApi '/api/config/meta'
+    $body=@{injection_rate_multiplier=$Multiplier}
+    $scopedKeys=@($meta.meta.PSObject.Properties.Name|Where-Object{$_-like'injection_rate_multiplier:*'})
+    foreach($key in $scopedKeys){$body[$key]=$Multiplier}
+    Invoke-ExternalLoadApi '/api/config/meta' 'Put' ($body|ConvertTo-Json -Compress)|Out-Null
+    $verified=Invoke-ExternalLoadApi '/api/config/meta'
+    $bad=[System.Collections.Generic.List[string]]::new()
+    foreach($key in @('injection_rate_multiplier')+$scopedKeys){
+        $actual=[double](Get-OptionalPropertyValue $verified.meta $key -1)
+        if([math]::Abs($actual-$Multiplier)-gt0.0001){$bad.Add("$key=$actual")}
+    }
+    if($bad.Count){throw "EXTERNAL_LOAD_MULTIPLIER_SYNC_FAILED: expected=$Multiplier actual=$($bad-join',')"}
+    Write-Host "EXTERNAL_LOAD_MULTIPLIER_READY: multiplier=$Multiplier keys=$(@('injection_rate_multiplier')+$scopedKeys-join',')" -ForegroundColor Green
+}
+
 function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[switch]$FreshVerification) {
     $profiles=@($SweepProfiles)
     $results=[System.Collections.Generic.List[object]]::new()
@@ -6508,6 +6529,7 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
         Sync-ExternalLoadServerEndpoint $script:Endpoint
         $body=New-ExternalLoadRequestBody $profileName $script:Endpoint
         $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
+        Set-ExternalLoadMultiplierAfterStart $ExternalLoadMultiplier
         $runId=[string]$run.run_id; $started=Get-Date; $expected=[int]([double](Get-OptionalPropertyValue $run 'expected_end_min' 15)*60); $restarts=0
         $samples=[System.Collections.Generic.List[object]]::new(); $completed=$false
         while (((Get-Date)-$started).TotalSeconds -lt ($expected+120)) {
@@ -6526,6 +6548,7 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
             if (-not [bool]$status.running) {
                 if ([int]$status.elapsed_sec -lt [math]::Max(120,$expected-60) -and $restarts -lt 1) {
                     $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
+                    Set-ExternalLoadMultiplierAfterStart $ExternalLoadMultiplier
                     $runId=[string]$run.run_id; $started=Get-Date; $samples.Clear(); $restarts++; Write-Warning "조기 중지·리소스 정상: $profileName fresh 재시작"; continue
                 }
                 $results.Add([pscustomobject]@{Profile=$profileName;RunId=$runId;Score=$score;Status=$status;Restarts=$restarts;Samples=@($samples);Fresh=[bool]$FreshVerification}); $completed=$true; break

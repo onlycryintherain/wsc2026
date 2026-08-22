@@ -188,6 +188,7 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-22 | pending | `/api/load/start`가 user-scoped 강도를 저장 기본값 0.25로 되돌리는 동작을 짧은 calibration run으로 확인. active run에서 scoped meta를 0.5로 PUT하면 target이 2.3→4.7 RPS로 즉시 전환됨을 검증하여 `-ExternalLoadMultiplier`를 추가하고, 각 start/restart 직후 global+발견된 scoped multiplier를 원자 적용·GET 검증하도록 보강. 기본값0은 서버 설정 보존. self-test 34/34·terraform validate 통과. |
 | 2026-08-22 | pending | low binary 첫 `run-1787378429`는 CloudFront 생성 직후 load server DNS 미전파로 앱 access log/HPA 트래픽 없이 2xx=0인 무효 run. 이어진 `run-1787380268`에서 DNS 정상화를 확인했지만 scoped multiplier가 0.25로 돌아가 88초에 중지. endpoint가 이미 같아도 meta PUT을 실행하면 서버가 user-scoped UI metadata를 refresh해 명시 강도를 덮는 원인으로 판단하여, `tune.ps1` endpoint 동기화를 GET-first·불일치할 때만 PUT하도록 수정. self-test 34/34·terraform validate 통과. |
 | 2026-08-22 | pending | 0.5x fresh 순차 검증 전 `tune.ps1` 외부 load API 관측을 4회 지수 backoff retry로 보강. 이전 run에서 injector는 정상인데 skills-server 단발 연결 거부로 tuner만 종료된 재현성 문제를 방지하며, 중복 run 위험이 있는 `/api/load/start` POST는 retry하지 않고 GET 및 idempotent endpoint PUT만 retry. parse/self-test 34/34·terraform validate 통과. |
 | 2026-08-22 | pending | 재생성 인프라 CloudFront `d3tum9m2cawjh9.cloudfront.net` Deployed 후 `Downloads/high_binary/low_binary`의 user/product/stress를 `application/binary`·S3·ECR latest에 반영하고 rollout 완료. 새 digest user `d17299b8`, product `97d8642c`, stress `240e5f97` 확인. 외부 health/user/product 200, stress 201, WAF 403/unknown 404 정상; 최초 CloudFront health 573ms는 warm 후 39~48ms. terraform validate 통과, plan은 종료된 bastion 재생성과 ALB SG drift 1 change가 있어 apply하지 않음. |
