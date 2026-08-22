@@ -347,6 +347,29 @@ if ($BaseExperiment) {
         if(-not(Test-ExternalSweepFinalAccepted $good)-or(Test-ExternalSweepFinalAccepted $perfOff)-or(Test-ExternalSweepFinalAccepted $costOff)){throw 'final gate acceptance regression'}
     }
 
+    # TEST 35: simultaneous shared apps can cross a node boundary even when each
+    # app independently fits one node. Prefer the smallest safe relative delta.
+    Assert-Test 'Shared-domain packing removes aggregate node' {
+        $best=Copy-Config $BaseConfig best
+        $best.user.requestCpu='70m';$best.user.hpaTarget=33;$best.user.maxReplicas=20
+        $best.product.requestCpu='70m';$best.product.hpaTarget=29;$best.product.maxReplicas=20
+        $best.stress.requestCpu='550m';$best.stress.hpaTarget=60;$best.stress.maxReplicas=12
+        $h=@{
+            user=[pscustomobject]@{Current=20;Desired=20;Max=20;CpuUtil=32;Target=33}
+            product=[pscustomobject]@{Current=7;Desired=7;Max=20;CpuUtil=27;Target=29}
+            stress=[pscustomobject]@{Current=3;Desired=3;Max=12;CpuUtil=40;Target=60}
+        }
+        $u=@{user=[pscustomobject]@{CpuTotalM=450};product=[pscustomobject]@{CpuTotalM=150};stress=[pscustomobject]@{CpuTotalM=650}}
+        $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=$u}
+        $cluster=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150;NodeAllocatablePods=110;DaemonSetPodCount=2;AvailableAppMemory=2200}
+        $oldCluster=$script:ExternalSweepClusterCapacity
+        try {
+            $script:ExternalSweepClusterCapacity=$cluster
+            $rec=Get-CostAwarePackingRecommendation $best @($sample) @()
+            if($rec.Type-ne'REQUEST_PACKING'-or$rec.App-ne'user'-or[int]$rec.To-ne50-or[int]$rec.NewTarget-ne46){throw "unexpected $($rec.Type) $($rec.App) $($rec.To)@$($rec.NewTarget)"}
+        } finally {$script:ExternalSweepClusterCapacity=$oldCluster}
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
     if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }
