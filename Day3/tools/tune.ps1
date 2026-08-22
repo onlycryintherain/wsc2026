@@ -6553,6 +6553,33 @@ function Wait-ExternalProfileLowLoadFloor([int]$NodeFloor) {
     }
 }
 
+function Wait-ExternalAlbTargetsReady([int]$TimeoutSeconds=240) {
+    $until=(Get-Date).AddSeconds($TimeoutSeconds);$lastDetail=''
+    do {
+        $allReady=$true;$details=[System.Collections.Generic.List[string]]::new()
+        try {
+            $bindings=((& kubectl -n $Namespace get targetgroupbinding -o json 2>$null)-join'')|ConvertFrom-Json
+            foreach($app in $apps){
+                $binding=@($bindings.items|Where-Object{$_.spec.serviceRef.name-eq$app}|Select-Object -First 1)
+                $slices=((& kubectl -n $Namespace get endpointslice -l "kubernetes.io/service-name=$app" -o json 2>$null)-join'')|ConvertFrom-Json
+                $expected=@($slices.items.endpoints|Where-Object{$_.conditions.ready-ne$false}|ForEach-Object{$_.addresses}|Sort-Object -Unique)
+                if(-not$binding.Count-or-not$expected.Count){$allReady=$false;$details.Add("$app endpoints/binding unavailable");continue}
+                $healthRaw=(& aws elbv2 describe-target-health --region $Region --target-group-arn ([string]$binding[0].spec.targetGroupARN) --output json 2>$null)-join''
+                if($LASTEXITCODE-ne0-or[string]::IsNullOrWhiteSpace($healthRaw)){$allReady=$false;$details.Add("$app target health unavailable");continue}
+                $health=$healthRaw|ConvertFrom-Json
+                $healthy=@($health.TargetHealthDescriptions|Where-Object{$_.TargetHealth.State-eq'healthy'}|ForEach-Object{[string]$_.Target.Id}|Sort-Object -Unique)
+                $expectedKey=$expected-join',';$healthyKey=$healthy-join','
+                if($expectedKey-ne$healthyKey){$allReady=$false;$details.Add("$app expected=[$expectedKey] healthy=[$healthyKey]")}
+            }
+        } catch {$allReady=$false;$details.Add($_.Exception.Message)}
+        if($allReady){Write-Host 'MEASUREMENT_ALB_READY: healthy targets exactly match current EndpointSlices' -ForegroundColor Green;return}
+        $lastDetail=$details-join'; '
+        Write-Host "MEASUREMENT_ALB_WAIT: $lastDetail" -ForegroundColor DarkGray
+        Start-Sleep -Seconds 5
+    }while((Get-Date)-lt$until)
+    throw "MEASUREMENT_ENV_INVALID: ALB target mismatch after ${TimeoutSeconds}s: $lastDetail"
+}
+
 function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) {
     if ([string]::IsNullOrWhiteSpace($RunEndpoint)) { throw 'EXTERNAL_LOAD_ENDPOINT_EMPTY' }
     return (@{template=$ProfileName;endpoint=$RunEndpoint.TrimEnd('/')} | ConvertTo-Json -Compress)
@@ -6637,6 +6664,10 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
     foreach ($profileName in $profiles) {
         # Every cost window, including a fresh BASE, starts from the same floor.
         Wait-ExternalProfileLowLoadFloor ([int]$script:ExternalSweepNodeFloor)
+        # A recently released Pod IP can be reused by another Service before ALB
+        # deregistration finishes. Starting traffic then routes product requests
+        # to a user Pod and produces false 404 availability loss.
+        Wait-ExternalAlbTargetsReady 240
         $profileIndex++
         Write-Host "`n===== EXTERNAL PROFILE: $CandidateName / $profileName =====" -ForegroundColor Cyan
         # The grading server keeps endpoint per run and in persisted injector
