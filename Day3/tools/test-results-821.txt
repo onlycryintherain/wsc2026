@@ -584,3 +584,20 @@ Endpoint: https://d3tum9m2cawjh9.cloudfront.net
     C:\Users\competitor\AppData\Local\Temp\wsi-low-binary-05-base-sequential-valid2-20260822-1537
     C:\Users\competitor\AppData\Local\Temp\wsi-low-binary-05-stress-pack550-20260822-1610
 ====================================================
+
+====================================================
+Rejected 40-Point Shared Packing Candidate
+Date: 2026-08-22 KST
+====================================================
+  Candidate run-1787387744: user request 70m->50m, HPA 33%->46%
+  (absolute trigger 23.1m preserved)
+  Result: 36.5/40, availability=12, performance=9.5, cost=11
+  avg EC2=2.47; user/product/stress perf=77.69/113.45/99.65%
+  Decision: REJECT. A default node was still required and user performance
+  regressed from the confirmed 90.63% to 77.69%.
+  Rollback: user 70m@33, stress 550m@60 restored through tune.ps1; rollouts OK.
+  Model correction: shared-domain packing now reserves all managed-node static
+  system requests via AvailableAppCPU, not only per-node DaemonSets.
+  Evidence:
+    C:\Users\competitor\AppData\Local\Temp\wsi-low-binary-05-shared-pack50-20260822-1730
+====================================================

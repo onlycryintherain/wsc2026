@@ -347,9 +347,10 @@ if ($BaseExperiment) {
         if(-not(Test-ExternalSweepFinalAccepted $good)-or(Test-ExternalSweepFinalAccepted $perfOff)-or(Test-ExternalSweepFinalAccepted $costOff)){throw 'final gate acceptance regression'}
     }
 
-    # TEST 35: simultaneous shared apps can cross a node boundary even when each
-    # app independently fits one node. Prefer the smallest safe relative delta.
-    Assert-Test 'Shared-domain packing removes aggregate node' {
+    # TEST 35: shared-domain packing must reserve managed-node static system
+    # workloads, not only DaemonSets. The otherwise tempting 70m->50m user
+    # candidate is unsafe when controllers reduce actual app capacity.
+    Assert-Test 'Shared-domain packing honors static system reserve' {
         $best=Copy-Config $BaseConfig best
         $best.user.requestCpu='70m';$best.user.hpaTarget=33;$best.user.maxReplicas=20
         $best.product.requestCpu='70m';$best.product.hpaTarget=29;$best.product.maxReplicas=20
@@ -361,12 +362,12 @@ if ($BaseExperiment) {
         }
         $u=@{user=[pscustomobject]@{CpuTotalM=450};product=[pscustomobject]@{CpuTotalM=150};stress=[pscustomobject]@{CpuTotalM=650}}
         $sample=[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=$u}
-        $cluster=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150;NodeAllocatablePods=110;DaemonSetPodCount=2;AvailableAppMemory=2200}
+        $cluster=[pscustomobject]@{NodeAllocatableCPU=1930;DaemonSetCPUPerNode=150;AvailableAppCPU=1300;NodeAllocatablePods=110;DaemonSetPodCount=2;AvailableAppMemory=2200}
         $oldCluster=$script:ExternalSweepClusterCapacity
         try {
             $script:ExternalSweepClusterCapacity=$cluster
             $rec=Get-CostAwarePackingRecommendation $best @($sample) @()
-            if($rec.Type-ne'REQUEST_PACKING'-or$rec.App-ne'user'-or[int]$rec.To-ne50-or[int]$rec.NewTarget-ne46){throw "unexpected $($rec.Type) $($rec.App) $($rec.To)@$($rec.NewTarget)"}
+            if($null-ne$rec){throw "unsafe shared packing returned $($rec.App) $($rec.To)@$($rec.NewTarget)"}
         } finally {$script:ExternalSweepClusterCapacity=$oldCluster}
     }
 

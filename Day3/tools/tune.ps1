@@ -6150,6 +6150,11 @@ function Get-CostAwarePackingRecommendation([hashtable]$BestConfig,$Samples,[str
         }
         foreach($domain in @($domains.Keys)){
             $members=@($domains[$domain]);if($members.Count-lt2){continue}
+            # Shared apps land on the managed node with controllers and other
+            # non-DaemonSet system Pods. Dedicated domains need only the
+            # per-node DaemonSet reserve. Never use the larger dedicated budget
+            # to justify packing shared applications.
+            $domainCpuCapacity=if($domain-eq'shared'-and[double]$cluster.AvailableAppCPU-gt0){[double]$cluster.AvailableAppCPU}else{$usableCpu}
             $rows=[System.Collections.Generic.List[object]]::new()
             foreach($sample in $Samples){
                 $demand=0.0;$memory=0.0;$pods=0;$complete=$true;$desiredByApp=@{}
@@ -6163,14 +6168,14 @@ function Get-CostAwarePackingRecommendation([hashtable]$BestConfig,$Samples,[str
                 if($complete){$rows.Add([pscustomobject]@{Demand=$demand;Memory=$memory;Pods=$pods;Desired=$desiredByApp;Sample=$sample})}
             }
             if(-not$rows.Count){continue}
-            $oldNodes=[int](($rows|ForEach-Object{[math]::Ceiling($_.Demand/$usableCpu)}|Measure-Object -Maximum).Maximum)
+            $oldNodes=[int](($rows|ForEach-Object{[math]::Ceiling($_.Demand/$domainCpuCapacity)}|Measure-Object -Maximum).Maximum)
             $newNodes=$oldNodes-1;if($newNodes-lt1){continue}
             foreach($app in $members){
                 $currentRequest=[double](Convert-CpuToM $BestConfig[$app].requestCpu);$allowed=[double]::PositiveInfinity
-                foreach($row in @($rows|Where-Object{[math]::Ceiling($_.Demand/$usableCpu)-ge$oldNodes})){
+                foreach($row in @($rows|Where-Object{[math]::Ceiling($_.Demand/$domainCpuCapacity)-ge$oldNodes})){
                     $desired=[int]$row.Desired[$app];if($desired-le0){continue}
                     $other=$row.Demand-($desired*$currentRequest)
-                    $allowed=[math]::Min($allowed,(($newNodes*$usableCpu)-$other)/$desired)
+                    $allowed=[math]::Min($allowed,(($newNodes*$domainCpuCapacity)-$other)/$desired)
                 }
                 $newRequest=[math]::Floor($allowed/$CpuRequestStep)*$CpuRequestStep
                 if($newRequest-le0-or$newRequest-ge$currentRequest){continue}
@@ -6181,13 +6186,13 @@ function Get-CostAwarePackingRecommendation([hashtable]$BestConfig,$Samples,[str
                 $peakMemory=[double](($rows.Memory|Measure-Object -Maximum).Maximum)
                 $peakPods=[int](($rows.Pods|Measure-Object -Maximum).Maximum)
                 $podCapacity=$newNodes*([int]$cluster.NodeAllocatablePods-[int]$cluster.DaemonSetPodCount)
-                if($peakNewDemand-gt$newNodes*$usableCpu-or$peakMemory-gt$newNodes*[double]$cluster.AvailableAppMemory-or$peakPods-gt$podCapacity){continue}
+                if($peakNewDemand-gt$newNodes*$domainCpuCapacity-or$peakMemory-gt$newNodes*[double]$cluster.AvailableAppMemory-or$peakPods-gt$podCapacity){continue}
                 $peakCpu=0.0
                 foreach($row in $rows){
                     $cpu=0.0;foreach($member in $members){$usage=$row.Sample.Usage[$member];if($usage-and$null-ne$usage.CpuTotalM){$cpu+=[double]$usage.CpuTotalM}}
                     $peakCpu=[math]::Max($peakCpu,$cpu)
                 }
-                if($peakCpu-gt$newNodes*$usableCpu*0.80){continue}
+                if($peakCpu-gt$newNodes*$domainCpuCapacity*0.80){continue}
                 $sig="REQUEST_PACKING_DOMAIN:${domain}:${app}:${newRequest}:$newTarget"
                 if($sig-notin$RejectedSignatures){$packing.Add([pscustomobject]@{Type='REQUEST_PACKING';Signature=$sig;App=$app;From=$currentRequest;To=$newRequest;OldTarget=[int]$BestConfig[$app].hpaTarget;NewTarget=$newTarget;NodeSaving=$oldNodes-$newNodes;RequestReductionRatio=($currentRequest-$newRequest)/$currentRequest;Reason="shared-domain packing $domain; request ${currentRequest}m->$newRequest m; peak scheduler ${peakNewDemand}m/${peakMemory}Mi/${peakPods}pods fits $newNodes node; observed CPU ${peakCpu}m <= 80%; preserve trigger ${absoluteTrigger}m"})}
             }
