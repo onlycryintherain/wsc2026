@@ -618,3 +618,23 @@ Date: 2026-08-22 KST
   Evidence:
     C:\Users\competitor\AppData\Local\Temp\wsi-t3-best39-05-2h-standard-20260822-1941\observer.log
 ====================================================
+
+====================================================
+t3.medium / Original Binary / 0.5x 2h-standard REJECT
+Date: 2026-08-22 KST
+====================================================
+  Run run-1787402745 stopped at 4358s during down1.
+  Score at stop: 21.5/40; performance=5.5, cost=0, avg EC2=4.26
+  user/product/stress perf=23.96/97.52/78.94%
+  Peak Ready=7; spike1 Pending peak=17; dropped=0
+  user Max20 and stress Max12 ceilings were observed. This binary/config pair is
+  rejected. Restored the verified low binaries and 39-point config.
+
+  tune.ps1 improvement:
+    after ten minutes, perf<90 plus three consecutive HPA ceiling samples with
+    CPU above target becomes partial measured evidence. The long run stops and
+    the outer immutable lifecycle generates the next HPA Max one-delta instead
+    of waiting through the remaining two-hour failure window.
+  Evidence:
+    C:\Users\competitor\AppData\Local\Temp\wsi-t3-original-05-2h-standard-20260822-2148\observer.log
+====================================================

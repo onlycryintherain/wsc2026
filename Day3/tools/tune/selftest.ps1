@@ -371,6 +371,20 @@ if ($BaseExperiment) {
         } finally {$script:ExternalSweepClusterCapacity=$oldCluster}
     }
 
+    # TEST 36: long external profiles convert a sustained performance/HPA
+    # ceiling into a measured one-delta signal instead of wasting two hours.
+    Assert-Test 'Online ceiling recovery detects sustained bottleneck' {
+        $h=@{}
+        foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=20;CpuUtil=5;Target=30}}
+        $h.user=[pscustomobject]@{Current=20;Desired=20;Max=20;CpuUtil=80;Target=33}
+        $samples=@(1..3|ForEach-Object{[pscustomobject]@{Hpa=$h}})
+        $score=[pscustomobject]@{logged_minutes=10;user_perf=25;product_perf=100;stress_perf=80}
+        $signal=Get-ExternalOnlineRecoverySignal $score $samples
+        if($null-eq$signal-or$signal.App-ne'user'){throw "missing user recovery signal"}
+        $score.logged_minutes=9
+        if($null-ne(Get-ExternalOnlineRecoverySignal $score $samples)){throw 'recovery fired before evidence window'}
+    }
+
     Write-Host "`nSelf-tests: $testPassed/$testTotal passed" -ForegroundColor $(if($testPassed -eq $testTotal){'Green'}else{'Red'})
     if ($testPassed -ne $testTotal) { throw "SELF_TEST_FAILED: $testPassed/$testTotal" }
 }

@@ -6581,6 +6581,21 @@ function Set-ExternalLoadMultiplierAfterStart([double]$Multiplier) {
     Write-Host "EXTERNAL_LOAD_MULTIPLIER_READY: multiplier=$Multiplier keys=$(@('injection_rate_multiplier')+$scopedKeys-join',')" -ForegroundColor Green
 }
 
+function Get-ExternalOnlineRecoverySignal($Score,$Samples) {
+    if($null-eq$Score-or[int](Get-OptionalPropertyValue $Score 'logged_minutes' 0)-lt10){return $null}
+    $signals=[System.Collections.Generic.List[object]]::new()
+    foreach($app in $apps){
+        $perf=Get-OptionalPropertyValue $Score "${app}_perf" $null
+        if($null-eq$perf-or[double]$perf-ge90.0){continue}
+        $recent=@($Samples|Select-Object -Last 3)
+        if($recent.Count-lt3){continue}
+        $pinned=@($recent|Where-Object{$m=$_.Hpa[$app];$m-and[int]$m.Desired-ge[int]$m.Max-and$null-ne$m.CpuUtil-and[double]$m.CpuUtil-gt[double]$m.Target})
+        if($pinned.Count-eq$recent.Count){$signals.Add([pscustomobject]@{App=$app;Performance=[double]$perf;Reason="three sustained HPA ceiling samples with CPU above target"})}
+    }
+    if($signals.Count){return @($signals|Sort-Object Performance,App)[0]}
+    return $null
+}
+
 function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[switch]$FreshVerification) {
     $profiles=@($SweepProfiles)
     $results=[System.Collections.Generic.List[object]]::new()
@@ -6611,6 +6626,17 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
             }
             Write-Host ("{0}: elapsed={1}s total={2} perf={3} nodes={4}" -f $profileName,$status.elapsed_sec,$score.total40,$score.performance.score,$score.avg_ec2) -ForegroundColor DarkGray
             if ([string]$status.run_id -ne $runId) { throw "PROFILE_RUN_CHANGED: $profileName" }
+            # A two-hour profile must not spend the remaining window on a proven
+            # replica ceiling. Preserve the partial run as measured evidence so
+            # the outer one-delta lifecycle can grow the worst app Max and retry.
+            $onlineSignal=Get-ExternalOnlineRecoverySignal $score @($samples)
+            if($onlineSignal -and -not [bool]$FreshVerification){
+                try{Invoke-ExternalLoadApi '/api/load/stop' 'Post' '{}'|Out-Null}catch{}
+                try{$status=Invoke-ExternalLoadApi '/api/load/status'}catch{}
+                $results.Add([pscustomobject]@{Profile=$profileName;RunId=$runId;Score=$score;Status=$status;Restarts=$restarts;Samples=@($samples);Fresh=$false;OnlineRecoverySignal=$onlineSignal})
+                Write-Warning "ONLINE_CEILING_RECOVERY: profile=$profileName elapsed=$($status.elapsed_sec)s app=$($onlineSignal.App) perf=$($onlineSignal.Performance)% — stop evidence and generate one-delta"
+                $completed=$true;break
+            }
             if (-not [bool]$status.running) {
                 if ([int]$status.elapsed_sec -lt [math]::Max(120,$expected-60) -and $restarts -lt 1) {
                     $run=Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/start") -Body $body -ContentType 'application/json' -TimeoutSec 20
