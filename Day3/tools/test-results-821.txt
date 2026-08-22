@@ -553,4 +553,8 @@ CloudFront: https://do876irwkqghf.cloudfront.net
     best run to 7 here. A transient skills-server connection failure stopped
     the tuner monitor around minute 5, but the independent injector completed
     all 1799s and was verified through /api/runs/score and Kubernetes telemetry.
+
+  Decision: REJECT Max40. It scored below the reproducible Max32 reference and
+  reduced cost score. Restored immutable fingerprint with user Max32 through
+  tune.ps1 after traffic ended; product Max20 and stress Max12 unchanged.
 ====================================================
