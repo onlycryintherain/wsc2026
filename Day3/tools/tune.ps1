@@ -6219,8 +6219,17 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
     # The external engine's dropped counter is the reliable saturation signal.
     $generatorLimited=@($BestEvaluation.Results | Where-Object { [double](Get-OptionalPropertyValue $_.Status 'dropped' 0) -gt 0 })
     if ($generatorLimited.Count) { return [pscustomobject]@{Type='GENERATOR_LIMIT';Signature='GENERATOR_LIMIT';App=$null;Reason='external generator reported dropped requests'} }
-    if (@($samples | Where-Object { [int]$_.CniErrors -gt 0 }).Count) {
-        return [pscustomobject]@{Type='CNI_IP_CAPACITY';Signature='CNI_IP_CAPACITY';App=$null;Reason='FailedCreatePodSandBox; application capacity must not be increased'}
+    $cniSamples=@($samples|Where-Object{[int]$_.CniErrors-gt0})
+    if($cniSamples.Count){
+        # FailedCreatePodSandBox can occur once while a brand-new aws-node warms
+        # its first delegated prefix. The event remains in Kubernetes after every
+        # affected Pod is Running, so historical count alone is not capacity loss.
+        # Stop only while the latest sample still has unresolved network startup.
+        $latest=$samples[-1]
+        $unresolved=@($latest.Pending|Where-Object{$_.Reason-match'FailedCreatePodSandBox|failed to assign an IP address|ContainerCreating|ContainersNotReady'})
+        if([int]$latest.CniErrors-gt0-and$unresolved.Count){
+            return [pscustomobject]@{Type='CNI_IP_CAPACITY';Signature='CNI_IP_CAPACITY';App=$null;Reason="FailedCreatePodSandBox remains unresolved in latest sample ($($unresolved.Count) Pods)"}
+        }
     }
     # A short Pending window while Karpenter launches a node is expected elastic
     # behavior, not proof of exhausted capacity. Stop mutation only when Pending

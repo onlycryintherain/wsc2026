@@ -257,12 +257,16 @@ if ($BaseExperiment) {
             $h=@{};foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=[int]$best[$app].maxReplicas;CpuUtil=5;Target=[int]$best[$app].hpaTarget}}
             $h.user=[pscustomobject]@{Current=[int]$best.user.maxReplicas;Desired=[int]$best.user.maxReplicas;Max=[int]$best.user.maxReplicas;CpuUtil=100;Target=[int]$best.user.hpaTarget}
             $pending=if($i-lt2){@([pscustomobject]@{App='user';Reason='Insufficient cpu'})}else{@()}
-            $samples+=[pscustomobject]@{CniErrors=0;Pending=$pending;Hpa=$h;Usage=@{}}
+            $cni=if($i-ge18){9}else{0}
+            $samples+=[pscustomobject]@{CniErrors=$cni;Pending=$pending;Hpa=$h;Usage=@{}}
         }
         $result=[pscustomobject]@{Score=[pscustomobject]@{user_perf=25;product_perf=100;stress_perf=85};Status=[pscustomobject]@{dropped=0};Samples=$samples}
         $evaluation=[pscustomobject]@{AllPerformanceGuards=$false;Results=@($result)}
         $rec=Get-DynamicSweepRecommendation $best $evaluation @()
-        if($rec.Type-ne'HPA_CEILING'-or$rec.App-ne'user'){throw "transient Pending incorrectly classified as $($rec.Type)"}
+        if($rec.Type-ne'HPA_CEILING'-or$rec.App-ne'user'){throw "recovered transient Pending/CNI incorrectly classified as $($rec.Type)"}
+        $samples[-1].Pending=@([pscustomobject]@{App='user';Reason='ContainersNotReady; ContainerCreating'})
+        $rec=Get-DynamicSweepRecommendation $best $evaluation @()
+        if($rec.Type-ne'CNI_IP_CAPACITY'){throw "unresolved CNI incorrectly classified as $($rec.Type)"}
     }
 
     # TEST 27: cost gate regression cannot be exchanged for performance.
