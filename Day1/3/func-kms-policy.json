@@ -1,0 +1,44 @@
+{
+  "Version": "2012-10-17",
+  "Id": "wsc2026-function-kms-policy",
+  "Statement": [
+    {
+      "Sid": "AllowKeyManagement",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::003150130236:user/admin"
+      },
+      "Action": [
+        "kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*",
+        "kms:Put*", "kms:Update*", "kms:Revoke*", "kms:Disable*",
+        "kms:Get*", "kms:Delete*", "kms:TagResource", "kms:UntagResource",
+        "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion",
+        "kms:GenerateDataKey", "kms:Encrypt", "kms:Decrypt"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowLambdaRole",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::003150130236:role/wsc2026-book-function-role"
+      },
+      "Action": [
+        "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowLambdaService",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Action": [
+        "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*",
+        "kms:GenerateDataKey*", "kms:DescribeKey", "kms:CreateGrant"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

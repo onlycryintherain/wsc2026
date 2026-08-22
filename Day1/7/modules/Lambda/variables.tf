@@ -3,7 +3,8 @@ variable "function_name" {
 }
 
 variable "kms_key_arn" {
-  type = string
+  description = "Platform KMS key ARN for Lambda code and logs"
+  type        = string
 }
 
 variable "table_name" {

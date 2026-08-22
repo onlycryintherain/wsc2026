@@ -62,3 +62,8 @@ variable "flow_log_name" {
   description = "Flow log name"
   type        = string
 }
+
+variable "flow_log_kms_key_arn" {
+  description = "KMS key ARN for the VPC flow log group"
+  type        = string
+}

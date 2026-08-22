@@ -32,6 +32,7 @@ module "VPC" {
   source               = "./modules/VPC"
   vpc_name             = "unicorn-vpc"
   vpc_cidr             = "10.97.0.0/16"
+  flow_log_kms_key_arn = module.KMS.platform_key_arn
   public_subnets_cidr  = ["10.97.0.0/24", "10.97.1.0/24", "10.97.2.0/24"]
   private_subnets_cidr = ["10.97.10.0/24", "10.97.11.0/24", "10.97.12.0/24"]
   availability_zones   = ["ap-northeast-2a", "ap-northeast-2b", "ap-northeast-2c"]
@@ -401,11 +402,9 @@ EOF
   depends_on = [aws_s3_object.manifests, aws_s3_object.book_binary, aws_s3_object.dockerfile]
 }
 
-resource "aws_eip" "bastion" {
-  instance = aws_instance.bastion.id
-  domain   = "vpc"
-  tags     = { Name = "unicorn-bastion-eip" }
-}
+# Bastion receives an auto-assigned public IP from the public subnet.
+# A separate Elastic IP is intentionally not allocated because the account
+# has reached its regional EIP quota.
 
 
 

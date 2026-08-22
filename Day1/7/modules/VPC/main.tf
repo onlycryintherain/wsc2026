@@ -123,7 +123,8 @@ resource "aws_flow_log" "unicorn" {
 
 # CloudWatch Log Group for Flow Log
 resource "aws_cloudwatch_log_group" "flow_log" {
-  name = "/aws/vpc-flow-log/${var.vpc_name}"
+  name       = "/aws/vpc-flow-log/${var.vpc_name}"
+  kms_key_id = var.flow_log_kms_key_arn
 
   tags = {
     Name = "${var.flow_log_name}-group"

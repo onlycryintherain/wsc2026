@@ -1,6 +1,6 @@
 #!/bin/bash
 set -x
-export NUMBER=${NUMBER:-103}
+export NUMBER=${number:-${NUMBER:-103}}
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 REGION=ap-northeast-2
 WORKDIR=$(pwd)

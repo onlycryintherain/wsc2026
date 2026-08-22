@@ -28,5 +28,5 @@ output "platform_key_arn" {
 
 
 output "bastion_public_ip" {
-  value = aws_eip.bastion.public_ip
+  value = aws_instance.bastion.public_ip
 }

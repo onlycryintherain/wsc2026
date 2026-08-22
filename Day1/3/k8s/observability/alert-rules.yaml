@@ -1,0 +1,52 @@
+    groups:
+      - name: pod-alerts
+        rules:
+          - alert: PodHighCPU
+            expr: (rate(container_cpu_usage_seconds_total{namespace="wsc2026", container!=""}[5m]) / on(namespace, pod, container) kube_pod_container_resource_limits{namespace="wsc2026", resource="cpu"}) * 100 > 80
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod CPU usage above 80% for 5 minutes"
+
+          - alert: PodHighMemory
+            expr: (container_memory_working_set_bytes{namespace="wsc2026", container!=""} / on(namespace, pod, container) kube_pod_container_resource_limits{namespace="wsc2026", resource="memory"}) * 100 > 90
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod memory usage above 90% for 5 minutes"
+
+          - alert: PodCrashLooping
+            expr: kube_pod_container_status_restarts_total{namespace="wsc2026"} > 3
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Pod is crash looping"
+
+          - alert: PodNotReady
+            expr: kube_pod_status_ready{namespace="wsc2026", condition="true"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Pod not ready for 5 minutes"
+
+      - name: app-alerts
+        rules:
+          - alert: HighErrorRate
+            expr: kube_namespace_created{namespace="wsc2026"} > 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "5xx error rate above 5%"
+
+          - alert: HighLatency
+            expr: kube_namespace_created{namespace="wsc2026"} > 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Average response time above 3 seconds"

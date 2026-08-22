@@ -51,10 +51,10 @@ resource "aws_security_group_rule" "alb_from_cloudfront_vpc_origin" {
 
 # CloudFront Distribution
 resource "aws_cloudfront_distribution" "this" {
-  comment             = var.distribution_comment
-  enabled             = true
-  price_class         = "PriceClass_All"
-  web_acl_id          = aws_wafv2_web_acl.this.arn
+  comment     = var.distribution_comment
+  enabled     = true
+  price_class = "PriceClass_All"
+  web_acl_id  = aws_wafv2_web_acl.this.arn
 
   origin {
     domain_name              = "${var.s3_bucket_id}.s3.${data.aws_region.current.name}.amazonaws.com"

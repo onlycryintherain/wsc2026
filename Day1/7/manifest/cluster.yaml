@@ -52,6 +52,7 @@ managedNodeGroups:
     tags:
       Name: unicorn-k8snode-app-node
     volumeEncrypted: true
+    volumeKmsKeyID: KEY_ARN
     volumeSize: 20
     preBootstrapCommands:
       - "timedatectl set-timezone Asia/Seoul"
@@ -68,6 +69,7 @@ managedNodeGroups:
     tags:
       Name: unicorn-k8snode-addon-node
     volumeEncrypted: true
+    volumeKmsKeyID: KEY_ARN
     volumeSize: 20
     preBootstrapCommands:
       - "timedatectl set-timezone Asia/Seoul"

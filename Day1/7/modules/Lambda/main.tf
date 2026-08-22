@@ -7,8 +7,8 @@ resource "aws_iam_role" "lambda" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
       Principal = { Service = "lambda.amazonaws.com" }
     }]
   })
@@ -28,7 +28,7 @@ resource "aws_iam_role_policy" "lambda" {
       {
         Effect   = "Allow"
         Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
-        Resource = ["*"]
+        Resource = [var.kms_key_arn]
       },
       {
         Effect   = "Allow"
@@ -46,7 +46,8 @@ resource "aws_iam_role_policy" "lambda" {
 
 # Log Group
 resource "aws_cloudwatch_log_group" "lambda" {
-  name = var.log_group_name
+  name       = var.log_group_name
+  kms_key_id = var.kms_key_arn
 }
 
 # Security Group

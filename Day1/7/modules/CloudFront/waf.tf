@@ -138,7 +138,7 @@ resource "aws_wafv2_web_acl" "this" {
     action {
       block {
         custom_response {
-          response_code = 403
+          response_code            = 403
           custom_response_body_key = "blocked"
         }
       }
@@ -146,9 +146,9 @@ resource "aws_wafv2_web_acl" "this" {
 
     statement {
       rate_based_statement {
-        limit              = 50
+        limit                 = 50
         evaluation_window_sec = 60
-        aggregate_key_type = "IP"
+        aggregate_key_type    = "IP"
       }
     }
 
@@ -180,6 +180,7 @@ resource "aws_wafv2_web_acl" "this" {
 resource "aws_cloudwatch_log_group" "waf" {
   provider   = aws.us_east_1
   name       = "aws-waf-logs-unicorn"
+  kms_key_id = var.kms_key_arn
 
   tags = {
     Name = "aws-waf-logs-unicorn"
