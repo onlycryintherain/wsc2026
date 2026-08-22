@@ -6725,7 +6725,7 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
     # the preceding measured BEST so a noisy candidate can never be left live.
     $confirmedFallbackConfig=Copy-Config $bestConfig 'CONFIRMED_FALLBACK'
     $confirmedFallbackEvaluation=$best
-    $lastKeptRecommendation=$null
+    $lastKeptRecommendation=$null;$infrastructureStop=$null
     $history=[System.Collections.Generic.List[object]]::new();$rejected=[System.Collections.Generic.List[string]]::new()
     foreach($signature in @($RejectedSweepSignatures-split',')){if(-not[string]::IsNullOrWhiteSpace($signature)){$rejected.Add($signature.Trim())}}
     for ($i=1; $i -le $MaxProfileCandidates; $i++) {
@@ -6736,6 +6736,7 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
             $record=[pscustomobject]@{Timestamp=(Get-Date -Format o);StopReason=$rec.Type;Recommendation=$rec;Best=$best}
             New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
             $record | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $OutputDir 'profile-sweep-infra-stop.json') -Encoding UTF8
+            $infrastructureStop=$record
             Write-Warning "INFRASTRUCTURE_STOP: $($rec.Type) — no application value changed"; break
         }
         $candidate=New-DynamicSweepCandidate $bestConfig $rec "CANDIDATE_$i"
@@ -6753,6 +6754,14 @@ function Invoke-ProfileSweepOptimization([hashtable]$MeasuredBase,$InitialEvalua
             $rejected.Add($rec.Signature)
             if (-not $NoApply) { $script:hardDeadline=(Get-Date).AddMinutes(15); Apply-CandidateSafely $bestConfig Hard | Out-Null }
         }
+    }
+    if($infrastructureStop){
+        # Infrastructure-invalid evidence cannot justify an application delta or
+        # a FINAL_FRESH rerun of the identical configuration. Return immediately
+        # so the operator can repair capacity and resume from immutable evidence.
+        $lifecycle=[pscustomobject]@{GeneratedAt=(Get-Date -Format o);SelectionObjective='stopped before application mutation because infrastructure evidence is invalid';TargetScore=$ProfileTargetScore;Accepted=$false;RolledBack=$false;StopReason=$infrastructureStop.StopReason;BestConfig=$bestConfig;SelectedMeasured=$best;FinalFresh=$null;RejectedSignatures=@($rejected);History=@($history)}
+        $lifecycle|ConvertTo-Json -Depth 60|Set-Content -LiteralPath (Join-Path $OutputDir 'profile-sweep-lifecycle.json') -Encoding UTF8
+        return $lifecycle
     }
     if (-not $NoApply) { $script:hardDeadline=(Get-Date).AddMinutes(15); Apply-CandidateSafely $bestConfig Hard | Out-Null }
     # Final validation is always three new load runs, never cached re-scoring.

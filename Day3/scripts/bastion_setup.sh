@@ -300,8 +300,37 @@ STRESS_NODEPOOL
 kubectl -n kube-system patch daemonset aws-node --type=strategic -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"wsi2026.io/app-capacity","operator":"Exists","effect":"NoSchedule"},{"key":"wsi2026.io/app-capacity","operator":"Exists","effect":"NoExecute"},{"key":"wsi2026.io/stress","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/network-unavailable","operator":"Exists","effect":"NoSchedule"},{"key":"CriticalAddonsOnly","operator":"Exists"}]}}}}' || true
 kubectl -n kube-system patch daemonset kube-proxy --type=strategic -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"wsi2026.io/app-capacity","operator":"Exists","effect":"NoSchedule"},{"key":"wsi2026.io/app-capacity","operator":"Exists","effect":"NoExecute"},{"key":"wsi2026.io/stress","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoSchedule"},{"key":"CriticalAddonsOnly","operator":"Exists"}]}}}}' || true
 
-# prefix delegation: 노드당 Pod 상한을 풀어 t3.medium 슬롯 문제 해소
-kubectl -n kube-system set env ds/aws-node ENABLE_PREFIX_DELEGATION=true WARM_PREFIX_TARGET=1 || true
+# prefix delegation + custom networking: t3.medium의 Pod 슬롯을 확보하고 Pod IP는
+# 넓은 /22 전용 subnet에서 할당한다. Public /24의 조각난 /28 prefix 때문에 spike
+# 순간 FailedCreatePodSandBox가 발생하지 않도록 AZ별 ENIConfig를 강제한다.
+POD_SUBNET_A=$(aws ec2 describe-subnets --region "$REGION" --filters "Name=vpc-id,Values=${vpc_id}" "Name=tag:Name,Values=${cluster_name}-pod-capacity-1" --query 'Subnets[0].SubnetId' --output text)
+POD_SUBNET_B=$(aws ec2 describe-subnets --region "$REGION" --filters "Name=vpc-id,Values=${vpc_id}" "Name=tag:Name,Values=${cluster_name}-pod-capacity-2" --query 'Subnets[0].SubnetId' --output text)
+NODE_SG=$(aws ec2 describe-security-groups --region "$REGION" --filters "Name=vpc-id,Values=${vpc_id}" "Name=group-name,Values=${cluster_name}-node-sg" --query 'SecurityGroups[0].GroupId' --output text)
+if [[ "$POD_SUBNET_A" != "None" && "$POD_SUBNET_B" != "None" && "$NODE_SG" != "None" ]]; then
+cat <<ENICONFIG | kubectl apply -f -
+apiVersion: crd.k8s.amazonaws.com/v1alpha1
+kind: ENIConfig
+metadata:
+  name: ${region}a
+spec:
+  subnet: $POD_SUBNET_A
+  securityGroups:
+    - $NODE_SG
+---
+apiVersion: crd.k8s.amazonaws.com/v1alpha1
+kind: ENIConfig
+metadata:
+  name: ${region}b
+spec:
+  subnet: $POD_SUBNET_B
+  securityGroups:
+    - $NODE_SG
+ENICONFIG
+  kubectl -n kube-system set env ds/aws-node ENABLE_PREFIX_DELEGATION=true WARM_PREFIX_TARGET=1 AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG=true ENI_CONFIG_LABEL_DEF=topology.kubernetes.io/zone || true
+else
+  echo "CNI custom networking discovery failed: subnetA=$POD_SUBNET_A subnetB=$POD_SUBNET_B nodeSG=$NODE_SG" >&2
+  exit 1
+fi
 
 kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
 cat <<K8SSA | kubectl apply -f -

@@ -638,3 +638,22 @@ Date: 2026-08-22 KST
   Evidence:
     C:\Users\competitor\AppData\Local\Temp\wsi-t3-original-05-2h-standard-20260822-2148\observer.log
 ====================================================
+
+====================================================
+t3.medium / Original Binary / user Max25 target28 CNI-invalid
+Date: 2026-08-23 KST
+====================================================
+  Run run-1787410997 stopped online at 762s during spike1.
+  Score: 33.5/40; performance=6.5, cost=11, avg EC2=2.08
+  user/product/stress perf=51.05/91.70/77.61%; dropped=0
+  user reached 25/25, but six FailedCreatePodSandBox events made the
+  application comparison invalid. A control-flow defect then started identical
+  FINAL_FRESH run-1787412009; it was stopped and FINAL_FRESH-after-infra-stop
+  was removed.
+
+  Infrastructure repair:
+    enabled AZ ENIConfig custom networking on pod-capacity 10.0.4.0/22 and
+    10.0.8.0/22, retaining prefix delegation. Probe Pod received 10.0.6.192.
+  Evidence:
+    C:\Users\competitor\AppData\Local\Temp\wsi-t3-original-online-target28-opt3-20260823-0005
+====================================================

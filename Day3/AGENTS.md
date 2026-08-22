@@ -188,6 +188,7 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-23 | pending | 기존 binary user Max25·target28 `run-1787410997`은 spike1 762s에서 online stop: 33.5/40, perf6.5, cost11, avg2.08, user/product/stress 51.05/91.70/77.61%, user25/25. shared 신규 노드에서 FailedCreatePodSandBox 6건으로 측정 무효. VPC CNI custom networking을 AZ별 pod-capacity /22 ENIConfig로 강제하고 probe Pod `10.0.6.192` 확인. infra stop 뒤 동일 설정 FINAL_FRESH를 실행하던 제어 흐름을 즉시 return으로 수정. S3 재현 script targeted apply, self-test36/36·terraform validate 통과. |
 | 2026-08-22 | pending | cooldown PDB relax 함수가 `Invoke-Kubectl` 출력을 saved hashtable과 함께 반환해 restore 값이 배열로 오염되고 user/product PDB가 0으로 남는 버그 발견. active baseline을 중지하고 PDB 1 즉시 복구, relax/restore kubectl 출력을 `Out-Null` 처리. 구버전 tuner 종료 후 self-test 36/36·terraform validate 통과. |
 | 2026-08-22 | pending | profile 시작 지연 개선: no-traffic cooldown에서 Ready 부하가 없고 HPA가 60초 이상 잔류하면 노드 수와 무관하게 `tune.ps1`이 scaleDown을 임시 0s/100%로 가속하고 min 도달 즉시 표준 300s/Min 정책을 복구. 이전 6~10분 stair-step 대기와 cooldown timeout 오염을 제거. user25 near-ceiling 증거로 다음 seed user target33→28 적용. parse/self-test 36/36·terraform validate 통과. |
 | 2026-08-22 | pending | 기존 binary 재튜닝 seed user Max25 `run-1787408633`은 spike1에서 user24/25 near-ceiling, perf70.42%, 총점34까지 확인 후 1435s에 근거 종료. exact max/CPU>target만 요구해 online 전환하지 못한 조건을 보강하여, perf<75 + 최근3 sample desired≥90% Max + CPU≥90% target도 recovery signal로 인정하고 `HPA_TARGET_RECOVERY` user33→28 one-delta를 생성하도록 개선. 기존 binary 재배포 상태 유지, self-test 36/36·terraform validate 통과. |
