@@ -601,3 +601,20 @@ Date: 2026-08-22 KST
   Evidence:
     C:\Users\competitor\AppData\Local\Temp\wsi-low-binary-05-shared-pack50-20260822-1730
 ====================================================
+
+====================================================
+t3.medium / Low Binary / Official 0.5x 2h-standard
+Date: 2026-08-22 KST
+====================================================
+  Run: run-1787395279 (7199s, completed)
+  Score: 39/40 (availability=12, performance=12, cost=11)
+  user/product/stress perf=92.47/112.42/98.78%
+  user/product/stress availability=99.94/100/99.96%
+  Average EC2=2.23; peak Ready=3; dropped=0; Pending=0
+  Baseline/spike1/valley held 40. Spike2 recovered 38->39 and the cluster
+  returned from three to two t3.medium nodes during down1.
+  The tuner observer exited early with PROFILE_RUN_CHANGED, but the independent
+  injector completed 7199s and observer/API telemetry verified the full run.
+  Evidence:
+    C:\Users\competitor\AppData\Local\Temp\wsi-t3-best39-05-2h-standard-20260822-1941\observer.log
+====================================================
