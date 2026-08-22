@@ -6495,7 +6495,7 @@ function Set-CooldownPdbRelaxation {
         $value=$pdb[0].spec.minAvailable
         if($null-eq$value-or($value-is[string]-and$value-match'%$')-or[int]$value-le0){continue}
         $saved[$app]=[int]$value
-        Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p','{"spec":{"minAvailable":0}}')
+        Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p','{"spec":{"minAvailable":0}}')|Out-Null
         Write-Host "PROFILE_COOLDOWN_PDB_RELAX: $app $value->0" -ForegroundColor DarkGray
     }
     return $saved
@@ -6504,7 +6504,7 @@ function Set-CooldownPdbRelaxation {
 function Restore-CooldownPdbRelaxation($Saved) {
     foreach($app in @($Saved.Keys)){
         $patch=@{spec=@{minAvailable=[int]$Saved[$app]}}|ConvertTo-Json -Compress
-        Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p',$patch)
+        Invoke-Kubectl @('-n',$Namespace,'patch','pdb',$app,'--type=merge','-p',$patch)|Out-Null
         Write-Host "PROFILE_COOLDOWN_PDB_RESTORE: $app ->$($Saved[$app])" -ForegroundColor DarkGray
     }
 }
