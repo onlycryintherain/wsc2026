@@ -6237,10 +6237,14 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
     $pendingSamples=@($samples | Where-Object { @($_.Pending).Count -gt 0 })
     $sustainedPendingThreshold=[math]::Max(3,[math]::Ceiling($samples.Count*0.10))
     if ($pendingSamples.Count -ge $sustainedPendingThreshold) {
-        $pending=@($pendingSamples | ForEach-Object { @($_.Pending) })
-        if (@($pending | Where-Object { $_.Reason -match 'Insufficient cpu' }).Count) { return [pscustomobject]@{Type='NODE_CPU_CAPACITY';Signature='NODE_CPU_CAPACITY';App=$null;Reason="sustained Pending Insufficient cpu ($($pendingSamples.Count)/$($samples.Count) samples)"} }
-        if (@($pending | Where-Object { $_.Reason -match 'Insufficient memory' }).Count) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Signature='NODE_MEMORY_CAPACITY';App=$null;Reason="sustained Pending Insufficient memory ($($pendingSamples.Count)/$($samples.Count) samples)"} }
-        return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Signature='SCHEDULER_PLACEMENT';App=$null;Reason="sustained Pending ($($pendingSamples.Count)/$($samples.Count) samples): $(@($pending.Reason) -join '; ')"}
+        $firstPending=$pendingSamples[0];$lastPending=$pendingSamples[-1]
+        $elasticRecovery=[int](Get-OptionalPropertyValue $lastPending 'ReadyNodes' 0)-gt[int](Get-OptionalPropertyValue $firstPending 'ReadyNodes' 0)-and@($lastPending.Pending).Count-lt@($firstPending.Pending).Count
+        if(-not$elasticRecovery){
+            $pending=@($pendingSamples | ForEach-Object { @($_.Pending) })
+            if (@($pending | Where-Object { $_.Reason -match 'Insufficient cpu' }).Count) { return [pscustomobject]@{Type='NODE_CPU_CAPACITY';Signature='NODE_CPU_CAPACITY';App=$null;Reason="sustained Pending Insufficient cpu ($($pendingSamples.Count)/$($samples.Count) samples)"} }
+            if (@($pending | Where-Object { $_.Reason -match 'Insufficient memory' }).Count) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Signature='NODE_MEMORY_CAPACITY';App=$null;Reason="sustained Pending Insufficient memory ($($pendingSamples.Count)/$($samples.Count) samples)"} }
+            return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Signature='SCHEDULER_PLACEMENT';App=$null;Reason="sustained Pending ($($pendingSamples.Count)/$($samples.Count) samples): $(@($pending.Reason) -join '; ')"}
+        }
     }
 
     # When cost is below its gate, attempt a measured scheduler-density boundary
