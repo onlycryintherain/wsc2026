@@ -6520,7 +6520,7 @@ function Wait-ExternalProfileLowLoadFloor([int]$NodeFloor) {
             $atMin=@($hpas.items | Where-Object { [int]$_.status.currentReplicas -le [int]$_.spec.minReplicas -and [int]$_.status.desiredReplicas -le [int]$_.spec.minReplicas }).Count -eq @($hpas.items).Count
             if ($ready -le $NodeFloor -and $atMin) { Write-Host "PROFILE_COOLDOWN_READY: nodes=$ready floor=$NodeFloor" -ForegroundColor Green; return }
             if($atMin-and$ready-gt$NodeFloor-and$null-eq$relaxed){$relaxed=Set-CooldownPdbRelaxation}
-            if(-not$atMin-and$ready-le$NodeFloor-and-not$hpaAccelerated-and((Get-Date)-$started).TotalSeconds-ge60){
+            if(-not$atMin-and-not$hpaAccelerated-and((Get-Date)-$started).TotalSeconds-ge60){
                 $loadRunning=$false
                 try{$loadRunning=[bool](Get-OptionalPropertyValue (Invoke-ExternalLoadApi '/api/load/status') 'running' $false)}catch{}
                 if(-not$loadRunning){
