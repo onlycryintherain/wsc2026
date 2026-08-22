@@ -519,3 +519,38 @@ Date: 2026-08-22 KST
   requested performance gate stayed enabled, so do not start another mutation
   cycle from this 0.25x diagnostic.
 ====================================================
+
+====================================================
+Recreated Infrastructure / Endpoint-Synchronized Max40 Retry
+Date: 2026-08-22 KST
+CloudFront: https://do876irwkqghf.cloudfront.net
+====================================================
+  Invalid warm-up run: run-1787356534
+    Score 0 because load-server persisted endpoint still referenced deleted
+    d3tmuvdlyjyjyk.cloudfront.net. New CloudFront/API/ALB/RDS were healthy and
+    application access logs received no grading traffic. Stopped after 175s.
+
+  tune.ps1 correction:
+    Before every profile, PUT current discovered CloudFront endpoint to
+    /api/config/meta, GET-verify the persisted value, and also include endpoint
+    in /api/load/start. Commit: ffe7dc2.
+
+  Valid fresh run: run-1787356819
+    Config: user Max40, product Max20, stress Max12; worker ceiling 8
+    Strength: 0.25x; profile: sequential
+    Score: 32.5/40 (availability 12, performance 9.5, cost 7)
+    Performance: user 81.25%, product 108.10%, stress 88.33%
+    Availability: user 100%, product 100%, stress 99.87%
+    Average EC2: 4.40; observed peak Ready nodes: 7; dropped=0
+    Peak replicas observed: product 19, stress 6, user 33
+    Monitor evidence:
+      C:\Users\competitor\AppData\Local\Temp\wsi-recreated-user40-endpointfixed-025-20260822-0900\manual-monitor.log
+
+  Notes:
+    Spike1 retained performance 12/12. During spike2 the performance gate fell
+    to 9 then recovered to 9.5. The 300s anti-flap scale-down policy retained
+    six nodes through most of phase 4, reducing cost from 8 in the prior Max40
+    best run to 7 here. A transient skills-server connection failure stopped
+    the tuner monitor around minute 5, but the independent injector completed
+    all 1799s and was verified through /api/runs/score and Kubernetes telemetry.
+====================================================
