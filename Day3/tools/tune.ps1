@@ -6479,13 +6479,17 @@ function Sync-ExternalLoadServerEndpoint([string]$RunEndpoint) {
     if ([string]::IsNullOrWhiteSpace($RunEndpoint)) { throw 'EXTERNAL_LOAD_ENDPOINT_EMPTY' }
     $expected=$RunEndpoint.TrimEnd('/')
     # The v2 load API accepts endpoint in /load/start but its injector may still
-    # read the persisted meta endpoint after CloudFront recreation. Synchronize
-    # and verify both sources before creating a score window. PUT is idempotent,
-    # so retrying it cannot create a second load run.
-    $body=@{endpoint=$expected} | ConvertTo-Json -Compress
-    Invoke-ExternalLoadApi '/api/config/meta' 'Put' $body | Out-Null
+    # read the persisted meta endpoint after CloudFront recreation. Read first:
+    # a redundant endpoint-only PUT makes this server refresh user-scoped UI
+    # metadata and can overwrite an explicitly selected intensity multiplier.
     $meta=Invoke-ExternalLoadApi '/api/config/meta'
     $actual=[string](Get-OptionalPropertyValue $meta.meta 'endpoint' '')
+    if($actual.TrimEnd('/')-ne$expected){
+        $body=@{endpoint=$expected} | ConvertTo-Json -Compress
+        Invoke-ExternalLoadApi '/api/config/meta' 'Put' $body | Out-Null
+        $meta=Invoke-ExternalLoadApi '/api/config/meta'
+        $actual=[string](Get-OptionalPropertyValue $meta.meta 'endpoint' '')
+    }
     if ($actual.TrimEnd('/') -ne $expected) { throw "EXTERNAL_LOAD_ENDPOINT_SYNC_FAILED: expected=$expected actual=$actual" }
     Write-Host "EXTERNAL_LOAD_ENDPOINT_READY: $expected" -ForegroundColor Green
 }
