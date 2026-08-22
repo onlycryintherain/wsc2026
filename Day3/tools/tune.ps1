@@ -6659,7 +6659,16 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
                 Stop-AndRecordResourceLoss ("candidate=$CandidateName; profile=$profileName; run=$runId; $($_.Exception.Message)") ([pscustomobject]@{Status=$status;Score=$score;Samples=@($samples)})
             }
             Write-Host ("{0}: elapsed={1}s total={2} perf={3} nodes={4}" -f $profileName,$status.elapsed_sec,$score.total40,$score.performance.score,$score.avg_ec2) -ForegroundColor DarkGray
-            if ([string]$status.run_id -ne $runId) { throw "PROFILE_RUN_CHANGED: $profileName" }
+            if ([string]$status.run_id -ne $runId) {
+                # The load server can briefly return its preceding run snapshot
+                # immediately after start. Confirm a changed owner three times;
+                # never silently adopt another run.
+                for($runCheck=1;$runCheck-le3-and[string]$status.run_id-ne$runId;$runCheck++){
+                    Start-Sleep -Seconds 2
+                    $status=Invoke-ExternalLoadApi '/api/load/status'
+                }
+                if([string]$status.run_id-ne$runId){throw "PROFILE_RUN_CHANGED: profile=$profileName expected=$runId actual=$($status.run_id)"}
+            }
             # A two-hour profile must not spend the remaining window on a proven
             # replica ceiling. Preserve the partial run as measured evidence so
             # the outer one-delta lifecycle can grow the worst app Max and retry.

@@ -188,6 +188,7 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-23 | pending | Max32 final 시작 `run-1787418376`에서 첫 sample 뒤 PROFILE_RUN_CHANGED로 observer 종료. `/load/start` response와 status ID는 수동 동일 절차에서 일치함을 검증. 서버의 직전 snapshot 순간 노출 가능성을 반영해 2초×3회 ID 재확인 후에만 owner 변경으로 중단하고 expected/actual ID를 오류에 기록하도록 보강. 타 run을 자동 adopt하지 않음. self-test36/36·terraform validate 통과. |
 | 2026-08-23 | pending | user target23/Max25 `run-1787417174`: 762s 33.5/40, user/product/stress perf34.50/92.45/82.38%, avg2.08로 target28 대비 user 회귀하여 REJECT. Pending sample은 11→3→2→1 감소, Ready 2→3→3→5(종료 직후6) 정상 scale-out인데 sample 4개로 NODE_CPU_CAPACITY 오판. Ready 증가+Pending 감소를 elastic recovery로 인정하도록 수정, self-test36/36·terraform validate 통과. |
 | 2026-08-23 | pending | custom CNI evidence resume로 user Max25→32 후보 `run-1787415764`; PROFILE_RUN_CHANGED로 tuner observer는 29s에 종료됐지만 injector를 독립 관찰해 1081s spike1 근거 종료. user27/32·CPU30/28에서 user perf70.60%, 총34/40·perf8·cost10·avg2.78로 Max보다 trigger 병목. severe perf<75의 near-ceiling 기준을 90→80%로 조정해 target28→23 one-delta 생성, self-test36/36·terraform validate 통과. |
 | 2026-08-23 | pending | custom CNI 재측정 `run-1787414573`: spike1 763s online stop, 34.5/40·perf7.5·cost11·avg2.15, user/product/stress 45.61/90.62/85.96%, user25/25. 신규 aws-node 시작 7초 뒤 9 Pod가 FailedCreatePodSandBox 1회 발생했으나 다음 sample 전에 모두 전용 /22 IP로 Running 복구. 누적 Event만으로 영구 CNI capacity를 오판하지 않고 latest sample의 unresolved ContainerCreating이 있을 때만 stop하도록 수정, unresolved/recovered self-test 포함 36/36·terraform validate 통과. |
