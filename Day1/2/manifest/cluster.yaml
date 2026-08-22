@@ -16,7 +16,10 @@ vpc:
       ap-northeast-2c: { id: SUBNET_C }
       ap-northeast-2d: { id: SUBNET_D }
   clusterEndpoints:
-    privateAccess: true
+    # The Bastion runs in private subnets and must reach the EKS API while
+    # eksctl is creating the cluster. Public access avoids a bootstrap
+    # deadlock before the cluster security group is known.
+    privateAccess: false
     publicAccess: true
 
 accessConfig:

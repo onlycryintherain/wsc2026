@@ -83,7 +83,16 @@ SUBNET_D=$(aws ec2 describe-subnets --filters Name=tag:Name,Values=wskorea26-pri
 EKS_KEY_ARN=$(aws kms describe-key --key-id alias/wskorea26-eks-key --query "KeyMetadata.Arn" --output text)
 sed -i "s|VPC_ID|$VPC_ID|g; s|SUBNET_C|$SUBNET_C|g; s|SUBNET_D|$SUBNET_D|g; s|EKS_KEY_ARN|$EKS_KEY_ARN|g" cluster.yaml
 
-eksctl create cluster -f cluster.yaml || true
+# The public EKS endpoint is reachable during bootstrap. Keep a hard timeout
+# so a completed-but-unreturned eksctl process cannot block the whole setup.
+timeout --foreground 45m eksctl create cluster -f cluster.yaml || {
+  status=$?
+  if [ "$status" -eq 124 ]; then
+    echo "eksctl timed out; continuing with the existing cluster resources"
+  else
+    echo "eksctl returned $status; continuing so the idempotent waits can verify the cluster"
+  fi
+}
 
 aws eks wait cluster-active --name wskorea26-cluster
 aws eks wait nodegroup-active --cluster-name wskorea26-cluster --nodegroup-name wskorea26-addon-ng
