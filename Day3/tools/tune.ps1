@@ -6510,7 +6510,7 @@ function Restore-CooldownPdbRelaxation($Saved) {
 }
 
 function Wait-ExternalProfileLowLoadFloor([int]$NodeFloor) {
-    $started=Get-Date;$relaxed=$null
+    $started=Get-Date;$relaxed=$null;$hpaAccelerated=$false
     try {
         while (((Get-Date)-$started).TotalSeconds -lt $ExternalProfileCooldownSec) {
             Assert-RequiredResourcesPresent
@@ -6520,11 +6520,24 @@ function Wait-ExternalProfileLowLoadFloor([int]$NodeFloor) {
             $atMin=@($hpas.items | Where-Object { [int]$_.status.currentReplicas -le [int]$_.spec.minReplicas -and [int]$_.status.desiredReplicas -le [int]$_.spec.minReplicas }).Count -eq @($hpas.items).Count
             if ($ready -le $NodeFloor -and $atMin) { Write-Host "PROFILE_COOLDOWN_READY: nodes=$ready floor=$NodeFloor" -ForegroundColor Green; return }
             if($atMin-and$ready-gt$NodeFloor-and$null-eq$relaxed){$relaxed=Set-CooldownPdbRelaxation}
+            if(-not$atMin-and$ready-le$NodeFloor-and-not$hpaAccelerated-and((Get-Date)-$started).TotalSeconds-ge60){
+                $loadRunning=$false
+                try{$loadRunning=[bool](Get-OptionalPropertyValue (Invoke-ExternalLoadApi '/api/load/status') 'running' $false)}catch{}
+                if(-not$loadRunning){
+                    $fast=@{spec=@{behavior=@{scaleDown=@{stabilizationWindowSeconds=0;selectPolicy='Max';policies=@(@{type='Percent';value=100;periodSeconds=15})}}}}|ConvertTo-Json -Depth 10 -Compress
+                    foreach($hpa in @($hpas.items)){Invoke-Kubectl @('-n',$Namespace,'patch','hpa',[string]$hpa.metadata.name,'--type=merge','-p',$fast)}
+                    $hpaAccelerated=$true
+                    Write-Host 'PROFILE_COOLDOWN_HPA_ACCELERATED: no traffic; temporary scaleDown=0s/100%' -ForegroundColor Yellow
+                }
+            }
             Write-Host "PROFILE_COOLDOWN: nodes=$ready->$NodeFloor hpaAtMin=$atMin" -ForegroundColor DarkGray
             Start-Sleep -Seconds 15
         }
         Write-Warning "PROFILE_COOLDOWN_TIMEOUT: node floor $NodeFloor not reached; next profile cost may include prior capacity"
-    } finally { if($relaxed){Restore-CooldownPdbRelaxation $relaxed} }
+    } finally {
+        if($relaxed){Restore-CooldownPdbRelaxation $relaxed}
+        if($hpaAccelerated){Ensure-ExternalSweepHpaBehavior}
+    }
 }
 
 function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) {
