@@ -6276,8 +6276,11 @@ function Get-DynamicSweepRecommendation([hashtable]$BestConfig,$BestEvaluation,[
             if (-not $utils.Count) { continue }
             $peakUtil=[double](($utils | Measure-Object -Maximum).Maximum)
             $currentTarget=[int]$BestConfig[$app].hpaTarget
-            $rejectedMax="HPA_MAX:${app}:$([int][math]::Ceiling([int]$BestConfig[$app].maxReplicas*1.20))" -in $RejectedSignatures
-            if (($peakDesired -lt [int]$BestConfig[$app].maxReplicas -or $rejectedMax) -and $peakUtil -gt $currentTarget*1.20 -and $currentTarget -gt $HpaTargetLowerBound+5) {
+            $currentMax=[int]$BestConfig[$app].maxReplicas
+            $rejectedMax="HPA_MAX:${app}:$([int][math]::Ceiling($currentMax*1.20))" -in $RejectedSignatures
+            $strongCpuSignal=$peakUtil-gt$currentTarget*1.20
+            $severeNearCeiling=$worstPerf-lt75.0-and$peakDesired-ge[math]::Ceiling($currentMax*0.90)-and$peakUtil-ge$currentTarget*0.90
+            if (($peakDesired -lt $currentMax -or $rejectedMax) -and ($strongCpuSignal -or $severeNearCeiling) -and $currentTarget -gt $HpaTargetLowerBound+5) {
                 $rejectedTargetCount=@($RejectedSignatures|Where-Object{$_-like"HPA_TARGET_RECOVERY:${app}:*"}).Count
                 $nextTarget=[int][math]::Max($HpaTargetLowerBound,$currentTarget-(5*($rejectedTargetCount+1)))
                 $sig="HPA_TARGET_RECOVERY:${app}:$nextTarget"
@@ -6589,8 +6592,13 @@ function Get-ExternalOnlineRecoverySignal($Score,$Samples) {
         if($null-eq$perf-or[double]$perf-ge90.0){continue}
         $recent=@($Samples|Select-Object -Last 3)
         if($recent.Count-lt3){continue}
-        $pinned=@($recent|Where-Object{$m=$_.Hpa[$app];$m-and[int]$m.Desired-ge[int]$m.Max-and$null-ne$m.CpuUtil-and[double]$m.CpuUtil-gt[double]$m.Target})
-        if($pinned.Count-eq$recent.Count){$signals.Add([pscustomobject]@{App=$app;Performance=[double]$perf;Reason="three sustained HPA ceiling samples with CPU above target"})}
+        $pinned=@($recent|Where-Object{
+            $m=$_.Hpa[$app];if(-not$m-or$null-eq$m.CpuUtil){return $false}
+            $hardCeiling=[int]$m.Desired-ge[int]$m.Max-and[double]$m.CpuUtil-gt[double]$m.Target
+            $severeNearCeiling=[double]$perf-lt75.0-and[int]$m.Desired-ge[math]::Ceiling([int]$m.Max*0.90)-and[double]$m.CpuUtil-ge[double]$m.Target*0.90
+            return $hardCeiling-or$severeNearCeiling
+        })
+        if($pinned.Count-eq$recent.Count){$signals.Add([pscustomobject]@{App=$app;Performance=[double]$perf;Reason="three sustained hard/near HPA ceiling samples with CPU signal"})}
     }
     if($signals.Count){return @($signals|Sort-Object Performance,App)[0]}
     return $null

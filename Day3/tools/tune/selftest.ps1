@@ -376,11 +376,16 @@ if ($BaseExperiment) {
     Assert-Test 'Online ceiling recovery detects sustained bottleneck' {
         $h=@{}
         foreach($app in $apps){$h[$app]=[pscustomobject]@{Current=2;Desired=2;Max=20;CpuUtil=5;Target=30}}
-        $h.user=[pscustomobject]@{Current=20;Desired=20;Max=20;CpuUtil=80;Target=33}
-        $samples=@(1..3|ForEach-Object{[pscustomobject]@{Hpa=$h}})
-        $score=[pscustomobject]@{logged_minutes=10;user_perf=25;product_perf=100;stress_perf=80}
+        $h.user=[pscustomobject]@{Current=24;Desired=24;Max=25;CpuUtil=31;Target=33}
+        $samples=@(1..3|ForEach-Object{[pscustomobject]@{CniErrors=0;Pending=@();Hpa=$h;Usage=@{}}})
+        $score=[pscustomobject]@{logged_minutes=10;user_perf=70;product_perf=100;stress_perf=84}
         $signal=Get-ExternalOnlineRecoverySignal $score $samples
-        if($null-eq$signal-or$signal.App-ne'user'){throw "missing user recovery signal"}
+        if($null-eq$signal-or$signal.App-ne'user'){throw "missing near-ceiling user recovery signal"}
+        $best=Copy-Config $BaseConfig best;$best.user.maxReplicas=25;$best.user.hpaTarget=33
+        $result=[pscustomobject]@{Score=$score;Status=[pscustomobject]@{dropped=0};Samples=$samples}
+        $evaluation=[pscustomobject]@{AllPerformanceGuards=$false;AllCostGuards=$true;Results=@($result)}
+        $rec=Get-DynamicSweepRecommendation $best $evaluation @()
+        if($rec.Type-ne'HPA_TARGET_RECOVERY'-or$rec.App-ne'user'-or[int]$rec.To-ne28){throw "unexpected near-ceiling recommendation $($rec.Type) $($rec.App) $($rec.To)"}
         $score.logged_minutes=9
         if($null-ne(Get-ExternalOnlineRecoverySignal $score $samples)){throw 'recovery fired before evidence window'}
     }
