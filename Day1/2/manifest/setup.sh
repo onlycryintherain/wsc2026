@@ -20,6 +20,13 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 set -x
 echo "Setup log: $LOG_FILE"
 
+# Prevent duplicate launches when setup is started by systemd and manually.
+exec 9>/var/lock/wskorea26-setup.lock
+if ! flock -n 9; then
+  echo "Another wskorea26 setup process is already running; exiting."
+  exit 0
+fi
+
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 REGION=ap-northeast-2
 ECR=$ACCOUNT.dkr.ecr.$REGION.amazonaws.com
@@ -239,20 +246,67 @@ LAMBDA_TG_ARN=$(aws elbv2 describe-target-groups \
 sed -i "s|LAMBDA_TARGET_GROUP_ARN|$LAMBDA_TG_ARN|g" ingress.yaml
 kubectl apply -f ingress.yaml
 
+# Ingress reconciliation is asynchronous. Wait for ALBs, listeners and rules
+# instead of failing immediately with LoadBalancerNotFound/ListenerNotFound.
+wait_for_load_balancer() {
+  local name="$1" arn=""
+  for attempt in $(seq 1 180); do
+    arn=$(aws elbv2 describe-load-balancers \
+      --names "$name" \
+      --query 'LoadBalancers[0].LoadBalancerArn' \
+      --output text 2>/dev/null || true)
+    if [ -n "$arn" ] && [ "$arn" != "None" ]; then
+      printf '%s\n' "$arn"
+      return 0
+    fi
+    echo "Waiting for load balancer $name ($attempt/180)..." >&2
+    sleep 10
+  done
+  echo "Timed out waiting for load balancer $name" >&2
+  return 1
+}
+
+wait_for_listener() {
+  local load_balancer_arn="$1" listener_arn=""
+  for attempt in $(seq 1 60); do
+    listener_arn=$(aws elbv2 describe-listeners \
+      --load-balancer-arn "$load_balancer_arn" \
+      --query 'Listeners[?Port==`80`].ListenerArn | [0]' \
+      --output text 2>/dev/null || true)
+    if [ -n "$listener_arn" ] && [ "$listener_arn" != "None" ]; then
+      printf '%s\n' "$listener_arn"
+      return 0
+    fi
+    echo "Waiting for listener ($attempt/60)..." >&2
+    sleep 5
+  done
+  echo "Timed out waiting for listener" >&2
+  return 1
+}
+
+wait_for_rule() {
+  local listener_arn="$1" rule_arn=""
+  for attempt in $(seq 1 60); do
+    rule_arn=$(aws elbv2 describe-rules \
+      --listener-arn "$listener_arn" \
+      --query "Rules[?Priority=='1'].RuleArn | [0]" \
+      --output text 2>/dev/null || true)
+    if [ -n "$rule_arn" ] && [ "$rule_arn" != "None" ]; then
+      printf '%s\n' "$rule_arn"
+      return 0
+    fi
+    echo "Waiting for book POST rule ($attempt/60)..." >&2
+    sleep 5
+  done
+  echo "Timed out waiting for book POST rule" >&2
+  return 1
+}
+
 # ALB Controller versions may reconcile the rule before URL transforms are ready.
-# Apply the required /book -> /v1/book transform after the Ingress rule exists.
-BOOK_INGRESS_ALB_ARN=$(aws elbv2 describe-load-balancers \
-  --names wskorea26-book-alb \
-  --query 'LoadBalancers[0].LoadBalancerArn' \
-  --output text)
-BOOK_INGRESS_LISTENER_ARN=$(aws elbv2 describe-listeners \
-  --load-balancer-arn "$BOOK_INGRESS_ALB_ARN" \
-  --query 'Listeners[0].ListenerArn' \
-  --output text)
-BOOK_POST_RULE_ARN=$(aws elbv2 describe-rules \
-  --listener-arn "$BOOK_INGRESS_LISTENER_ARN" \
-  --query "Rules[?Priority=='1'].RuleArn | [0]" \
-  --output text)
+BOOK_INGRESS_ALB_ARN=$(wait_for_load_balancer wskorea26-book-alb)
+wait_for_load_balancer wskorea26-grafana-alb >/dev/null
+BOOK_INGRESS_LISTENER_ARN=$(wait_for_listener "$BOOK_INGRESS_ALB_ARN")
+BOOK_POST_RULE_ARN=$(wait_for_rule "$BOOK_INGRESS_LISTENER_ARN")
 aws elbv2 modify-rule \
   --rule-arn "$BOOK_POST_RULE_ARN" \
   --transforms '[{"Type":"url-rewrite","UrlRewriteConfig":{"Rewrites":[{"Regex":"^/book$","Replace":"/v1/book"}]}}]'
@@ -260,6 +314,8 @@ aws elbv2 modify-rule \
 kubectl get ingress -A
 
 echo "===== Setup Complete ====="
+mkdir -p /var/lib/wskorea26
+touch /var/lib/wskorea26/setup.complete
 
 CF_DOMAIN=$(aws cloudfront list-distributions --query 'DistributionList.Items[?Comment==`wskorea26-concert-cf`].DomainName | [0]' --output text)
 echo "CloudFront: $CF_DOMAIN"

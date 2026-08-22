@@ -42,7 +42,7 @@ resource "aws_dynamodb_table" "this" {
     enabled = true
   }
 
-  deletion_protection_enabled = true
+  deletion_protection_enabled = false
 
   tags = { Name = var.table_name }
 }

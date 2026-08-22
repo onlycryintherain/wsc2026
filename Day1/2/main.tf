@@ -274,6 +274,27 @@ aws s3 cp s3://$BUCKET/ . --recursive --region $REGION
 sed -i 's/\r$//' *.sh *.yaml *.yml 2>/dev/null || true
 chmod +x setup.sh
 chown -R ec2-user:ec2-user /home/ec2-user
+cat >/etc/systemd/system/wskorea26-setup.service <<'UNIT'
+[Unit]
+Description=wskorea26 EKS and application setup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/ec2-user
+Environment=SETUP_LOG_FILE=/home/ec2-user/wskorea26-setup-systemd.log
+ExecStart=/bin/bash /home/ec2-user/setup.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now wskorea26-setup.service
 EOF
 
   tags = { Name = "wskorea26-bastion" }
