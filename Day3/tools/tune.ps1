@@ -6459,15 +6459,32 @@ function New-ExternalLoadRequestBody([string]$ProfileName,[string]$RunEndpoint) 
     return (@{template=$ProfileName;endpoint=$RunEndpoint.TrimEnd('/')} | ConvertTo-Json -Compress)
 }
 
+function Invoke-ExternalLoadApi([string]$Path,[string]$Method='Get',[string]$Body='',[int]$Attempts=4) {
+    $uri="$LoadServer$Path"
+    for($attempt=1;$attempt-le$Attempts;$attempt++){
+        try {
+            $args=@{Method=$Method;Uri=$uri;TimeoutSec=20}
+            if(-not[string]::IsNullOrEmpty($Body)){$args.Body=$Body;$args.ContentType='application/json'}
+            return Invoke-RestMethod @args
+        } catch {
+            if($attempt-ge$Attempts){throw}
+            $delay=[math]::Min(8,[math]::Pow(2,$attempt))
+            Write-Warning "EXTERNAL_LOAD_API_RETRY: method=$Method path=$Path attempt=$attempt/$Attempts delay=${delay}s error=$($_.Exception.Message)"
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
 function Sync-ExternalLoadServerEndpoint([string]$RunEndpoint) {
     if ([string]::IsNullOrWhiteSpace($RunEndpoint)) { throw 'EXTERNAL_LOAD_ENDPOINT_EMPTY' }
     $expected=$RunEndpoint.TrimEnd('/')
     # The v2 load API accepts endpoint in /load/start but its injector may still
     # read the persisted meta endpoint after CloudFront recreation. Synchronize
-    # and verify both sources before creating a score window.
+    # and verify both sources before creating a score window. PUT is idempotent,
+    # so retrying it cannot create a second load run.
     $body=@{endpoint=$expected} | ConvertTo-Json -Compress
-    Invoke-RestMethod -Method Put -Uri ("$LoadServer/api/config/meta") -Body $body -ContentType 'application/json' -TimeoutSec 20 | Out-Null
-    $meta=Invoke-RestMethod -Uri ("$LoadServer/api/config/meta") -TimeoutSec 20
+    Invoke-ExternalLoadApi '/api/config/meta' 'Put' $body | Out-Null
+    $meta=Invoke-ExternalLoadApi '/api/config/meta'
     $actual=[string](Get-OptionalPropertyValue $meta.meta 'endpoint' '')
     if ($actual.TrimEnd('/') -ne $expected) { throw "EXTERNAL_LOAD_ENDPOINT_SYNC_FAILED: expected=$expected actual=$actual" }
     Write-Host "EXTERNAL_LOAD_ENDPOINT_READY: $expected" -ForegroundColor Green
@@ -6491,8 +6508,11 @@ function Invoke-ExternalProfileSweep([string]$CandidateName,[hashtable]$Config,[
         $samples=[System.Collections.Generic.List[object]]::new(); $completed=$false
         while (((Get-Date)-$started).TotalSeconds -lt ($expected+120)) {
             Start-Sleep -Seconds 30
-            $status=Invoke-RestMethod -Uri ("$LoadServer/api/load/status") -TimeoutSec 20
-            $score=Invoke-RestMethod -Uri ("$LoadServer/api/score") -TimeoutSec 20
+            # skills-server can briefly refuse connections while preserving the
+            # injector. Retry read-only observations instead of abandoning a
+            # healthy 30-minute score window.
+            $status=Invoke-ExternalLoadApi '/api/load/status'
+            $score=Invoke-ExternalLoadApi '/api/score'
             try { $samples.Add((Get-ExternalProfileClusterSample $started)) } catch {
                 try { Invoke-RestMethod -Method Post -Uri ("$LoadServer/api/load/stop") -Body '{}' -ContentType 'application/json' -TimeoutSec 20 | Out-Null } catch { }
                 Stop-AndRecordResourceLoss ("candidate=$CandidateName; profile=$profileName; run=$runId; $($_.Exception.Message)") ([pscustomobject]@{Status=$status;Score=$score;Samples=@($samples)})
