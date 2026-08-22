@@ -558,3 +558,29 @@ CloudFront: https://do876irwkqghf.cloudfront.net
   reduced cost score. Restored immutable fingerprint with user Max32 through
   tune.ps1 after traffic ended; product Max20 and stress Max12 unchanged.
 ====================================================
+
+====================================================
+Low Binary / Official 0.5x Sequential Optimization
+Date: 2026-08-22 KST
+Endpoint: https://d3tum9m2cawjh9.cloudfront.net
+====================================================
+  BASE run-1787380613: 38/40
+    availability=12, performance=12, cost=10, avg EC2=2.90, peak Ready=4
+    user/product/stress perf=92.06/113.62/99.68%, dropped=0
+
+  One delta: stress request 600m->550m, HPA 55%->60%
+    Absolute trigger preserved: 330m. Peak stress 3 Pods now fit one c5.large
+    dedicated node (3*550m + 150m daemon requests <= allocatable CPU).
+
+  Candidate run-1787382981: 39/40
+    availability=12, performance=12, cost=11, avg EC2=2.50, peak Ready=3
+    user/product/stress perf=92.07/113.90/99.81%, dropped=0
+
+  FINAL_FRESH run-1787385221: 39/40 KEEP
+    availability=12, performance=12, cost=11, avg EC2=2.43
+    user/product/stress perf=90.63/113.70/99.23%
+    availability=99.97/100/100%, dropped=0
+  Evidence:
+    C:\Users\competitor\AppData\Local\Temp\wsi-low-binary-05-base-sequential-valid2-20260822-1537
+    C:\Users\competitor\AppData\Local\Temp\wsi-low-binary-05-stress-pack550-20260822-1610
+====================================================
