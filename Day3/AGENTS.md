@@ -160,6 +160,67 @@ terraform plan -var-file=terraform.tfvars
 - WAF rate limit은 사용하지 않는다.
 - 성능 변경 후 비용 영향과 Terraform 재생성 여부를 함께 확인한다.
 
+## `skills-server:8003` 제어 API 사용
+
+기본 주소는 `http://skills-server:8003`이다. 이 API는 외부 채점 부하의 시작·중지, 실행별 점수, Kubernetes/EC2 관측값과 허용된 튜닝 설정을 제공한다. API 자체 명세는 `GET /`에서 확인한다.
+
+### 주요 API
+
+| 메서드 | 경로 | 용도 |
+|---|---|---|
+| GET | `/health` | 제어 서버 상태 확인 |
+| POST | `/api/load/start` | `{template, endpoint}`로 새 부하 실행 시작 |
+| POST | `/api/load/stop` | 현재 사용자의 injector 중지 |
+| GET | `/api/load/status` | `run_id`, running, phase, elapsed, target/sent RPS, dropped 확인 |
+| GET | `/api/runs/score` | 현재 run에 고정된 40점 점수와 앱별 가용성/성능/평균 EC2 확인 |
+| GET | `/api/runs/live` | 최신 phase와 부하량 확인 |
+| GET | `/api/score` | 실시간 점수 확인. 반드시 응답의 `run.run_id`를 기대 ID와 대조 |
+| GET | `/api/cluster` | snapshot ID와 노드/Pod/HPA/EC2 종합 상태 확인 |
+| GET | `/api/cluster/{nodes,pods,hpa,ec2,karpenter,pending,stress-check}` | 세부 클러스터 관측 |
+| GET | `/api/config/{hpa,resources,karpenter,meta,validate,history}` | 현재 설정과 검증 결과 조회 |
+| GET | `/api/log/monitor?tail=50` | 분 단위 판정, 2xx/5xx, P95, EC2 로그 확인 |
+
+### 기본 사용 예시
+
+```powershell
+$LoadServer = 'http://skills-server:8003'
+
+# 명세/상태/점수
+Invoke-RestMethod "$LoadServer/"
+Invoke-RestMethod "$LoadServer/api/load/status"
+Invoke-RestMethod "$LoadServer/api/runs/score"
+Invoke-RestMethod "$LoadServer/api/cluster"
+Invoke-RestMethod "$LoadServer/api/log/monitor?tail=50"
+
+# 직접 시작해야 할 때만 사용한다. 평소에는 tune.ps1 경로를 우선한다.
+$body = @{
+  template = '순차증가'
+  endpoint = 'https://example.cloudfront.net'
+} | ConvertTo-Json -Compress
+$run = Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/start" `
+  -ContentType 'application/json' -Body $body
+$expectedRunId = [string]$run.run_id
+
+# 종료
+Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/stop" `
+  -ContentType 'application/json' -Body '{}'
+```
+
+### 운용 규칙과 확인된 동작
+
+- 부하 시작은 가능하면 `tools/tune.ps1`을 통해 수행한다. HPA/resources/Karpenter PUT도 직접 호출하지 않고 tuner의 측정·rollback 경로만 사용한다.
+- `/api/load/start`는 중복 실행 위험이 있으므로 자동 retry하지 않는다. GET과 idempotent endpoint PUT만 제한적으로 retry한다.
+- 시작 응답의 `run_id`를 owner로 저장하고 status/score의 ID와 계속 대조한다. 서버가 직전 snapshot을 순간 노출할 수 있으므로 불일치 시 2초 간격 3회 재확인한 뒤에만 `PROFILE_RUN_CHANGED`로 중지한다.
+- 동시에 두 개의 `tune.ps1` 또는 UI run을 시작하지 않는다. 새 run은 기존 phase clock과 run별 점수 창을 교체한다.
+- CloudFront 재생성 후 `/api/config/meta`의 `endpoint`가 이전 도메인에 남을 수 있다. 현재 endpoint와 먼저 GET 비교하고, 다를 때만 PUT한 뒤 GET 검증한다. 같은 값을 불필요하게 PUT하면 user-scoped UI metadata가 갱신될 수 있다.
+- `/api/load/status`의 `endpoint`는 정상 run에서도 `null`일 수 있으므로 meta endpoint, 실제 앱 access log, HPA CPU 증가를 함께 확인한다.
+- `/api/load/start`는 user-scoped multiplier를 저장 기본값으로 되돌릴 수 있다. 요청 강도는 임의 변경하지 않는다. 주인이 UI 지원 배율을 명시적으로 선택한 경우에만 `tune.ps1 -ExternalLoadMultiplier <값>`으로 start 직후 global/scoped 값을 원자 적용하고 GET 검증한다.
+- run 직후 이전 점수가 잠깐 보일 수 있다. 새 `run_id`, 첫 신규 분 로그, 앱별 2xx가 확인되기 전 점수는 판정 근거로 쓰지 않는다.
+- `sent_rps`의 순간 흔들림은 generator 포화가 아니다. 누적 `dropped > 0`만 generator limit 근거로 사용한다.
+- 2xx가 0이고 Pod access log/HPA 변화가 없으면 성능 문제가 아니라 endpoint/DNS 무효 run으로 판단해 즉시 중지한다.
+- tuner 관측 프로세스가 종료돼도 injector가 계속 실행될 수 있다. 항상 `/api/load/status.running`을 별도로 확인하고 경기 종료 시 `/api/load/stop`으로 종료한다.
+- 점수는 run별이다. `total40`, availability/performance/cost, 앱별 perf/avail, `avg_ec2`, dropped를 run ID와 함께 기록한다.
+
 ## WAF 원칙
 
 - AWS Managed Rules를 우선 사용하고 커스텀 규칙은 보완용으로만 추가한다.
@@ -188,6 +249,7 @@ terraform plan -var-file=terraform.tfvars
 
 ## 최근 작업 로그
 
+| 2026-08-23 | pending | `skills-server:8003` 제어 API 사용 절 추가. 주요 load/run/score/cluster/config/log endpoint, PowerShell 예시, run ID ownership, POST start non-retry, CloudFront endpoint GET-first 동기화, scoped multiplier 동작, stale snapshot 재확인, 무효 run 판정 및 injector 별도 종료 규칙을 문서화. |
 | 2026-08-23 | pending | `aws ec2 modify-instance-credit-specification` 명령어가 올바르지 않은 파라미터(--instance-ids, --cpu-credits)를 사용하여 `bastion_setup.sh` 실행 시 AWS CLI 오류로 setup.sh가 실패하는 버그 해결. `bastion_setup.sh` 본문 및 Karpenter `EC2NodeClass` userData 내의 명령을 올바른 규격(--instance-credit-specifications "InstanceId=...,CpuCredits=...")으로 수정 및 루프 처리 보강. `terraform validate` 통과. |
 | 2026-08-23 | pending | Max32 `run-1787418670` baseline 32.5점은 product availability60.15%로 무효. 원인은 Terraform state의 EKS OIDC Provider가 AWS에서 외부 삭제되어 ALB Controller가 `InvalidIdentityToken`으로 stale target을 유지했고, product TG에 재사용된 user Pod IP가 남아 404 발생. saved targeted plan으로 OIDC Provider 1 add 복구, controller restart 후 product/user/stress healthy target이 EndpointSlice와 정확히 일치함을 확인. `tune.ps1`은 매 profile 전에 ALB healthy target exact-set gate를 통과해야 시작하도록 보강. self-test36/36·terraform validate 통과. |
 | 2026-08-23 | pending | EKS 노드 CPU credit 정책을 root `eks_node_cpu_credits=unlimited`로 명시. Managed NodeGroup Launch Template은 T계열에서만 `credit_specification`을 생성하고, Karpenter `EC2NodeClass` userData와 setup.sh 기존 노드 보정/검증으로 unlimited를 재현. c5/m5 전환 시 credit 블록/API 호출을 건너뛰도록 가드 추가. `terraform validate`, t3/c5 plan, Git Bash `bash -n` 통과; plan은 기존 Bastion 삭제/SG drift로 apply하지 않음. |
