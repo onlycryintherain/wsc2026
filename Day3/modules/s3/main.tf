@@ -56,6 +56,7 @@ resource "aws_s3_object" "bastion_script" {
     db_secret_name     = var.db_secret_name
     db_proxy_name      = var.db_proxy_name
     node_instance_type = var.node_instance_type
+    node_cpu_credits   = var.node_cpu_credits
   })
 }
 

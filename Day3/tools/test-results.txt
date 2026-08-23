@@ -1,0 +1,254 @@
+====================================================
+CloudGame Performance Tuning Results
+Date: 2026-08-20 04:31:03
+Template: Default (15min)
+Cluster: wsi2026-cluster (ap-northeast-2)
+Node Type: c5.large x 3
+====================================================
+
+--- 1/3: Original App (application/binary) ---
+Total: 91.2/100 (36.5/40)
+  Abnormal:     4.0/4.0
+  Availability: 12.0/12.0
+  Performance:  10.5/12.0
+  Cost:         10.0/12.0
+  user_perf:    88.93%
+  product_perf: 106.51%
+  stress_perf:  86.92%
+  avg_ec2:      3.0
+
+--- 2/3: High Binary (high_binary) ---
+Total: 85.0/100 (34.0/40)
+  Abnormal:     4.0/4.0
+  Availability: 12.0/12.0
+  Performance:  8.0/12.0
+  Cost:         10.0/12.0
+  user_perf:    83.75%
+  product_perf: 101.97%
+  stress_perf:  79.60%
+  avg_ec2:      3.0
+
+--- 3/3: Low Binary (low_binary) ---
+Total: 95/100 (38/40)
+  Abnormal:     4/4
+  Availability: 12/12
+  Performance:  12/12
+  Cost:         10/12
+  user_perf:    99.81%
+  product_perf: 113.74%
+  stress_perf:  99.74%
+  avg_ec2:      3
+
+====================================================
+Summary:
+  Original:     91.2/100 (36.5/40)
+  High Binary:  85.0/100 (34.0/40)
+  Low Binary:   95/100 (38/40)
+====================================================
+
+Applied Settings (Default Profile):
+  Resources:
+    user:    req_cpu=50m, req_mem=64Mi, lim_mem=256Mi (no CPU limit)
+    product: req_cpu=30m, req_mem=64Mi, lim_mem=256Mi (no CPU limit)
+    stress:  req_cpu=150m, req_mem=192Mi, lim_mem=512Mi (no CPU limit)
+  HPA:
+    user:    min=10, max=15, target=40%
+    product: min=2, max=5, target=70%
+    stress:  min=6, max=10, target=25%
+  Karpenter:
+    default: cpu=2, mem=4Gi (1 node max)
+    stress:  cpu=2, mem=4Gi (1 node max)
+  Node Strategy:
+    - Total 3 nodes (managed 1 + default 1 + stress 1)
+    - Stress isolated with taint/toleration
+    - CPU limit removed (no throttle)
+    - Aggressive pre-scaling (high min replicas)
+====================================================
+
+====================================================
+CloudGame Performance Tuning Results
+Date: 2026-08-20 22:46 KST
+Template: Default (15min) — BASELINE / 기본값
+Cluster: wsi2026-cluster (ap-northeast-2)
+Node Type: c5.large x 3
+Status: Candidate 적용 전 기본값 결과
+====================================================
+
+--- BASELINE RESULT ---
+Total: 92.5/100 (37.0/40)
+  Abnormal:     4.0/4.0
+  Availability: 12.0/12.0
+  Performance:  11.0/12.0
+  Cost:         10.0/12.0
+  Requests:     20,811
+  Duration:     15 minutes
+  user_avail:   99.9%
+  user_perf:    90.4%
+  product_avail: 100.0%
+  product_perf: 110.7%
+  stress_avail:  99.7%
+  stress_perf:   86.0%
+  image_success: 100.0%
+  abnormal_block: 100.0%
+  avg_ec2:       3.0
+  cost_ratio:    1.5 (3.0 / baseline 2.0)
+
+Applied BASE Settings:
+  Resources:
+    user:    req_cpu=70m, req_mem=64Mi, lim_mem=256Mi (no CPU limit)
+    product: req_cpu=70m, req_mem=64Mi, lim_mem=256Mi (no CPU limit)
+    stress:  req_cpu=600m, req_mem=640Mi, lim_cpu=2000m, lim_mem=1536Mi
+  HPA:
+    user:    min=2, max=20, target=33%
+    product: min=2, max=20, target=29%
+    stress:  min=1, max=6, target=55%
+  Placement:
+    user/product: SHARED
+    stress:      ISOLATED
+  Karpenter:
+    default: cpu=2
+    stress:  cpu=2
+  Node Strategy:
+    - Total 3 nodes (managed 1 + default 1 + stress 1)
+    - Stress isolated with taint/toleration
+    - CPU limits removed for user/product; stress BASE limit retained
+====================================================
+
+====================================================
+CloudGame Performance Tuning Results
+Date: 2026-08-20 22:57 KST
+Template: Custom peak2 (8min)
+Cluster: wsi2026-cluster (ap-northeast-2)
+Node Type: c5.large x 3
+Status: Peak2 overload / stress-550m candidate
+====================================================
+
+--- PEAK2 RESULT ---
+Total: 47.5/100 (19.0/40)
+  Gate:         performance minimum 12.5%
+  Abnormal:     4.0/4.0
+  Availability: 11.0/12.0
+  Performance:   4.0/12.0
+  Cost:          0.0/12.0 (performance gate)
+  Requests:     15,633
+  Duration:     8 minutes
+  Traffic:
+    baseline:  5 RPS total (user 2.0 / product 1.6 / stress 0.1)
+    peak2:    156 RPS total (user 65.0 / product 72.8 / stress 3.5)
+  user_avail:   100.0%
+  user_perf:     12.5%
+  product_avail: 100.0%
+  product_perf:  94.4%
+  stress_avail:   85.7%
+  stress_perf:    17.9%
+  image_success: 100.0%
+  abnormal_block: 100.0%
+  avg_ec2:        3.0
+  cost_ratio:     1.5 (3.0 / baseline 2.0)
+
+Candidate Settings:
+  stress request_cpu=550m (BASE 600m), request_mem=640Mi
+  stress limit_cpu=2000m, limit_mem=1536Mi, HPA max=6
+  NodePool stress CPU limit=2 (one stress c5.large)
+
+Observed Bottleneck:
+  - user HPA reached max=20 and CPU remained high
+  - stress HPA reached max=6; 3 Ready + 3 Pending
+  - Pending reason: Insufficient CPU / NodePool CPU limit exceeded
+  - Peak2 is not comparable to the previous peak1 BASE result
+====================================================
+
+====================================================
+Candidate Prepared
+Date: 2026-08-20 23:01 KST
+Candidate: BASE resources + stress NodePool capacity
+====================================================
+  BASE resources restored:
+    stress request_cpu=600m, request_mem=640Mi
+    stress limit_cpu=2000m, limit_mem=1536Mi
+    stress HPA min=1, max=6, target=55%
+  Single delta:
+    stress NodePool CPU limit: 2 -> 12
+  Current stable state:
+    stress deployment: 1/1 Ready
+    stress Pending: 0
+    total nodes: 3
+  Next measurement: same peak2 profile (156 / 65 / 72.8 / 3.5)
+====================================================
+
+====================================================
+CloudGame Performance Tuning Results
+Date: 2026-08-20 23:18 KST
+Template: Custom peak2 (10min)
+Cluster: wsi2026-cluster (ap-northeast-2)
+Node Type: c5.large x average 4.6
+Status: Peak2 / stress NodePool 12 candidate
+====================================================
+
+--- PEAK2 RESULT ---
+Total: 52.5/100 (21.0/40)
+  Gate:          performance minimum 9.4%
+  Abnormal:      4.0/4.0
+  Availability: 12.0/12.0
+  Performance:   5.0/12.0
+  Cost:          0.0/12.0 (performance gate)
+  Requests:      30,878
+  Duration:      10 minutes
+  user_avail:    100.0%
+  user_perf:      9.4%
+  product_avail: 100.0%
+  product_perf:  99.7%
+  stress_avail:  97.0%
+  stress_perf:   63.9%
+  image_success: 100.0%
+  abnormal_block:100.0%
+  avg_ec2:       4.6
+  cost_ratio:    2.3 (4.6 / baseline 2.0)
+
+Observed Bottleneck:
+  - user HPA reached max=20; CPU remained about 86%
+  - stress HPA reached max=6; stress NodePool expanded to 5 nodes
+  - transient CNI FailedCreatePodSandBox occurred on new stress nodes
+  - stress performance improved, but foreground user performance collapsed
+====================================================
+
+====================================================
+Default-spike2 Iteration Log (early-stop loop)
+Date: 2026-08-20 23:29–23:52 KST
+Profile: 5min baseline + peak2, early stop when meaningful score <=30
+====================================================
+  Run 0: stopped at 15s, score 0.0 — initial score invalid, excluded
+  Run 1: user HPA max 21
+    stopped at 340s, score 20.5/40
+    user_perf=20.77%, product_perf=104.07%, stress_perf=42.00%
+  Run 2: user HPA max 22
+    stopped at 368s, score 20.5/40
+    user_perf=20.77%, product_perf=103.66%, stress_perf=44.21%
+  Run 3: default NodePool CPU 2 -> 4
+    stopped at 399s, score 20.0/40
+    user_perf=13.39%, product_perf=104.93%, stress_perf=23.02%
+  Best iteration: Run 1 (user max=21, default CPU=2, stress CPU=12)
+  Final restored: user HPA max=21, default NodePool CPU=2,
+                  stress NodePool CPU=12, total Ready nodes=3
+  Run 4: user HPA max=30
+    stopped at 399s, score 20.0/40
+    candidate rejected; no improvement over Run 1
+  Run 5: warm profile user=10/product=10/stress=4, stress request=550m,
+          stress NodePool CPU=4
+    stopped at 369s, score 22.0/40
+    user_perf=21.65%, product_perf=100.09%, stress_perf=81.18%, avg_ec2=4.0
+    candidate rejected; foreground user remained below gate
+  Warm user=20 prewarm was not measured because scheduling produced Pending/Error
+  pods; configuration was immediately restored.
+  Final restored: BASE resources, user HPA max=21/min=2,
+                  default CPU=2, stress CPU=12, total Ready nodes=3
+  Run 6: score-first warm user=20/product=20/stress=4,
+          user request=50m, stress request=550m, stress CPU=4
+    stopped at 370s, score 21.5/40
+    user_perf=16.71%, product_perf=101.87%, stress_perf=79.70%, avg_ec2=4.0
+    candidate rejected; user HPA/foreground capacity remained limiting
+  Aggressive warm user=30/product=20/stress=6 was not measured because
+  foreground Pending/Error pods appeared during prewarm; immediately reverted.
+  Final restored: BASE resources, user HPA max=21/min=2,
+                  default CPU=2, stress CPU=12, total Ready nodes=3
+====================================================

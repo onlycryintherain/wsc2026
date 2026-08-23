@@ -12,6 +12,7 @@ DB_USERNAME="${db_username}"
 DB_SECRET_NAME="${db_secret_name}"
 RDS_PROXY_NAME="${db_proxy_name}"
 NODE_INSTANCE_TYPE="${node_instance_type}"
+NODE_CPU_CREDITS="${node_cpu_credits}"
 
 echo "=== Updating kubeconfig ==="
 aws eks update-kubeconfig --name ${cluster} --region ${region}
@@ -27,6 +28,39 @@ for i in $(seq 1 60); do
   echo "Attempt $i: No ready nodes yet, waiting..."
   sleep 10
 done
+
+if [[ "$NODE_INSTANCE_TYPE" == t* ]]; then
+  echo "=== Enforcing EC2 CPU credit mode: $NODE_CPU_CREDITS ==="
+  NODE_IDS=$(aws ec2 describe-instances \
+    --region "$REGION" \
+    --filters \
+      "Name=tag:aws:eks:cluster-name,Values=$CLUSTER" \
+      "Name=instance-state-name,Values=pending,running" \
+      "Name=instance-type,Values=$NODE_INSTANCE_TYPE" \
+    --query 'Reservations[].Instances[].InstanceId' \
+    --output text)
+  if [ -n "$NODE_IDS" ] && [ "$NODE_IDS" != "None" ]; then
+    for nid in $NODE_IDS; do
+      aws ec2 modify-instance-credit-specification \
+        --region "$REGION" \
+        --instance-credit-specifications "InstanceId=$nid,CpuCredits=$NODE_CPU_CREDITS"
+    done
+    CREDIT_STATE=$(aws ec2 describe-instance-credit-specifications \
+      --region "$REGION" \
+      --instance-ids $NODE_IDS \
+      --query 'InstanceCreditSpecifications[].CpuCredits' \
+      --output text)
+    echo "CPU credit mode: $CREDIT_STATE"
+    if ! echo "$CREDIT_STATE" | grep -qw "$NODE_CPU_CREDITS"; then
+      echo "ERROR: CPU credit mode verification failed" >&2
+      exit 1
+    fi
+  else
+    echo "No $NODE_INSTANCE_TYPE nodes found for CPU credit enforcement"
+  fi
+else
+  echo "Skipping CPU credit configuration for non-burstable instance type: $NODE_INSTANCE_TYPE"
+fi
 
 echo "=== Adding EKS access entry for root ==="
 aws eks create-access-entry --cluster-name ${cluster} --principal-arn arn:aws:iam::${account_id}:root --region ${region} 2>/dev/null || true
@@ -207,6 +241,29 @@ spec:
   role: ${node_role}
   kubelet:
     maxPods: 110
+  # Karpenter EC2NodeClass에는 creditSpecification native 필드가 없으므로
+  # AL2023 user data에서 T계열 인스턴스 자신에게 CPU credit 모드를 적용한다.
+  userData: |
+    #!/bin/bash
+    if [[ "${node_instance_type}" == t* ]]; then
+      for i in \$(seq 1 12); do
+        if command -v aws >/dev/null 2>&1; then
+          TOKEN=\$(curl -fsS -X PUT \\
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \\
+            http://169.254.169.254/latest/api/token || true)
+          INSTANCE_ID=\$(curl -fsS \\
+            -H "X-aws-ec2-metadata-token: \$TOKEN" \\
+            http://169.254.169.254/latest/meta-data/instance-id || true)
+          if [ -n "\$INSTANCE_ID" ] && aws ec2 modify-instance-credit-specification \\
+            --region "${region}" \\
+            --instance-credit-specifications "InstanceId=\$INSTANCE_ID,CpuCredits=${node_cpu_credits}"; then
+            logger "CPU credit mode set to ${node_cpu_credits}: \$INSTANCE_ID"
+            break
+          fi
+        fi
+        sleep 5
+      done
+    fi
   # Worker nodes require public egress because this environment has no NAT.
   # role/elb excludes role/cni pod-capacity subnets from node placement.
   subnetSelectorTerms:
