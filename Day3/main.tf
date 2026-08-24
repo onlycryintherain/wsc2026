@@ -56,6 +56,15 @@ variable "db_proxy_name" { default = "apdev-proxy" }
 variable "db_secret_name" { default = "apdev-rds-credentials" }
 variable "db_instance_class" { default = "db.t3.micro" }
 variable "eks_node_instance_type" { default = "t3.medium" }
+variable "eks_node_cpu_credits" {
+  type    = string
+  default = "unlimited"
+
+  validation {
+    condition     = contains(["standard", "unlimited"], var.eks_node_cpu_credits)
+    error_message = "eks_node_cpu_credits는 standard 또는 unlimited여야 합니다."
+  }
+}
 variable "db_password" {
   default   = "Skill53##"
   sensitive = true
@@ -79,6 +88,7 @@ module "eks" {
   vpc_cidr      = module.vpc.vpc_cidr
   subnet_ids    = module.vpc.public_subnet_ids
   instance_type = var.eks_node_instance_type
+  cpu_credits   = var.eks_node_cpu_credits
 }
 
 # ===================
@@ -143,6 +153,7 @@ module "s3" {
   db_secret_name       = var.db_secret_name
   db_proxy_name        = var.db_proxy_name
   node_instance_type   = var.eks_node_instance_type
+  node_cpu_credits     = var.eks_node_cpu_credits
 }
 
 resource "aws_ecr_repository" "apps" {

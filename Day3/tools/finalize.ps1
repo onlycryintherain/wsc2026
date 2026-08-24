@@ -1,10 +1,10 @@
-<#
+﻿<#
 .SYNOPSIS
     2026 전국기능경기대회 채점 직전 finalize 스크립트
 .DESCRIPTION
     채점 부하가 처음 들어오는 시점의 Ready 노드를 1대(Managed)로 보장한다.
     1) Karpenter 노드 drain/삭제 -> Ready 노드 1대
-    2) Karpenter NodePool limits.cpu=1 -> 채점 중 추가 노드 생성 차단
+    4) Karpenter NodePool limits.cpu는 MaxNodes/ManagedNodes 기반으로 계산하며 추가 노드는 성능 실측을 통과한 경우에만 허용
     3) HPA min=1, max=SingleNode 튜닝값(또는 현재 값) 적용
     4) 1노드 내 pre-warm (기본 user 2 / product 2 / stress 1)
     5) 노드 1대 + replica + HPA 상태 검증
@@ -36,15 +36,31 @@ $ErrorActionPreference = 'Stop'
 $apps = @('user','product','stress')
 $preWarm = @{ user = $UserPreWarm; product = $ProductPreWarm; stress = $StressPreWarm }
 # tune.ps1 SingleNode 기준 최소 CPU request (request가 바뀐 경우 수동 조정)
-$requestCpu = @{ user = 125; product = 50; stress = 700 }
+$NodePoolCpuLimit = 2  # 각 Karpenter NodePool 1대분; 총 OperatingNodeBudget은 profile 기준
 
 function Require([string]$name) {
     if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { throw "명령을 찾을 수 없습니다: $name" }
 }
 
 function Invoke-Kubectl([string[]]$Arguments) {
-    & kubectl @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "kubectl 실패: kubectl $($Arguments -join ' ')" }
+    # Windows PowerShell 5.1 native argument 전달에서 JSON 따옴표가 손상되지 않도록
+    # kubectl patch payload는 임시 파일로 전달한다.
+    $args2=[System.Collections.Generic.List[string]]::new(); $tempFiles=[System.Collections.Generic.List[string]]::new()
+    try {
+        for ($i=0; $i -lt $Arguments.Count; $i++) {
+            if ($Arguments[$i] -eq '-p' -and ($i+1) -lt $Arguments.Count) {
+                $patch=[string]$Arguments[$i+1]
+                if ($patch.TrimStart().StartsWith('{') -or $patch.TrimStart().StartsWith('[')) {
+                    $file=[IO.Path]::GetTempFileName()
+                    [IO.File]::WriteAllText($file,$patch,(New-Object System.Text.UTF8Encoding($false)))
+                    $tempFiles.Add($file); $args2.Add('--patch-file'); $args2.Add($file); $i++; continue
+                }
+            }
+            $args2.Add([string]$Arguments[$i])
+        }
+        $output=@(& kubectl @args2 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "kubectl 실패: kubectl $($args2 -join ' '): $($output -join ' ')" }
+    } finally { foreach ($file in $tempFiles) { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue } }
 }
 
 function Get-ReadyNodeCount {
@@ -116,6 +132,11 @@ if ($ProfileJson) {
     Write-Host ("[finalize] 현재 HPA max를 유지합니다: user={0} product={1} stress={2}" -f $hpaMax.user,$hpaMax.product,$hpaMax.stress) -ForegroundColor Cyan
 }
 
+$requestCpu=@{}
+foreach ($app in $apps) {
+    $deployment = (& kubectl -n $Namespace get deployment $app -o json) | ConvertFrom-Json
+    $requestCpu[$app]=[int]([regex]::Match([string]$deployment.spec.template.spec.containers[0].resources.requests.cpu,'[0-9]+').Value)
+}
 $totalRequest = 0
 foreach ($app in $apps) { $totalRequest += [int]$requestCpu[$app] * $preWarm[$app] }
 Write-Host "[finalize] pre-warm CPU request 합계(순수 앱): ${totalRequest}m" -ForegroundColor DarkGray
@@ -128,7 +149,7 @@ if ($DryRun) {
     Write-Host ("  HPA min/max: user=1/{0} product=1/{1} stress=1/{2}" -f $hpaMax.user,$hpaMax.product,$hpaMax.stress)
     Write-Host "  pre-warm replica: user=$UserPreWarm product=$ProductPreWarm stress=$StressPreWarm"
     if ($FreezePreWarm) { Write-Host '  FreezePreWarm: HPA min을 pre-warm replica 수로 고정 (부하 시작까지 유지)' }
-    Write-Host "  NodePool limits.cpu: 1 (추가 노드 차단)" -NoNewline
+    Write-Host "  NodePool limits.cpu: $NodePoolCpuLimit (추가 노드 총량 제한)" -NoNewline
     if ($SkipNodePoolLimit) { Write-Host ' [SkipNodePoolLimit: 변경 안 함]' } else { Write-Host '' }
     Write-Host "  Karpenter drain: 실행" -NoNewline
     if ($SkipDrain) { Write-Host ' [SkipDrain: 생략]' } else { Write-Host '' }
@@ -157,16 +178,16 @@ if (-not $SkipDrain -and $PSBoundParameters.ContainsKey('SkipDrain')) {
     }
 }
 
-# ---------- 4. NodePool 추가 노드 차단 ----------
-# warm 전략: 기본 생략 — OperatingNodeBudget 내 확장을 막지 않는다.
-# (legacy limits.cpu=1은 채점 중 추가 노드 생성 차단용이었으나, warm capacity가
-#  곧 score-optimal budget이므로 명시적으로 -SkipNodePoolLimit=$false일 때만 적용)
-if (-not $SkipNodePoolLimit -and $PSBoundParameters.ContainsKey('SkipNodePoolLimit')) {
-    $nodePool = ((& kubectl get nodepool default -o json 2>$null) -join '') | ConvertFrom-Json
-    if (-not $nodePool) { throw 'Karpenter NodePool/default를 찾지 못했습니다. -SkipNodePoolLimit로 우회할 수 있습니다.' }
-    $patch = @{spec=@{limits=@{cpu='1'}}} | ConvertTo-Json -Compress
-    Invoke-Kubectl @('patch','nodepool','default','--type=merge','-p',$patch)
-    Write-Host '[finalize] NodePool limits.cpu=1 적용 (추가 노드 차단)' -ForegroundColor Cyan
+# ---------- 4. NodePool 추가 노드 총량 제한 ----------
+# 기본 적용: default와 stress NodePool 모두 현재 인스턴스 1대분(2 vCPU)으로 제한한다.
+if (-not $SkipNodePoolLimit) {
+    $patch = @{spec=@{limits=@{cpu="$NodePoolCpuLimit"}}} | ConvertTo-Json -Compress
+    foreach ($nodePoolName in @('default','stress')) {
+        $nodePool = ((& kubectl get nodepool $nodePoolName -o json 2>$null) -join '') | ConvertFrom-Json
+        if (-not $nodePool) { throw "Karpenter NodePool/$nodePoolName을 찾지 못했습니다. -SkipNodePoolLimit로 우회할 수 있습니다." }
+        Invoke-Kubectl @('patch','nodepool',$nodePoolName,'--type=merge','-p',$patch)
+        Write-Host ("[finalize] NodePool/{0} limits.cpu={1} 적용 (추가 노드 총량 제한)" -f $nodePoolName,$NodePoolCpuLimit) -ForegroundColor Cyan
+    }
 }
 
 # ---------- 5. HPA 적용 (ProfileJson의 최종 min/max 그대로) ----------
@@ -192,7 +213,7 @@ Write-Host "`n=== 최종 검증 ===" -ForegroundColor Yellow
 $readyTotal = Get-ReadyNodeCount
 $karpenterLeft = @(Get-KarpenterNodeNames).Count
 $fail = 0
-$operatingNodeBudget = 2   # tune.ps1 CostBaselineNodes 기준 (warm score-optimal budget)
+$operatingNodeBudget = 3   # tune.ps1 CostBaselineNodes 기준 (Managed 1 + Karpenter 2)
 Write-Host "  Ready 노드: $readyTotal 대 (OperatingNodeBudget $operatingNodeBudget 이하 목표)"
 if ($readyTotal -gt $operatingNodeBudget) { Write-Warning "Ready 노드가 OperatingNodeBudget 초과: $readyTotal 대"; $fail++ }
 Write-Host "  Karpenter 노드: $karpenterLeft 대 (warm capacity 유지 — 0 강제 아님)"

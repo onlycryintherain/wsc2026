@@ -12,6 +12,7 @@ DB_USERNAME="${db_username}"
 DB_SECRET_NAME="${db_secret_name}"
 RDS_PROXY_NAME="${db_proxy_name}"
 NODE_INSTANCE_TYPE="${node_instance_type}"
+NODE_CPU_CREDITS="${node_cpu_credits}"
 
 echo "=== Updating kubeconfig ==="
 aws eks update-kubeconfig --name ${cluster} --region ${region}
@@ -27,6 +28,39 @@ for i in $(seq 1 60); do
   echo "Attempt $i: No ready nodes yet, waiting..."
   sleep 10
 done
+
+if [[ "$NODE_INSTANCE_TYPE" == t* ]]; then
+  echo "=== Enforcing EC2 CPU credit mode: $NODE_CPU_CREDITS ==="
+  NODE_IDS=$(aws ec2 describe-instances \
+    --region "$REGION" \
+    --filters \
+      "Name=tag:aws:eks:cluster-name,Values=$CLUSTER" \
+      "Name=instance-state-name,Values=pending,running" \
+      "Name=instance-type,Values=$NODE_INSTANCE_TYPE" \
+    --query 'Reservations[].Instances[].InstanceId' \
+    --output text)
+  if [ -n "$NODE_IDS" ] && [ "$NODE_IDS" != "None" ]; then
+    for nid in $NODE_IDS; do
+      aws ec2 modify-instance-credit-specification \
+        --region "$REGION" \
+        --instance-credit-specifications "InstanceId=$nid,CpuCredits=$NODE_CPU_CREDITS"
+    done
+    CREDIT_STATE=$(aws ec2 describe-instance-credit-specifications \
+      --region "$REGION" \
+      --instance-ids $NODE_IDS \
+      --query 'InstanceCreditSpecifications[].CpuCredits' \
+      --output text)
+    echo "CPU credit mode: $CREDIT_STATE"
+    if ! echo "$CREDIT_STATE" | grep -qw "$NODE_CPU_CREDITS"; then
+      echo "ERROR: CPU credit mode verification failed" >&2
+      exit 1
+    fi
+  else
+    echo "No $NODE_INSTANCE_TYPE nodes found for CPU credit enforcement"
+  fi
+else
+  echo "Skipping CPU credit configuration for non-burstable instance type: $NODE_INSTANCE_TYPE"
+fi
 
 echo "=== Adding EKS access entry for root ==="
 aws eks create-access-entry --cluster-name ${cluster} --principal-arn arn:aws:iam::${account_id}:root --region ${region} 2>/dev/null || true
@@ -207,9 +241,35 @@ spec:
   role: ${node_role}
   kubelet:
     maxPods: 110
+  # Karpenter EC2NodeClass에는 creditSpecification native 필드가 없으므로
+  # AL2023 user data에서 T계열 인스턴스 자신에게 CPU credit 모드를 적용한다.
+  userData: |
+    #!/bin/bash
+    if [[ "${node_instance_type}" == t* ]]; then
+      for i in \$(seq 1 12); do
+        if command -v aws >/dev/null 2>&1; then
+          TOKEN=\$(curl -fsS -X PUT \\
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \\
+            http://169.254.169.254/latest/api/token || true)
+          INSTANCE_ID=\$(curl -fsS \\
+            -H "X-aws-ec2-metadata-token: \$TOKEN" \\
+            http://169.254.169.254/latest/meta-data/instance-id || true)
+          if [ -n "\$INSTANCE_ID" ] && aws ec2 modify-instance-credit-specification \\
+            --region "${region}" \\
+            --instance-credit-specifications "InstanceId=\$INSTANCE_ID,CpuCredits=${node_cpu_credits}"; then
+            logger "CPU credit mode set to ${node_cpu_credits}: \$INSTANCE_ID"
+            break
+          fi
+        fi
+        sleep 5
+      done
+    fi
+  # Worker nodes require public egress because this environment has no NAT.
+  # role/elb excludes role/cni pod-capacity subnets from node placement.
   subnetSelectorTerms:
     - tags:
         kubernetes.io/cluster/${cluster_name}: shared
+        kubernetes.io/role/elb: "1"
   securityGroupSelectorTerms:
     - tags:
         kubernetes.io/cluster/${cluster_name}: shared
@@ -237,13 +297,14 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
+  # Managed 1대 + default 1대 + stress 4대 = 최대 6대.
+  # Min replica는 건드리지 않고 저부하 빈 노드를 빠르게 회수한다.
   limits:
-    cpu: 1000
+    cpu: "2"
     memory: 1000Gi
   disruption:
-    # 채점/부하 중 노드 회수로 인한 Pod 재배치와 timeout을 방지한다.
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 10m
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
 NODEPOOL
 # 38점 기준: stress는 별도 NodePool + taint로 격리한다.
 # default NodePool은 user/product만 수용하고 stress NodePool만 workload-class=stress를 제공한다.
@@ -277,12 +338,14 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
+  # 대규모 트래픽에서 성능을 우선하되 총 worker ceiling 6을 넘지 않는 전용 4대분.
+  # 저부하에서는 1분 후 회수되어 managed 1 + stress 1 topology floor로 복귀한다.
   limits:
-    cpu: 1000
+    cpu: "8"
     memory: 1000Gi
   disruption:
-    consolidationPolicy: WhenEmpty
-    consolidateAfter: 10m
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
 STRESS_NODEPOOL
 
 # NodePool에 taint가 있으면(스트레스 격리) aws-node/kube-proxy가 그 노드에
@@ -294,8 +357,37 @@ STRESS_NODEPOOL
 kubectl -n kube-system patch daemonset aws-node --type=strategic -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"wsi2026.io/app-capacity","operator":"Exists","effect":"NoSchedule"},{"key":"wsi2026.io/app-capacity","operator":"Exists","effect":"NoExecute"},{"key":"wsi2026.io/stress","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/network-unavailable","operator":"Exists","effect":"NoSchedule"},{"key":"CriticalAddonsOnly","operator":"Exists"}]}}}}' || true
 kubectl -n kube-system patch daemonset kube-proxy --type=strategic -p '{"spec":{"template":{"spec":{"tolerations":[{"key":"wsi2026.io/app-capacity","operator":"Exists","effect":"NoSchedule"},{"key":"wsi2026.io/app-capacity","operator":"Exists","effect":"NoExecute"},{"key":"wsi2026.io/stress","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/not-ready","operator":"Exists","effect":"NoSchedule"},{"key":"node.kubernetes.io/unreachable","operator":"Exists","effect":"NoSchedule"},{"key":"CriticalAddonsOnly","operator":"Exists"}]}}}}' || true
 
-# prefix delegation: 노드당 Pod 상한을 풀어 t3.medium 슬롯 문제 해소
-kubectl -n kube-system set env ds/aws-node ENABLE_PREFIX_DELEGATION=true WARM_PREFIX_TARGET=1 || true
+# prefix delegation + custom networking: t3.medium의 Pod 슬롯을 확보하고 Pod IP는
+# 넓은 /22 전용 subnet에서 할당한다. Public /24의 조각난 /28 prefix 때문에 spike
+# 순간 FailedCreatePodSandBox가 발생하지 않도록 AZ별 ENIConfig를 강제한다.
+POD_SUBNET_A=$(aws ec2 describe-subnets --region "$REGION" --filters "Name=vpc-id,Values=${vpc_id}" "Name=tag:Name,Values=${cluster_name}-pod-capacity-1" --query 'Subnets[0].SubnetId' --output text)
+POD_SUBNET_B=$(aws ec2 describe-subnets --region "$REGION" --filters "Name=vpc-id,Values=${vpc_id}" "Name=tag:Name,Values=${cluster_name}-pod-capacity-2" --query 'Subnets[0].SubnetId' --output text)
+NODE_SG=$(aws ec2 describe-security-groups --region "$REGION" --filters "Name=vpc-id,Values=${vpc_id}" "Name=group-name,Values=${cluster_name}-node-sg" --query 'SecurityGroups[0].GroupId' --output text)
+if [[ "$POD_SUBNET_A" != "None" && "$POD_SUBNET_B" != "None" && "$NODE_SG" != "None" ]]; then
+cat <<ENICONFIG | kubectl apply -f -
+apiVersion: crd.k8s.amazonaws.com/v1alpha1
+kind: ENIConfig
+metadata:
+  name: ${region}a
+spec:
+  subnet: $POD_SUBNET_A
+  securityGroups:
+    - $NODE_SG
+---
+apiVersion: crd.k8s.amazonaws.com/v1alpha1
+kind: ENIConfig
+metadata:
+  name: ${region}b
+spec:
+  subnet: $POD_SUBNET_B
+  securityGroups:
+    - $NODE_SG
+ENICONFIG
+  kubectl -n kube-system set env ds/aws-node ENABLE_PREFIX_DELEGATION=true WARM_PREFIX_TARGET=1 AWS_VPC_K8S_CNI_CUSTOM_NETWORK_CFG=true ENI_CONFIG_LABEL_DEF=topology.kubernetes.io/zone || true
+else
+  echo "CNI custom networking discovery failed: subnetA=$POD_SUBNET_A subnetB=$POD_SUBNET_B nodeSG=$NODE_SG" >&2
+  exit 1
+fi
 
 kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
 cat <<K8SSA | kubectl apply -f -
@@ -428,16 +520,22 @@ spec:
         ports:
         - containerPort: 8080
         resources:
-          # 38점 기준: stress는 600m request / 2CPU limit으로 격리한다.
-          # CPU limit을 제거하지 않아 stress burst가 foreground 앱을 침범하지 않는다.
+          # stress는 600m request만 두고 CPU limit은 제거해 burst/throttling을 방지한다.
+          # request × HPA target = 600m × 55% = 330m control point를 유지한다.
           requests: {cpu: 600m, memory: 640Mi}
-          limits: {cpu: 2000m, memory: 1536Mi}
+          limits: {memory: 1536Mi}
         readinessProbe:
           httpGet: {path: /healthcheck, port: 8080}
           initialDelaySeconds: 2
           periodSeconds: 5
           timeoutSeconds: 5
           failureThreshold: 6
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels: {app: stress}
 ---
 apiVersion: v1
 kind: Service
@@ -476,8 +574,7 @@ metadata:
     alb.ingress.kubernetes.io/healthcheck-timeout-seconds: '3'
     alb.ingress.kubernetes.io/healthcheck-healthy-threshold-count: '2'
     # 큐잉 병목: 막힌 Pod로 요청을 보내지 않는다
-    alb.ingress.kubernetes.io/target-group-attributes: load_balancing.algorithm.type=least_outstanding_requests
-    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=10
+    alb.ingress.kubernetes.io/target-group-attributes: load_balancing.algorithm.type=least_outstanding_requests,deregistration_delay.timeout_seconds=10
     alb.ingress.kubernetes.io/actions.response-404: '{"type":"fixed-response","fixedResponseConfig":{"contentType":"application/json","statusCode":"404","messageBody":"{\"err\":\"not found\"}"}}'
 spec:
   ingressClassName: alb
@@ -603,7 +700,9 @@ spec:
     kind: Deployment
     name: stress
   minReplicas: 1
-  maxReplicas: 6
+  # peak2 실측에서 stress 8개도 zero-success capacity에 도달했다.
+  # 전용 NodePool을 확장해 최대 12개까지 수평 확장을 허용한다.
+  maxReplicas: 12
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0

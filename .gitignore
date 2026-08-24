@@ -1,16 +1,20 @@
 # Ignore terraform directories
 **/.terraform/
 
-# Ignore terraform state files
+# Ignore Terraform state files
 *.tfstate
 *.tfstate.*
 
-# Ignore test output files
-test*
+# Ignore Terraform dependency lock files
+*.lock.hcl
 
 # Ignore crash log files
 crash.log
 crash.*.log
+
+# Ignore terraform variables
+*.tfvars
+*.tfvars.json
 
 # Ignore override files
 override.tf
@@ -18,5 +22,14 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 
-# Ignore lock files
-.terraform.lock.hcl
+# Ignore Terraform plan files
+*.tfplan
+*.tfplan.*
+tfplan*
+
+# Day3 runtime/test outputs belong in temporary storage, not Git.
+Day3/tools/profile-sweep-*.json
+Day3/tools/test-results*.txt
+Day3/*-plan.txt
+**/__pycache__/
+*.pyc

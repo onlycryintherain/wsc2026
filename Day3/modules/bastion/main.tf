@@ -82,7 +82,10 @@ resource "aws_instance" "bastion" {
 
   tags = { Name = "${var.cluster_name}-bastion" }
 
+  # The instance must not boot before the role policy is attached. IAM/IMDS
+  # credentials can still take time to propagate; userdata has a retry window.
   depends_on = [
     aws_eks_access_policy_association.bastion,
+    aws_iam_role_policy_attachment.bastion,
   ]
 }

@@ -79,6 +79,21 @@ resource "aws_iam_role_policy_attachment" "node_policies" {
   policy_arn = each.value
 }
 
+# Karpenter AL2023 user data enforces the CPU credit mode on T instances.
+resource "aws_iam_role_policy" "eks_node_credit" {
+  name = "${var.cluster_name}-node-credit"
+  role = aws_iam_role.eks_node.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["ec2:ModifyInstanceCreditSpecification"]
+      Resource = "*"
+    }]
+  })
+}
+
 resource "aws_eks_node_group" "this" {
   cluster_name    = aws_eks_cluster.this.name
   node_group_name = "${var.cluster_name}-ng"
@@ -98,11 +113,23 @@ resource "aws_eks_node_group" "this" {
     version = aws_launch_template.eks_node.latest_version
   }
 
-  depends_on = [aws_iam_role_policy_attachment.node_policies]
+  depends_on = [
+    aws_iam_role_policy_attachment.node_policies,
+    aws_iam_role_policy.eks_node_credit,
+  ]
 }
 
 resource "aws_launch_template" "eks_node" {
   name_prefix = "${var.cluster_name}-lt-"
+
+  # Credit specification is valid only for burstable T-family instances.
+  # This keeps c5/m5 changes valid without sending an invalid EC2 field.
+  dynamic "credit_specification" {
+    for_each = startswith(var.instance_type, "t") ? [1] : []
+    content {
+      cpu_credits = var.cpu_credits
+    }
+  }
 
   # AL2023 EKS NodeConfig: managed nodegroup kubelet Pod density must match
   # Karpenter EC2NodeClass (maxPods=110), not the t3.medium default of 17.

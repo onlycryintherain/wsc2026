@@ -48,3 +48,13 @@ variable "db_username" { type = string }
 variable "db_secret_name" { type = string }
 variable "db_proxy_name" { type = string }
 variable "node_instance_type" { type = string }
+
+variable "node_cpu_credits" {
+  type    = string
+  default = "unlimited"
+
+  validation {
+    condition     = contains(["standard", "unlimited"], var.node_cpu_credits)
+    error_message = "node_cpu_credits는 standard 또는 unlimited여야 합니다."
+  }
+}

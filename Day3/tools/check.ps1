@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     2026 전국기능경기대회 Cloud 최종 점검 스크립트
 .DESCRIPTION
@@ -47,8 +47,44 @@ if ($Endpoint -notmatch '^https?://') { $Endpoint = "https://$Endpoint" }
 $Endpoint = $Endpoint.TrimEnd('/')
 Write-Host "[check] endpoint=$Endpoint`n"
 
-# dump에서 테스트 데이터 추출
-. (Join-Path $PSScriptRoot 'get-test-data.ps1')
+# dump에서 테스트 데이터 추출. check.ps1 단독 실행이 가능하도록 외부 helper에
+# 의존하지 않는다. 당일 dump 형식이 SQL/JSON/CSV/텍스트로 바뀌어도 첫 사용자를 찾는다.
+function Get-CheckFixture {
+    $dumpPath = if ($env:LOAD_USER_DUMP) { $env:LOAD_USER_DUMP } else { Join-Path $PSScriptRoot '..\application\load_user.dump' }
+    if (-not (Test-Path -LiteralPath $dumpPath)) { $dumpPath = Join-Path $PSScriptRoot '..\application\load_user.dump' }
+    $raw = if (Test-Path -LiteralPath $dumpPath) { Get-Content -LiteralPath $dumpPath -Raw -Encoding UTF8 } else { '' }
+
+    $id = $null
+    $email = $null
+    $emailMatch = [regex]::Match($raw, '[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+    if ($emailMatch.Success) { $email = $emailMatch.Value }
+
+    $idMatch = [regex]::Match($raw, "(?im)^\s*INSERT\s+INTO\s+[^\r\n]*user[^\r\n]*SET\s+id\s*=\s*'([^']+)")
+    if ($idMatch.Success) { $id = $idMatch.Groups[1].Value }
+    if (-not $id) { $idMatch = [regex]::Match($raw, '(?i)"(?:id|user_id|userid|username)"\s*:\s*"?([A-Za-z0-9_.-]+)') }
+    if ($idMatch.Success -and -not $id) { $id = $idMatch.Groups[1].Value }
+    if (-not $id) {
+        $idMatch = [regex]::Match($raw, "\('([^']+)'\s*,\s*'[^']+'\s*,\s*'[^']+'\)")
+        if ($idMatch.Success) { $id = $idMatch.Groups[1].Value }
+    }
+    if (-not $id) {
+        $idMatch = [regex]::Match($raw, '(?i)\b(?:dbdump|user)[A-Za-z0-9_-]*\d+\b')
+        if ($idMatch.Success) { $id = $idMatch.Value }
+    }
+    if (-not $id) { $id = if ($env:CHECK_USER_ID) { $env:CHECK_USER_ID } else { 'dbdump1' } }
+    if (-not $email) { $email = if ($env:CHECK_USER_EMAIL) { $env:CHECK_USER_EMAIL } else { "$id@example.org" } }
+
+    return [pscustomobject]@{
+        UserId = $id
+        UserEmail = $email
+        ProductId = if ($env:CHECK_PRODUCT_ID) { $env:CHECK_PRODUCT_ID } else { 'dbdump500001' }
+    }
+}
+
+$fixture = Get-CheckFixture
+$TestUserId = $fixture.UserId
+$TestUserEmail = $fixture.UserEmail
+$TestProductId = $fixture.ProductId
 
 Write-Host "[check] dump user: id=$TestUserId email=$TestUserEmail; product=$TestProductId`n"
 

@@ -146,6 +146,9 @@ terraform plan -var-file=terraform.tfvars
 
 # API/WAF 점검은 복구 스크립트와 분리해서 실행
 .\tools\check.ps1 -Api
+
+# 실제 트래픽 분석 및 안전한 HPA 튜닝(tune.ps1과 동시 실행 금지)
+.\tools\observe-live.ps1
 ```
 
 `tools/stabilize.ps1`은 API 요청을 보내지 않는다. 부하로 늘어난 `user`, `product`, `stress` Deployment를 각각 1개 Pod로 줄이고 HPA를 `minReplicas=1`, `maxReplicas=1`로 고정한다. HPA가 다시 확장되는 것을 막기 위해 이 동작을 유지한다.
@@ -159,6 +162,67 @@ terraform plan -var-file=terraform.tfvars
 - Stress 전용 NodePool은 기본 설정으로 만들지 않는다. 비용/인스턴스 비율을 먼저 고려한다.
 - WAF rate limit은 사용하지 않는다.
 - 성능 변경 후 비용 영향과 Terraform 재생성 여부를 함께 확인한다.
+
+## `skills-server:8003` 제어 API 사용
+
+기본 주소는 `http://skills-server:8003`이다. 이 API는 외부 채점 부하의 시작·중지, 실행별 점수, Kubernetes/EC2 관측값과 허용된 튜닝 설정을 제공한다. API 자체 명세는 `GET /`에서 확인한다.
+
+### 주요 API
+
+| 메서드 | 경로 | 용도 |
+|---|---|---|
+| GET | `/health` | 제어 서버 상태 확인 |
+| POST | `/api/load/start` | `{template, endpoint}`로 새 부하 실행 시작 |
+| POST | `/api/load/stop` | 현재 사용자의 injector 중지 |
+| GET | `/api/load/status` | `run_id`, running, phase, elapsed, target/sent RPS, dropped 확인 |
+| GET | `/api/runs/score` | 현재 run에 고정된 40점 점수와 앱별 가용성/성능/평균 EC2 확인 |
+| GET | `/api/runs/live` | 최신 phase와 부하량 확인 |
+| GET | `/api/score` | 실시간 점수 확인. 반드시 응답의 `run.run_id`를 기대 ID와 대조 |
+| GET | `/api/cluster` | snapshot ID와 노드/Pod/HPA/EC2 종합 상태 확인 |
+| GET | `/api/cluster/{nodes,pods,hpa,ec2,karpenter,pending,stress-check}` | 세부 클러스터 관측 |
+| GET | `/api/config/{hpa,resources,karpenter,meta,validate,history}` | 현재 설정과 검증 결과 조회 |
+| GET | `/api/log/monitor?tail=50` | 분 단위 판정, 2xx/5xx, P95, EC2 로그 확인 |
+
+### 기본 사용 예시
+
+```powershell
+$LoadServer = 'http://skills-server:8003'
+
+# 명세/상태/점수
+Invoke-RestMethod "$LoadServer/"
+Invoke-RestMethod "$LoadServer/api/load/status"
+Invoke-RestMethod "$LoadServer/api/runs/score"
+Invoke-RestMethod "$LoadServer/api/cluster"
+Invoke-RestMethod "$LoadServer/api/log/monitor?tail=50"
+
+# 직접 시작해야 할 때만 사용한다. 평소에는 tune.ps1 경로를 우선한다.
+$body = @{
+  template = '순차증가'
+  endpoint = 'https://example.cloudfront.net'
+} | ConvertTo-Json -Compress
+$run = Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/start" `
+  -ContentType 'application/json' -Body $body
+$expectedRunId = [string]$run.run_id
+
+# 종료
+Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/stop" `
+  -ContentType 'application/json' -Body '{}'
+```
+
+### 운용 규칙과 확인된 동작
+
+- 부하 시작은 가능하면 `tools/tune.ps1`을 통해 수행한다. HPA/resources/Karpenter PUT도 직접 호출하지 않고 tuner의 측정·rollback 경로만 사용한다.
+- `/api/load/start`는 중복 실행 위험이 있으므로 자동 retry하지 않는다. GET과 idempotent endpoint PUT만 제한적으로 retry한다.
+- 시작 응답의 `run_id`를 owner로 저장하고 status/score의 ID와 계속 대조한다. 서버가 직전 snapshot을 순간 노출할 수 있으므로 불일치 시 2초 간격 3회 재확인한 뒤에만 `PROFILE_RUN_CHANGED`로 중지한다.
+- 동시에 두 개의 `tune.ps1` 또는 UI run을 시작하지 않는다. 새 run은 기존 phase clock과 run별 점수 창을 교체한다.
+- CloudFront 재생성 후 `/api/config/meta`의 `endpoint`가 이전 도메인에 남을 수 있다. 현재 endpoint와 먼저 GET 비교하고, 다를 때만 PUT한 뒤 GET 검증한다. 같은 값을 불필요하게 PUT하면 user-scoped UI metadata가 갱신될 수 있다.
+- `/api/load/status`의 `endpoint`는 정상 run에서도 `null`일 수 있으므로 meta endpoint, 실제 앱 access log, HPA CPU 증가를 함께 확인한다.
+- `/api/load/start`는 user-scoped multiplier를 저장 기본값으로 되돌릴 수 있다. 요청 강도는 임의 변경하지 않는다. 주인이 UI 지원 배율을 명시적으로 선택한 경우에만 `tune.ps1 -ExternalLoadMultiplier <값>`으로 start 직후 global/scoped 값을 원자 적용하고 GET 검증한다.
+- run 직후 이전 점수가 잠깐 보일 수 있다. 새 `run_id`, 첫 신규 분 로그, 앱별 2xx가 확인되기 전 점수는 판정 근거로 쓰지 않는다.
+- `sent_rps`의 순간 흔들림은 generator 포화가 아니다. 누적 `dropped > 0`만 generator limit 근거로 사용한다.
+- 2xx가 0이고 Pod access log/HPA 변화가 없으면 성능 문제가 아니라 endpoint/DNS 무효 run으로 판단해 즉시 중지한다.
+- tuner 관측 프로세스가 종료돼도 injector가 계속 실행될 수 있다. 항상 `/api/load/status.running`을 별도로 확인하고 경기 종료 시 `/api/load/stop`으로 종료한다.
+- 점수는 run별이다. `total40`, availability/performance/cost, 앱별 perf/avail, `avg_ec2`, dropped를 run ID와 함께 기록한다.
 
 ## WAF 원칙
 
@@ -187,6 +251,74 @@ terraform plan -var-file=terraform.tfvars
 - 작업 기록은 이 파일(AGENTS.md)에 로그로 남긴다.
 
 ## 최근 작업 로그
+
+| 2026-08-25 | pending | 저장소를 Day3 전용으로 정리 — `destroy-plan.txt` Terraform 산출물 제거, feature/day3-tuning을 main에 통합하고 Day1 기능 브랜치 제거 |
+| 2026-08-25 | pending | `feature/day3-tuning` 실운영 정리 — 무인 `observe-live.ps1` 추가(검증된 scale-down 300초), `get-test-data.ps1` 로직을 `check.ps1`에 내장, DB/S3 삭제 도구·중복 Stress 평가 도구·커밋된 테스트 결과 3개 제거. observe self-test 6/6, tune self-test 26/26, Python 5/5 및 live JSONL 갱신 확인 |
+| 2026-08-25 | pending | 다음 240초 BASE에서 최종 Pending 4개는 모두 NodePool CPU `Unschedulable`인데, profile 중 이미 사라진 stress Pod의 일시적 `FailedCreatePodSandBox: failed to setup network policy` 이벤트 때문에 `CNI_UNRESOLVED`로 오판한 문제 수정. CNI/PDB/NodePool 이벤트는 최신 sample의 동일 Pending Pod 이름과 일치할 때만 unresolved/current evidence로 인정하고, 복구된 과거 CNI Event는 JSON evidence에만 보존. 종료 cleanup 후 user2/product2/stress1·HPA min 건강 확인. self-test26/26·localhost5/5 통과. |
+| 2026-08-25 | pending | 첫 240초 Python ramp 뒤 stress HPA12 상태에서 600→540m resource candidate rollout이 45초 timeout되고, rollback 540→600m은 4노드에 600m Pod 12개가 물리적으로 fit하지 않아 재차 timeout한 문제 수정. live는 HPA 55%/1..12·template600m으로 확인 후 stress scale1 및 candidate RS0으로 복구. Resource apply/rollback은 HPA 적용→min 축소→stress Pod 교체로 timeout 뒤에도 계속되는 CPU backlog 제거→resource patch→120초 rollout 순서로 변경. candidate/FINAL 전 fresh min reset, 정상/오류 종료 cleanup, PID+timestamp 결과 디렉터리를 추가하고 worst-case1185초 유지. self-test26/26·localhost5/5 통과. |
+| 2026-08-25 | pending | 사용자 요청에 따라 40초 3프로필 Python 부하를 구형 k6와 동일한 240초 단일 ramping-arrival-rate 계약(10 RPS warmup20s→20/30/40/50/60 각32s linear ramp→60 steady30s→cooldown30s, stress length256)으로 교체. steady phase만 성능 판정하고 Kubernetes sample에는 phase/RPS를 기록. NodePool limit/Insufficient CPU는 terminal stop이 아니라 failing app의 bounded request -10% + absolute HPA trigger 보존 candidate evidence로 전환하며 CNI/PDB/metrics/generator만 측정 무효로 중단. BASE→candidate 1개→FINAL worst-case 975초. self-test25/25·Python localhost5/5 통과. |
+| 2026-08-25 | pending | measured tuner live 실행이 BASE에서 default CPU2·stress CPU8 hard limit을 확인. explicit limit을 `NODEPOOL_LIMIT`로 분류하고 terminal infrastructure/generator stop 시 FINAL을 생략하며, 20분은 최소가 아닌 hard ceiling임을 시작 로그/README에 명시. 반복된 scheduler/event 원문으로 STOP_REASON이 폭증하지 않도록 `pending/app/readyNodes/nodepools` bounded summary로 교체하고 FINAL 생략 시 출력 label도 교정. self-test 23/23·localhost 4/4 통과. |
+| 2026-08-25 | pending | `tools/tune.ps1`을 20분 absolute deadline 기반 measured tuner로 단순화. immutable live BASE→performance-first one-delta(HPA_MAX/HPA_TARGET/MIN_UP/MIN_DOWN/REQUEST_CONTROL_POINT)→fresh KEEP/REJECT→exact BEST rollback/live equality→measured FINAL 흐름만 유지하고 PDB/placement/NodePool/Karpenter/shared-domain packing mutation 및 구형 k6/model test를 제거. Python 3.14 bounded asyncio loadgen에 phase별 SLO JSON과 강제 queue overflow 검증을 추가. PowerShell self-test 22/22, localhost Python 4/4, parse/py_compile/static forbidden grep/git diff check 통과; 실제 EKS 부하는 실행하지 않음. |
+| 2026-08-23 | pending | `skills-server:8003` 제어 API 사용 절 추가. 주요 load/run/score/cluster/config/log endpoint, PowerShell 예시, run ID ownership, POST start non-retry, CloudFront endpoint GET-first 동기화, scoped multiplier 동작, stale snapshot 재확인, 무효 run 판정 및 injector 별도 종료 규칙을 문서화. |
+| 2026-08-23 | pending | `aws ec2 modify-instance-credit-specification` 명령어가 올바르지 않은 파라미터(--instance-ids, --cpu-credits)를 사용하여 `bastion_setup.sh` 실행 시 AWS CLI 오류로 setup.sh가 실패하는 버그 해결. `bastion_setup.sh` 본문 및 Karpenter `EC2NodeClass` userData 내의 명령을 올바른 규격(--instance-credit-specifications "InstanceId=...,CpuCredits=...")으로 수정 및 루프 처리 보강. `terraform validate` 통과. |
+| 2026-08-23 | pending | Max32 `run-1787418670` baseline 32.5점은 product availability60.15%로 무효. 원인은 Terraform state의 EKS OIDC Provider가 AWS에서 외부 삭제되어 ALB Controller가 `InvalidIdentityToken`으로 stale target을 유지했고, product TG에 재사용된 user Pod IP가 남아 404 발생. saved targeted plan으로 OIDC Provider 1 add 복구, controller restart 후 product/user/stress healthy target이 EndpointSlice와 정확히 일치함을 확인. `tune.ps1`은 매 profile 전에 ALB healthy target exact-set gate를 통과해야 시작하도록 보강. self-test36/36·terraform validate 통과. |
+| 2026-08-23 | pending | EKS 노드 CPU credit 정책을 root `eks_node_cpu_credits=unlimited`로 명시. Managed NodeGroup Launch Template은 T계열에서만 `credit_specification`을 생성하고, Karpenter `EC2NodeClass` userData와 setup.sh 기존 노드 보정/검증으로 unlimited를 재현. c5/m5 전환 시 credit 블록/API 호출을 건너뛰도록 가드 추가. `terraform validate`, t3/c5 plan, Git Bash `bash -n` 통과; plan은 기존 Bastion 삭제/SG drift로 apply하지 않음. |
+| 2026-08-23 | pending | Max32 final 시작 `run-1787418376`에서 첫 sample 뒤 PROFILE_RUN_CHANGED로 observer 종료. `/load/start` response와 status ID는 수동 동일 절차에서 일치함을 검증. 서버의 직전 snapshot 순간 노출 가능성을 반영해 2초×3회 ID 재확인 후에만 owner 변경으로 중단하고 expected/actual ID를 오류에 기록하도록 보강. 타 run을 자동 adopt하지 않음. self-test36/36·terraform validate 통과. |
+| 2026-08-23 | pending | user target23/Max25 `run-1787417174`: 762s 33.5/40, user/product/stress perf34.50/92.45/82.38%, avg2.08로 target28 대비 user 회귀하여 REJECT. Pending sample은 11→3→2→1 감소, Ready 2→3→3→5(종료 직후6) 정상 scale-out인데 sample 4개로 NODE_CPU_CAPACITY 오판. Ready 증가+Pending 감소를 elastic recovery로 인정하도록 수정, self-test36/36·terraform validate 통과. |
+| 2026-08-23 | pending | custom CNI evidence resume로 user Max25→32 후보 `run-1787415764`; PROFILE_RUN_CHANGED로 tuner observer는 29s에 종료됐지만 injector를 독립 관찰해 1081s spike1 근거 종료. user27/32·CPU30/28에서 user perf70.60%, 총34/40·perf8·cost10·avg2.78로 Max보다 trigger 병목. severe perf<75의 near-ceiling 기준을 90→80%로 조정해 target28→23 one-delta 생성, self-test36/36·terraform validate 통과. |
+| 2026-08-23 | pending | custom CNI 재측정 `run-1787414573`: spike1 763s online stop, 34.5/40·perf7.5·cost11·avg2.15, user/product/stress 45.61/90.62/85.96%, user25/25. 신규 aws-node 시작 7초 뒤 9 Pod가 FailedCreatePodSandBox 1회 발생했으나 다음 sample 전에 모두 전용 /22 IP로 Running 복구. 누적 Event만으로 영구 CNI capacity를 오판하지 않고 latest sample의 unresolved ContainerCreating이 있을 때만 stop하도록 수정, unresolved/recovered self-test 포함 36/36·terraform validate 통과. |
+| 2026-08-23 | pending | 기존 binary user Max25·target28 `run-1787410997`은 spike1 762s에서 online stop: 33.5/40, perf6.5, cost11, avg2.08, user/product/stress 51.05/91.70/77.61%, user25/25. shared 신규 노드에서 FailedCreatePodSandBox 6건으로 측정 무효. VPC CNI custom networking을 AZ별 pod-capacity /22 ENIConfig로 강제하고 probe Pod `10.0.6.192` 확인. infra stop 뒤 동일 설정 FINAL_FRESH를 실행하던 제어 흐름을 즉시 return으로 수정. S3 재현 script targeted apply, self-test36/36·terraform validate 통과. |
+| 2026-08-22 | pending | cooldown PDB relax 함수가 `Invoke-Kubectl` 출력을 saved hashtable과 함께 반환해 restore 값이 배열로 오염되고 user/product PDB가 0으로 남는 버그 발견. active baseline을 중지하고 PDB 1 즉시 복구, relax/restore kubectl 출력을 `Out-Null` 처리. 구버전 tuner 종료 후 self-test 36/36·terraform validate 통과. |
+| 2026-08-22 | pending | profile 시작 지연 개선: no-traffic cooldown에서 Ready 부하가 없고 HPA가 60초 이상 잔류하면 노드 수와 무관하게 `tune.ps1`이 scaleDown을 임시 0s/100%로 가속하고 min 도달 즉시 표준 300s/Min 정책을 복구. 이전 6~10분 stair-step 대기와 cooldown timeout 오염을 제거. user25 near-ceiling 증거로 다음 seed user target33→28 적용. parse/self-test 36/36·terraform validate 통과. |
+| 2026-08-22 | pending | 기존 binary 재튜닝 seed user Max25 `run-1787408633`은 spike1에서 user24/25 near-ceiling, perf70.42%, 총점34까지 확인 후 1435s에 근거 종료. exact max/CPU>target만 요구해 online 전환하지 못한 조건을 보강하여, perf<75 + 최근3 sample desired≥90% Max + CPU≥90% target도 recovery signal로 인정하고 `HPA_TARGET_RECOVERY` user33→28 one-delta를 생성하도록 개선. 기존 binary 재배포 상태 유지, self-test 36/36·terraform validate 통과. |
+| 2026-08-22 | pending | 기존 binary+t3 0.5x 2h `run-1787402745`는 4358s에 중지: 21.5/40(성능5.5·비용0), user/product/stress perf 23.96/97.52/78.94%, avg4.26, peak Ready7, spike1 Pending17, user20·stress12 HPA ceiling. 성능<30 이후 계속 관찰한 운영 오류를 인정하고 즉시 stop, 검증된 low binary(S3/ECR/rollout/API)와 최고 구성으로 복구. 단순 붕괴 stop 대신 `tune.ps1`이 10분 이후 perf<90 + 최근3 sample HPA ceiling/CPU>target을 감지하면 partial evidence를 보존하고 run을 조기 종료하여 outer lifecycle이 HPA Max one-delta를 생성·재시작하도록 개선. self-test 36/36·terraform validate 통과. |
+| 2026-08-22 | pending | 사용자 요청에 따라 low 교체 전 기존 `application/binary`를 commit `f36dcbd`에서 복원하고 S3/ECR latest 재배포·rollout. 기존 digest user `d90e5791`, product `4deb5e02`, stress `2a843ac8` 사용 확인. t3.medium 2대에서 health/user/product 200, stress length128 201(652ms), warm API 49~100ms 정상. 동일 최고 HPA/resource 구성과 0.5x 2h-standard 재검증 준비. |
+| 2026-08-22 | pending | t3.medium 2대 idle + low binary 최고 구성 0.5x `2h-standard` `run-1787395279` 완주: 39/40(가용성12·성능12·비용11), user/product/stress perf 92.47/112.42/98.78%, availability 99.94/100/99.96%, avg EC2 2.23, dropped0. baseline/spike1/valley는 40 유지, spike2에서 38→39 회복, peak Ready3 후 down1에서2로 복귀. tuner는 초반 PROFILE_RUN_CHANGED로 종료됐지만 injector 7199s 및 독립 observer/API score로 완주 검증. |
+| 2026-08-22 | pending | 사용자 요청으로 `terraform.tfvars` 단일 기준을 c5.large→t3.medium으로 복귀. saved plan(2 add/2 change/1 destroy) 적용해 Managed NodeGroup 교체 후 bastion setup이 Karpenter default/stress 요구 타입도 t3.medium으로 동기화. PDB로 남은 c5 stress 노드는 cordon+stress rollout으로 t3 stress 노드를 먼저 Ready시킨 뒤 안전 종료. 현재 EKS running EC2는 t3.medium 2대뿐이며 최고 39점 구성(user/product70m, stress550m@60) `tune.ps1` fingerprint 복구, Pod/HPA min 및 API 200 확인. |
+| 2026-08-22 | pending | shared user request 70m@33→50m@46 후보 `run-1787387744`는 36.5/40(성능9.5·비용11·avg2.47), user perf 77.69%로 39점 BEST보다 크게 회귀하여 REJECT. peak에서 default 노드가 여전히 생성되어 2노드 packing도 실패. tuner immutable rollback으로 user70m@33·stress550m@60 복구 및 rollout 확인 후 중복 fresh는 중지. 원인은 shared capacity에서 static system Pod request 누락으로, domain 모델이 shared에는 DaemonSet뿐 아니라 전체 `AvailableAppCPU` reserve를 사용하도록 교정하고 unsafe 후보 방지 self-test 35/35·terraform validate 통과. |
+| 2026-08-22 | pending | 39→40 비용 후보를 위해 `Get-CostAwarePackingRecommendation`을 앱 단독 density뿐 아니라 live nodeSelector placement-domain 합산 경계로 확장. 동시 HPA desired의 CPU request·memory·Pod slot이 축소 노드에 fit하고 실측 aggregate CPU<80%인 경우에만 절대 HPA trigger 보존 request 후보를 생성하며, 같은 node saving이면 상대 request 감소가 가장 작은 안전 후보를 우선. 현재 evidence는 shared user20+product7~8의 2→1노드 경계에서 user70m@33→50m@46을 산출. self-test 35/35·terraform validate 통과. |
+| 2026-08-22 | pending | low binary 공식 0.5x `순차증가`: BASE `run-1787380613` 38/40(성능12·비용10·avg2.90·peak4), stress request packing 600m@55→550m@60 후보 `run-1787382981` 39/40(성능12·비용11·avg2.50·peak3), FINAL_FRESH `run-1787385221` 39/40(가용성12·성능12·비용11, user/product/stress perf 90.63/113.70/99.23%, avg2.43, dropped0) 재현. 절대 HPA trigger330m 보존과 stress 3 Pod의 전용 노드 2→1 packing으로 1점 개선하여 KEEP. |
+| 2026-08-22 | pending | `/api/load/start`가 user-scoped 강도를 저장 기본값 0.25로 되돌리는 동작을 짧은 calibration run으로 확인. active run에서 scoped meta를 0.5로 PUT하면 target이 2.3→4.7 RPS로 즉시 전환됨을 검증하여 `-ExternalLoadMultiplier`를 추가하고, 각 start/restart 직후 global+발견된 scoped multiplier를 원자 적용·GET 검증하도록 보강. 기본값0은 서버 설정 보존. self-test 34/34·terraform validate 통과. |
+| 2026-08-22 | pending | low binary 첫 `run-1787378429`는 CloudFront 생성 직후 load server DNS 미전파로 앱 access log/HPA 트래픽 없이 2xx=0인 무효 run. 이어진 `run-1787380268`에서 DNS 정상화를 확인했지만 scoped multiplier가 0.25로 돌아가 88초에 중지. endpoint가 이미 같아도 meta PUT을 실행하면 서버가 user-scoped UI metadata를 refresh해 명시 강도를 덮는 원인으로 판단하여, `tune.ps1` endpoint 동기화를 GET-first·불일치할 때만 PUT하도록 수정. self-test 34/34·terraform validate 통과. |
+| 2026-08-22 | pending | 0.5x fresh 순차 검증 전 `tune.ps1` 외부 load API 관측을 4회 지수 backoff retry로 보강. 이전 run에서 injector는 정상인데 skills-server 단발 연결 거부로 tuner만 종료된 재현성 문제를 방지하며, 중복 run 위험이 있는 `/api/load/start` POST는 retry하지 않고 GET 및 idempotent endpoint PUT만 retry. parse/self-test 34/34·terraform validate 통과. |
+| 2026-08-22 | pending | 재생성 인프라 CloudFront `d3tum9m2cawjh9.cloudfront.net` Deployed 후 `Downloads/high_binary/low_binary`의 user/product/stress를 `application/binary`·S3·ECR latest에 반영하고 rollout 완료. 새 digest user `d17299b8`, product `97d8642c`, stress `240e5f97` 확인. 외부 health/user/product 200, stress 201, WAF 403/unknown 404 정상; 최초 CloudFront health 573ms는 warm 후 39~48ms. terraform validate 통과, plan은 종료된 bastion 재생성과 ALB SG drift 1 change가 있어 apply하지 않음. |
+| 2026-08-22 | pending | 재생성 환경 endpoint 동기화 후 user Max40·8노드 ceiling 0.25x `순차증가` `run-1787356819`: 32.5/40(가용성12, 성능9.5, 비용7), user/product/stress 성능 81.25/108.10/88.33%, 평균 EC2 4.40, dropped=0. spike1은 성능12 유지, spike2 user33·product19·stress6/Ready peak7에서 게이트9→9.5 회복. 300s scale-down이 done 구간 6노드를 오래 유지해 비용이 기존 Max40 최고 run의 8→7로 하락. tuner는 skills-server 일시 연결 실패로 5분에 종료했으나 injector는 정상 완주해 별도 모니터 로그로 검증. Max32 기준보다 점수·비용이 낮아 REJECT하고 immutable fingerprint로 user Max32를 복구. |
+| 2026-08-22 | pending | 인프라 재생성 후 새 CloudFront `do876irwkqghf.cloudfront.net`은 정상이나 load server persisted meta endpoint가 삭제된 `d3tmuvdlyjyjyk.cloudfront.net`에 남아 `run-1787356534`가 2xx=0/0점이 된 것을 탐지·즉시 중지. `tune.ps1`이 매 profile 시작 전에 `/api/config/meta` endpoint를 현재 발견한 CloudFront로 PUT·GET 검증한 후 `/api/load/start`에도 명시하도록 보강. self-test 34/34·terraform validate 통과. |
+| 2026-08-22 | pending | HPA 300s scale-down 안정화 + user Max32 rollback 상태 fresh `run-1787339949`: 33/40, 가용성12, 성능9(게이트 통과), 비용8, user/product/stress 성능 76.62/105.40/88.26%, 평균 EC2 3.76. 스파이크 동안 user32·product17~19·stress4를 유지하고 가용성 99.99~100%, dropped/CNI 0. 성능 게이트가 꺼지지 않아 추가 코드 변이는 중단하고 300s 안정화 후 idle floor 복귀를 확인한다. |
+| 2026-08-22 | pending | user Max40 후보는 1차 `run-1787335919` 34.5/40·성능10.5로 KEEP됐으나 FINAL_FRESH `run-1787337791`이 33.5/40·성능8.5로 게이트 off. live HPA scaleDown=0s/100%로 spike2 replica가 29~35 사이에서 흔들린 원인을 반영해 external sweep 시작 전 scaleUp=0s·scaleDown=300s/Min을 강제 검증하고, FINAL_FRESH dual gate 실패 시 직전 measured BEST 자동 롤백 및 rejected signature 기록을 추가. self-test 34/34 통과. |
+| 2026-08-22 | pending | `tune.ps1`의 live Max 안전 상한을 측정 seed의 1.5배로 분리하고, aggregate 성능 게이트가 통과해도 개별 앱 성능<90%·실측 HPA ceiling·비용 게이트 통과 시 Max를 20~25% bounded one-delta로 확장하도록 개선. 0.25x 증거의 user 32/32·uncapped 41을 user Max 40 후보로 산출하며 self-test 32/32 통과. |
+| 2026-08-22 | pending | 사용자 지정 0.25x `순차증가` 진단 `run-1787333608`: 33.5/40(가용성 12, 성능 9.5, 비용 8), user/product/stress 성능 84.16/109.47/86.27%, 평균 EC2 3.73·peak 6·dropped/CNI 0. user HPA 32 ceiling 15/48 sample과 spike2 steady user p95 222~256ms를 확인해 다음 단일 후보를 user Max 32→40으로 선정하되 아직 적용하지 않음. 공식 0.5x 결과와 직접 비교하지 않는다. |
+| 2026-08-21 | pending | `tune.ps1 -PerformanceGateOnly`를 통해 HPA/request/limit을 스크립트로만 적용하고, CNI IP 할당 실패 대응으로 10.0.4.0/22·10.0.8.0/22 pod-capacity subnet을 추가. Node Type/RDS Instance Type은 유지. Default-spike2 10분 실측: 성능 11/12, user 89.39%, product 112.14%, stress 88.32%, 총 27/40(평균 EC2 9.45로 비용 0). |
+| 2026-08-21 | pending | 저트래픽 min=2, 빠른 HPA scale-up(15초), 5분 scale-down stabilization을 `tune.ps1`에 반영. 동일 프로필 Default/Default-spike2/순차증가를 수용하며, 리소스 소실 시 즉시 중지·JSON 기록하는 `RESOURCE_LOSS_STOP` guard 추가. Adaptive Default-spike2 15분: 성능 10.5/12, user 89.46%, product 111.88%, stress 85.64%, 총 26.5/40. |
+| 2026-08-21 | pending | `skills-server:8003` 3개 프로필 실측 완료 — Default 28/40(성능 12/12, user 99.21%, stress 90.93%), Default-spike2 26/40(성능 10/12, user 90.19%, stress 80.56%), 순차증가 27/40(성능 11/12, user 88.12%, stress 87.85%). 리소스 소실 없음. `-ProfileSweepOnly`에 3개 프로필 순차 실행·조기중지 재시작·소실 기록을 추가. |
+| 2026-08-21 | pending | `tune.ps1` production 유일 경로를 unknown-application 측정 lifecycle로 전환(legacy/app-fixture production 실행 차단) — Deployment/HPA 자동 발견, live config를 실행별 immutable BASE/BEST로 사용, 세 프로필 `min(TotalScore)` 우선 선택, min/request 분리 one-delta, request 변경 시 absolute HPA trigger 보존, 실제 3프로필 FINAL_FRESH 검증, CNI/Pending/generator/resource 소실 중지·JSON 기록. 현재 EKS API 소실로 live 검증은 중지하고 `%TEMP%/wsi-generic-no-resource/resource-loss-*.json` 기록. parse/terraform validate 및 self-test 19/19 통과. |
+| 2026-08-21 | pending | 재생성 리소스 점검 — kubeconfig를 새 EKS endpoint로 갱신, c5.large 노드 2대 Ready, 앱 5 Pod/ALB target 정상, RDS db.t3.micro Multi-AZ gp3 available, CloudFront/WAF 정상 확인. 외부 부하 서버의 이전 run endpoint가 null인 문제를 발견해 모든 `/api/load/start` 요청에 현재 발견한 CloudFront endpoint를 명시하도록 수정. self-test 20/20 통과. Terraform plan은 최신 AMI에 의한 bastion 교체와 ALB SG drift가 있어 apply하지 않음. |
+| 2026-08-21 | pending | live 범용 튜닝 시작 — 첫 실행이 profile 경로의 endpoint 초기화 누락으로 부하 시작 전에 종료되어 production profile 진입 전에 `Initialize-EndpointAndData`를 실행하도록 수정하고 non-resource 조기 종료 규칙에 따라 1회 재시작. BASE/Default run `run-1787272400` 동작 중이며 결과는 `%TEMP%/wsi-live-tune-20260821-0932`에 저장. |
+| 2026-08-21 | pending | Default 실측 분석 — 초반 2노드 40/40에서 spike 후 user/product HPA 20/14, stress 3 및 총 4노드로 증가해 최종 35/40(user/stress tail+평균 노드 비용). Max는 저부하 제어가 아니라 고부하 ceiling이므로, 성능 guard 실패 시에만 max 증가, guard 통과 시 measured peak+20% headroom으로 미사용 max를 one-delta 축소하도록 변경. 프로필 사이에는 최대 360초 동안 최초 measured low-load node floor/HPA min 복귀를 기다려 이전 profile 노드가 다음 비용창을 오염시키지 않도록 추가. self-test 21/21 통과. |
+| 2026-08-21 | pending | BASE 3프로필 후 최종 status의 순간 `sent_rps=4/target=4.6` 흔들림을 전체 run generator limit으로 오판해 candidate 탐색이 중단된 문제 수정 — 외부 엔진의 누적 `dropped>0`만 generator saturation 근거로 사용하고 정상 RPS jitter는 계속 탐색. self-test 22/22 통과. |
+| 2026-08-21 | pending | 연속 iteration 재시작 시 직전 profile의 잔여 Ready 5대를 low-load floor로 잘못 캡처한 문제 수정 — floor를 현재 노드 수가 아니라 Ready managed node 수 + min>0 앱의 distinct nodeSelector domain 수로 계산해 현재 topology는 1+1=2대로 산정. 다음 profile/candidate는 2대 복귀 후 측정. |
+| 2026-08-21 | pending | fresh BASE(Default 35.5, spike2 21.5, 순차 16.5) 병목 반영 — ceiling 후보를 앱별 최저 performance로 정렬하고 Max를 20% 증가(user 20→24 우선), 비-ceiling 지속 CPU guard deficit은 target -5, selection은 availability/타 profile 회귀 없이 guard deficit·worst profile 개선 시 KEEP. Guard 통과 뒤 live usable CPU density boundary request packing+absolute trigger 보존 추가. fingerprint 일치 immutable BASE resume 지원, self-test 25/25. |
+| 2026-08-21 | pending | 저부하 3번째 노드가 10분 이상 유지된 원인을 user PDB minAvailable=3 > HPA min/current=2로 확인(Karpenter DisruptionBlocked). production tune lifecycle에서 이 수학적으로 불가능한 PDB 관계만 minAvailable=max(1,HPA min-1)로 교정하고 valid PDB는 유지하도록 prerequisite 추가. |
+| 2026-08-21 | pending | fresh 고부하에서 `failed to assign an IP address` 266건 확인 — Terraform으로 CNI enhanced subnet discovery용 10.0.4.0/22·10.0.8.0/22(각 AZ, role/cni tag)와 route association을 targeted apply(4 add, 0 change/destroy). Cooldown 중 shared node에 같은 앱 Pod가 몰려 valid PDB도 consolidation을 막는 경우 no-traffic/HPA-min 동안만 shared PDB를 0으로 임시 완화하고 profile 시작 전 복구, dedicated PDB 유지. |
+| 2026-08-21 | pending | `-WorkerNodeCeiling 6 -DiagnosticSweepOnly -SweepProfiles 순차증가` 지원 — managed node를 제외한 슬롯을 discovered NodePool별 HPA max CPU demand 비율로 배정하여 총 worker ceiling을 제한하고 단일 프로필 진단. stress isolation 유지 시 물리 idle floor는 2임을 명시. |
+| 2026-08-21 | pending | 6노드 순차증가 진단 `run-1787294395`는 16.5/40(평균 EC2 4.73, stress availability 49.13%)이나 무효 인프라 측정: 추가 stress c5.large 3대가 NAT 없는 pod-capacity 10.0.8.0/22에 생성되어 NodeClaim Unknown/미등록 상태로 비용만 집계됨. EC2NodeClass의 cluster shared subnet selector가 CNI 전용 subnet까지 선택하는 것이 원인. 부하 종료 후 미등록 NodeClaim/EC2 정리, 원래 3개 Node Ready 및 앱 HPA min 건강 확인 후 사용자 요청에 따라 중지. |
+| 2026-08-21 | pending | Karpenter EC2NodeClass subnet selector에 `kubernetes.io/role/elb=1`을 추가해 Public subnet 2개만 노드용으로 선택하도록 live/`bastion_setup.sh` 반영. 1200m stress probe로 신규 `stress-q6srz`가 37초 내 Ready, public subnet `subnet-0e7ef5168e828794d`/public IP 사용 확인 후 probe와 임시 NodeClaim/EC2 삭제, 기존 3노드 및 앱 건강 확인. |
+| 2026-08-21 | pending | 단일 `DiagnosticSweepOnly`도 최적화 경로와 동일한 topology-derived low-load floor를 초기화하도록 공통 함수화. 기존 진단의 잘못된 floor=0 대기/timeout을 제거하고 stress isolation 기준 floor=2에서 순차증가 재측정 준비. |
+| 2026-08-21 | pending | Public subnet 수정 후 순차증가 `run-1787298425`: 23/40, user/product/stress 가용성 99.97/99.98/99.33%, 성능 24.77/101.11/85.48%, 평균 EC2 4.53, nodes 3→6, dropped=0, CNI=0. stress 병목은 복구됐고 user HPA 20/20 ceiling(peak CPU 1496m)이 주 병목. 종료 후 추가 Karpenter capacity를 정리해 topology floor 2노드와 앱 Ready 확인. |
+| 2026-08-21 | pending | 성능 게이트 복구 실험 전, 중단된 cooldown이 shared PDB를 0으로 남긴 상태를 startup에서 자동 복구하도록 보강. HPA min>1이고 PDB minAvailable=0이면 `max(1,min-1)`로 복구하여 저부하 노드 floor는 유지하면서 rollout/노드 disruption 가용성을 보호. |
+| 2026-08-21 | pending | Karpenter 정상 확장 중 2개 sample에만 나타난 일시적 `Insufficient cpu` Pending을 영구 `NODE_CPU_CAPACITY`로 오분류하던 문제 수정. 전체 sample의 10%(최소 3개) 이상 지속될 때만 infra stop하며, 짧은 Pending 뒤 Ready 확장되면 user HPA ceiling 복구 후보를 계속 평가. self-test 26/26. |
+| 2026-08-21 | pending | user HPA Max 20→24 one-delta `run-1787302469` REJECT: 22/40, avg EC2 4.50(cost 0), perf 6/12(user 25.09%, stress 81.54%)로 BASE 23/40/perf7보다 회귀, Max20 복구. 성능과 비용 dual guard를 별도 deficit으로 추적해 어느 한쪽 악화와 교환 금지, final은 둘 다 통과해야 acceptance. cost off이면 replica 추가 전 measured aggregate CPU 80% headroom + density boundary request packing 우선, self-test 28/28. |
+| 2026-08-21 | pending | stress request/control point packing 600m@55→550m@60 one-delta fresh `run-1787305449`는 2노드 저부하 40/40 후 spike2에서 perf 5/12(user 28.26%, stress 66.29%)로 dual gate 위반하여 30분 전 즉시 중단/REJECT. immutable config fingerprint를 production restore mode로 적용해 600m@55 복구. evidence fingerprint rollback self-test 포함 29/29. |
+| 2026-08-21 | pending | 재시작 간 immutable rejected signature 입력 지원. user Max20→24 및 stress packing550이 실패한 상태에서는 unrelated healthy product Max를 건드리지 않고, 같은 user 병목의 HPA target 33→28 조기 확장을 다음 one-delta로 선택. Min=2 및 peak ceiling=20은 유지해 저부하/최대 노드 비용을 늘리지 않음. self-test 30/30. |
+| 2026-08-21 | pending | user HPA target 33→28 fresh `run-1787307750`은 2노드 저부하 39/40 후 spike1 32초에 perf 7/12(user 47.81%)로 gate off되어 즉시 중단/REJECT, fingerprint BASE 복구. rejected target 누적 시 BASE 불변으로 target 28→23→18→15 신호 강화 후보를 순차 생성하도록 보강, self-test 31/31. |
+| 2026-08-21 | pending | 탄력 운영 저비용 기반 적용 — worker hard ceiling 6(managed1+default1+stress4), Karpenter consolidateAfter 1m, shared user/product의 preferred hostname spread 제거, dedicated stress spread 유지. 무부하 실제 2노드와 앱 Ready 확인. user/stress 조기 trigger 18%/35% 실험은 아래 실측 후 REJECT하여 33%/55% 복구. |
+| 2026-08-21 | pending | 조기 trigger 18%/35% 순차증가 `run-1787311291`: 22.5/40, avg4.33, perf6.5(user22.85%, stress84.76%), cost0으로 BASE 23/40보다 개선 없음. spike1에서 5노드까지 prewarm했지만 spike2 steady user 병목은 해결되지 않아 HPA 33%/55% fingerprint 복구. 저부하 2노드/1분 consolidation/총6 ceiling 정책만 유지. |
+| 2026-08-21 | pending | 비용 최소 1점을 허용한 성능우선 실험: total ceiling 7(managed1+default2+stress4), user Max24 `run-1787314521`은 23/40, perf7/12(user24.08%, stress85.61%), avg4.57/cost0. 6노드 BASE 대비 성능 개선 없이 비용 경계만 초과하여 REJECT, user Max20/total6 복구. 현재 binary는 노드/replica 추가로 성능12 달성 불가 근거 확보. |
+| 2026-08-20 | superseded | 3대 프로필 실측 — stress 성능 4.69%, user 8.51%로 성능 게이트 실패. 600m stress 6개를 안정적으로 수용하려면 stress NodePool 3대분(CPU 6)이 필요함을 확인 |
+| 2026-08-20 | pending | 안정 프로필로 전환 — default CPU 2, stress CPU 6(전용 3대), HPA user/product 2~20·stress 1~6, 저부하 consolidation 5m 유지 |
+| 2026-08-20 | pending | spike2 결과 반영 — stress HPA 6개 중 3개만 Ready, stress 5xx 175건·P95 30초로 확인되어 NodePool stress 한도를 4 CPU(2대분)로 확대해 총 4대까지 허용하고 request 500m 기준을 소스에 반영 |
+| 2026-08-20 | pending | `bastion_setup.sh` 성능 개선 — Karpenter default/stress를 각 2 CPU(각 1대분)로 조정해 총 3대 유지, stress 노드 1대 축소, ALB least-outstanding-requests와 앱 topology spread 반영 |
+| 2026-08-20 | pending | `tune.ps1` 개선 — 38점 앱 세트 BASE seed를 live 오염 상태가 아닌 재현 구성(70m/70m/600m, HPA 33/29/55, min 2/2/1)으로 고정하고, 외부 부하 결과의 잘못된 EC2 telemetry(reported 1 vs actual 3)를 진단 import/경고하며 최종 적용 config를 BASE 결과에 저장 |
 
 | 날짜 | 커밋 | 변경 요약 |
 | 2026-08-18 | pending | `bastion_setup.sh`/EKS Launch Template에 38점 기준 반영 — CNI prefix+warm prefix, MNG/Karpenter maxPods=110, user/product 70m·256Mi, stress 600m·2CPU·dedicated NodePool, HPA 33/29/55 및 20/20/6 |

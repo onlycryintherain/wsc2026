@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     38점 기준 User/Product/Stress Kubernetes 구성을 재현한다.
 .DESCRIPTION
@@ -92,6 +92,7 @@ function Ensure-Hpa([string]$App, [int]$Target, [int]$Min, [int]$Max) {
 function Ensure-StressNodePool {
     $default = Get-KubeJson @('get','nodepool','default','-o','json')
     $spec = $default.spec
+    $spec = $default.spec
     if ($null -eq $spec.template.metadata) { $spec.template | Add-Member -NotePropertyName metadata -NotePropertyValue ([pscustomobject]@{}) -Force }
     $labels = [ordered]@{}
     if ($spec.template.metadata.labels) {
@@ -99,6 +100,9 @@ function Ensure-StressNodePool {
     }
     $labels['workload-class'] = 'stress'
     $spec.template.metadata.labels = $labels
+    if ($null -eq $spec.template.spec.PSObject.Properties['taints']) {
+        $spec.template.spec | Add-Member -NotePropertyName taints -NotePropertyValue @() -Force
+    }
     $spec.template.spec.taints = @([ordered]@{key=$StressTaintKey;value='true';effect='NoSchedule'})
     $body = [ordered]@{
         apiVersion = 'karpenter.sh/v1'
