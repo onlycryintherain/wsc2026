@@ -57,6 +57,7 @@ $FallbackNodeCpu = 2
 $ActiveConsolidateAfter = '5m'
 $ActivityCpuM = @{ user = 15.0; product = 15.0; stress = 250.0 }
 $HotCpuM = @{ user = 50.0; product = 50.0; stress = 500.0 }
+$P95PressureMs = @{ user = 150.0; product = 150.0; stress = 600.0 }
 $script:History = @()
 $script:Baseline = @{}
 $script:NodePoolBaseline = @{}
@@ -671,7 +672,8 @@ function Get-Recommendation([string]$App) {
     $hotObserved = @($metrics | Where-Object { $_.Ready -ge 2 -and $_.CpuMaxM -ge $HotCpuM[$App] -and $_.HotRatio -ge 2.5 }).Count -gt 0
     $requestsObserved = [int](($metrics.Requests | Measure-Object -Sum).Sum) -gt 0
     $active = $requestsObserved -or $maxCpu -ge $ActivityCpuM[$App] -or $maxDesired -gt $latest.Min
-    $pressure = $maxDesired -gt $latest.Min -or ($latest.TargetUtil -gt 0 -and $maxUtil -ge [math]::Floor($latest.TargetUtil * 0.85))
+    $pressure = $maxDesired -gt $latest.Min -or $maxP95 -ge [double]$P95PressureMs[$App] -or
+        ($latest.TargetUtil -gt 0 -and $maxUtil -ge [math]::Floor($latest.TargetUtil * 0.85))
 
     $idle = $false
     if ($idleWindow.Count -gt 0) {
@@ -1025,6 +1027,7 @@ function Invoke-SelfTest {
     if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
     if ([math]::Abs((70 * 0.33) - 23.1) -gt 0.1) { $failures.Add('user control point') }
     if ($StressCpuRequest -ne '600m' -or $HpaTargetUtilization.stress -ne 55 -or $MaxSafetyCap.stress -ne 8) { $failures.Add('stress two-pods-per-node profile') }
+    if ($P95PressureMs.user -ne 150 -or $P95PressureMs.product -ne 150 -or $P95PressureMs.stress -ne 600) { $failures.Add('SLO proactive pressure thresholds') }
     if ($StressNodePool -ne 'stress') { $failures.Add('stress packed affinity pool') }
     if ([math]::Abs((600 * 0.55) - 330) -gt 1.0) { $failures.Add('stress control point 보존') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
@@ -1094,7 +1097,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 30/30' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 31/31' -ForegroundColor Green
 }
 
 if ($SelfTest) {
