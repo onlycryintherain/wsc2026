@@ -252,6 +252,7 @@ Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/stop" `
 
 ## 최근 작업 로그
 
+| 2026-08-25 | pending | **observer stress 1노드 밀집 수렴 보장** — Deployment에 남아 있던 hostname topology spread가 baseline 4 Pod를 stress 3노드로 분산해 비용을 높이고, Karpenter는 동일 가격 노드 재배치를 거부한 원인을 실측. observer가 spread를 제거하고 preferred podAffinity로 같은 hostname을 우선하도록 변경해 stress 4/4가 t3.medium 1대에 배치됨을 확인. `-PrepareForLoad` 동안만 disruption `100%/0s`로 빈 노드 회수를 허용하고 finally에서 `10%/1m` 복구, 실제 총 Ready 노드 4→2 수렴 및 PS7/PS5 self-test 22/22 통과. |
 | 2026-08-25 | pending | **현재 stress 바이너리 연결 편중 대응** — 0.5x 새 run에서 stress가 부하 후 1→6 Pod로 확장됐지만 keep-alive가 기존 2 Pod(923~985m)에 고정되고 신규 Pod는 1~27m idle, baseline stress 76.67%·avg3.0·35.5/40으로 하락한 실측을 반영. stress를 부하 전 4 Pod로 prewarm하고 한 t3.medium에 pack하도록 `400m@83%`(absolute trigger 332m)로 변경, pressure floor6. workflow는 `-PrepareForLoad`로 이전 backlog/replica를 정확한 floor로 교체한 후 HPA max/300s를 복구하며, ReadyNode<=2·Pending0까지 기다린 뒤에만 load start. PS7/PS5 observer 21/21·workflow 3/3 통과. |
 | 2026-08-25 | pending | **observe-live 비용-성능 탄력 프로필 복구** — 0.5x 60분 39/40 실측(run-1787385221)을 기준으로 user/product `70m`, stress `550m@60%`, HPA `2..20/2..20/1..12`를 시작 상태로 고정. 저부하 `2/2/1`, 트래픽 warm `4/2/2`, 압력 warm `6/4/3`이 모두 Managed 1대+stress 1대에 pack되며, NodePool ceiling(default 1대/stress 4대)은 실제 HPA 수요에만 노드가 생성되도록 분리. 유휴 300초 복귀, peak 중 consolidation 5분 유지, 오염된 과거 baseline annotation 무시, PS7/PS5 self-test 21/21 및 live 2-node rollout 검증. |
 | 2026-08-25 | pending | 저장소를 Day3 전용으로 정리 — `destroy-plan.txt` Terraform 산출물 제거, feature/day3-tuning을 main에 통합하고 Day1 기능 브랜치 제거 |

@@ -298,6 +298,36 @@ function Initialize-PerformanceProfile {
         }
     }
 
+    # 기존 spread 제약은 baseline 4 Pod를 여러 stress 노드에 강제로 흩어 비용을 키운다.
+    # 같은 노드를 선호하되 required로 고정하지 않아, CPU가 차면 다음 노드로 확장한다.
+    $hasStressSpread = $null -ne $stressDeployment.spec.template.spec.topologySpreadConstraints
+    $stressAffinityJson = $stressDeployment.spec.template.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution | ConvertTo-Json -Compress -Depth 12
+    $hasStressPacking = $stressAffinityJson -match 'kubernetes.io/hostname' -and $stressAffinityJson -match '"app":"stress"'
+    if ($hasStressSpread -or -not $hasStressPacking) {
+        $description = 'Deployment/stress spread 제거 + hostname 밀집 배치 선호'
+        if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
+            Write-Host "[권고] $description" -ForegroundColor Yellow
+        } else {
+            $patch = @{
+                spec = @{ template = @{
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'stress-packed-v3' } }
+                    spec = @{
+                        topologySpreadConstraints = $null
+                        affinity = @{ podAffinity = @{ preferredDuringSchedulingIgnoredDuringExecution = @(@{
+                            weight = 100
+                            podAffinityTerm = @{
+                                labelSelector = @{ matchLabels = @{ app = 'stress' } }
+                                topologyKey = 'kubernetes.io/hostname'
+                            }
+                        }) } }
+                    }
+                } }
+            } | ConvertTo-Json -Compress -Depth 14
+            Write-Host "[적용/rollout] $description" -ForegroundColor Cyan
+            Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=strategic', '-p', $patch) | Out-Null
+        }
+    }
+
     $hpas = Get-KubeJson @('-n', $Namespace, 'get', 'hpa', '-o', 'json')
     foreach ($app in $MutationOrder) {
         $hpa = @($hpas.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
@@ -346,6 +376,13 @@ function Initialize-PerformanceProfile {
         if ([string]$verifyStress.spec.template.spec.nodeSelector.'karpenter.sh/nodepool' -ne $StressNodePool) {
             throw '시작 프로필 검증 실패: stress nodeSelector'
         }
+        if ($null -ne $verifyStress.spec.template.spec.topologySpreadConstraints) {
+            throw '시작 프로필 검증 실패: stress topology spread 잔존'
+        }
+        $verifyAffinity = $verifyStress.spec.template.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution | ConvertTo-Json -Compress -Depth 12
+        if ($verifyAffinity -notmatch 'kubernetes.io/hostname' -or $verifyAffinity -notmatch '"app":"stress"') {
+            throw '시작 프로필 검증 실패: stress packed affinity'
+        }
         foreach ($pool in @('default', 'stress')) {
             $verifyPool = Get-KubeJson @('get', 'nodepool', $pool, '-o', 'json')
             $expectedLimit = [int]$NodePoolBaselineCpu[$pool]
@@ -360,36 +397,43 @@ function Reset-IdleStateForLoad {
     if (-not $PrepareForLoad -or $ObserveOnly -or $WhatIfPreference) { return }
 
     Write-Host '[준비] 이전 run replica/CPU backlog를 baseline floor로 정리' -ForegroundColor Cyan
-    foreach ($app in $MutationOrder) {
-        $floor = [int]$BaselineFloor[$app]
-        $lockPatch = @{ spec = @{ minReplicas = $floor; maxReplicas = $floor; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = 0 } } } } | ConvertTo-Json -Compress -Depth 8
-        Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $lockPatch) | Out-Null
-        Invoke-Kubectl @('-n', $Namespace, 'scale', "deployment/$app", "--replicas=$floor") | Out-Null
-    }
-
-    $deadline = [datetime]::UtcNow.AddSeconds(180)
-    do {
-        $deployments = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', '-o', 'json')
-        $ready = $true
-        foreach ($app in $ManagedApps) {
-            $deployment = @($deployments.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
+    $fastConsolidation = @{ spec = @{ disruption = @{ consolidateAfter = '0s'; budgets = @(@{ nodes = '100%' }) } } } | ConvertTo-Json -Compress -Depth 8
+    $normalConsolidation = @{ spec = @{ disruption = @{ consolidateAfter = '1m'; budgets = @(@{ nodes = '10%' }) } } } | ConvertTo-Json -Compress -Depth 8
+    try {
+        Invoke-Kubectl @('patch', 'nodepool', $StressNodePool, '--type=merge', '-p', $fastConsolidation) | Out-Null
+        foreach ($app in $MutationOrder) {
             $floor = [int]$BaselineFloor[$app]
-            if (-not $deployment -or [int]$deployment.status.replicas -ne $floor -or
-                [int]$deployment.status.readyReplicas -ne $floor -or [int]$deployment.status.unavailableReplicas -gt 0) {
-                $ready = $false
-                break
-            }
+            $lockPatch = @{ spec = @{ minReplicas = $floor; maxReplicas = $floor; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = 0 } } } } | ConvertTo-Json -Compress -Depth 8
+            Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $lockPatch) | Out-Null
+            Invoke-Kubectl @('-n', $Namespace, 'scale', "deployment/$app", "--replicas=$floor") | Out-Null
         }
-        if ($ready) { break }
-        Start-Sleep -Seconds 3
-    } while ([datetime]::UtcNow -lt $deadline)
-    if (-not $ready) { throw 'LOAD_PREPARE_TIMEOUT: baseline Deployment Ready 실패' }
 
-    foreach ($app in $MutationOrder) {
-        $restorePatch = @{ spec = @{ minReplicas = [int]$BaselineFloor[$app]; maxReplicas = [int]$MaxSafetyCap[$app]; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = $ScaleDownStabilizationSeconds } } } } | ConvertTo-Json -Compress -Depth 8
-        Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $restorePatch) | Out-Null
+        $deadline = [datetime]::UtcNow.AddSeconds(180)
+        do {
+            $deployments = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', '-o', 'json')
+            $ready = $true
+            foreach ($app in $ManagedApps) {
+                $deployment = @($deployments.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
+                $floor = [int]$BaselineFloor[$app]
+                if (-not $deployment -or [int]$deployment.status.replicas -ne $floor -or
+                    [int]$deployment.status.readyReplicas -ne $floor -or [int]$deployment.status.unavailableReplicas -gt 0) {
+                    $ready = $false
+                    break
+                }
+            }
+            if ($ready) { break }
+            Start-Sleep -Seconds 3
+        } while ([datetime]::UtcNow -lt $deadline)
+        if (-not $ready) { throw 'LOAD_PREPARE_TIMEOUT: baseline Deployment Ready 실패' }
+
+        foreach ($app in $MutationOrder) {
+            $restorePatch = @{ spec = @{ minReplicas = [int]$BaselineFloor[$app]; maxReplicas = [int]$MaxSafetyCap[$app]; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = $ScaleDownStabilizationSeconds } } } } | ConvertTo-Json -Compress -Depth 8
+            Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $restorePatch) | Out-Null
+        }
+        Write-Host '[준비] baseline floor Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
+    } finally {
+        Invoke-Kubectl @('patch', 'nodepool', $StressNodePool, '--type=merge', '-p', $normalConsolidation) -AllowFailure | Out-Null
     }
-    Write-Host '[준비] baseline floor Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
 }
 
 function Get-AccessLogMetric([string]$App) {
@@ -816,6 +860,7 @@ function Invoke-SelfTest {
     if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
     if ([math]::Abs((70 * 0.33) - 23.1) -gt 0.1) { $failures.Add('user control point') }
     if ($StressCpuRequest -ne '400m' -or $HpaTargetUtilization.stress -ne 83) { $failures.Add('stress packed prewarm profile') }
+    if ($StressNodePool -ne 'stress') { $failures.Add('stress packed affinity pool') }
     if ([math]::Abs((400 * 0.83) - (600 * 0.55)) -gt 2.1) { $failures.Add('stress control point 보존') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
@@ -877,7 +922,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 21/21' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 22/22' -ForegroundColor Green
 }
 
 if ($SelfTest) {
