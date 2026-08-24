@@ -427,11 +427,29 @@ function Reset-IdleStateForLoad {
         } while ([datetime]::UtcNow -lt $deadline)
         if (-not $ready) { throw 'LOAD_PREPARE_TIMEOUT: baseline Deployment Ready 실패' }
 
+        # rollout 직후에는 Pod가 이전 stress 노드에 흩어진 채 Deployment만 Ready가 될 수 있다.
+        # 빠른 disruption을 유지한 상태에서 실제 2-node/Pending=0까지 기다려 비용 시작점을 보장한다.
+        $nodeDeadline = [datetime]::UtcNow.AddSeconds(180)
+        do {
+            $nodes = Get-KubeJson @('get', 'nodes', '-o', 'json')
+            $pods = Get-KubeJson @('-n', $Namespace, 'get', 'pods', '-o', 'json')
+            $readyNodeCount = @($nodes.items | Where-Object {
+                @($_.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -gt 0
+            }).Count
+            $totalNodeCount = @($nodes.items).Count
+            $pendingCount = @($pods.items | Where-Object { $_.status.phase -eq 'Pending' }).Count
+            if ($totalNodeCount -le 2 -and $readyNodeCount -eq 2 -and $pendingCount -eq 0) { break }
+            Start-Sleep -Seconds 5
+        } while ([datetime]::UtcNow -lt $nodeDeadline)
+        if ($totalNodeCount -gt 2 -or $readyNodeCount -ne 2 -or $pendingCount -gt 0) {
+            throw "LOAD_PREPARE_TIMEOUT: 2-node 수렴 실패(Node=$totalNodeCount ReadyNode=$readyNodeCount Pending=$pendingCount)"
+        }
+
         foreach ($app in $MutationOrder) {
             $restorePatch = @{ spec = @{ minReplicas = [int]$BaselineFloor[$app]; maxReplicas = [int]$MaxSafetyCap[$app]; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = $ScaleDownStabilizationSeconds } } } } | ConvertTo-Json -Compress -Depth 8
             Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $restorePatch) | Out-Null
         }
-        Write-Host '[준비] baseline floor Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
+        Write-Host '[준비] baseline floor/2-node Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
     } finally {
         Invoke-Kubectl @('patch', 'nodepool', $StressNodePool, '--type=merge', '-p', $normalConsolidation) -AllowFailure | Out-Null
     }
