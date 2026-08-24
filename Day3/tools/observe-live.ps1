@@ -1,16 +1,16 @@
 ﻿<#
 .SYNOPSIS
-    실행 즉시 채점용 최소 용량을 준비하고 실제 유입 트래픽에 맞춰 자동 조정한다.
+    저부하는 2노드에 유지하고 강한 부하에서만 성능 보호 용량을 자동 준비한다.
 .DESCRIPTION
     인자 없이 실행한다. 추가 트래픽을 만들지 않고 Kubernetes metrics와 애플리케이션
-    JSON access log를 분석한다. 시작 시 user CPU 예약을 실측치에 맞추고 stress를 전용
-    NodePool에 배치한 뒤 비대칭 warm HPA를 적용한다. 이후 트래픽/CPU 편중/HPA 압력이
+    JSON access log를 분석한다. 시작 시 39/40 실측 프로필과 stress 전용 NodePool,
+    최소 HPA floor를 적용한다. 이후 트래픽/CPU 편중/HPA 압력이
     확인되면 minReplicas, maxReplicas, NodePool CPU ceiling과 scale-down/consolidation
-    시간을 조정한다. 유휴가 지속되면 HPA warm 상태와 NodePool을 시작 전 기준으로
+    시간을 조정한다. 유휴가 지속되면 HPA와 NodePool을 검증된 2노드 기준으로
     단계 복구한다. maxReplicas는 비용을 직접 발생시키지 않으므로 자동 축소하지 않는다.
 
-    시작 프로필은 user CPU request와 stress nodeSelector만 변경하므로 Deployment rollout이
-    한 번 발생한다. API/DB/Terraform은 변경하지 않는다. NodePool은 Pod를 직접 생성하지
+    시작 프로필은 세 앱 CPU request와 stress nodeSelector만 변경하므로 Deployment rollout이
+    발생할 수 있다. API/DB/Terraform은 변경하지 않는다. NodePool은 Pod를 직접 생성하지
     않고 허용 ceiling만 bounded 조정한다.
     Ctrl+C로 종료하며 결과는 임시 디렉터리의 JSONL 파일에 기록한다.
 .EXAMPLE
@@ -24,8 +24,8 @@ param(
     [string]$Region = 'ap-northeast-2',
     [ValidateRange(5, 60)][int]$IntervalSeconds = 10,
     [ValidateRange(30, 300)][int]$DecisionWindowSeconds = 30,
-    [ValidateRange(60, 600)][int]$ScaleDownStabilizationSeconds = 600,
-    [ValidateRange(120, 1800)][int]$IdleRestoreSeconds = 600,
+    [ValidateRange(60, 600)][int]$ScaleDownStabilizationSeconds = 300,
+    [ValidateRange(120, 1800)][int]$IdleRestoreSeconds = 300,
     [switch]$ObserveOnly,
     [switch]$SkipStartupProfile,
     [switch]$Once,
@@ -36,18 +36,22 @@ $ErrorActionPreference = 'Stop'
 $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
-# 앱별 SLO와 직전 60분 run 실측을 반영한 성능 우선 프로필이다. product는 이미
-# 만점권이라 작게 유지하고, 200ms user와 CPU-heavy stress에 시작 용량을 집중한다.
-$WarmFloor = @{ user = 12; product = 2; stress = 4 }
-$MaxSafetyCap = @{ user = 48; product = 20; stress = 8 }
-$HpaTargetUtilization = @{ user = 12; product = 29; stress = 33 }
-$UserCpuRequest = '200m'
-$StressCpuRequest = '1000m'
+# 0.5x 60분 실측 39/40(run-1787385221)의 절대 control point를 시작점으로 쓴다.
+# 저부하 floor와 압력 floor는 모두 t3.medium 2대(Managed 1 + stress 1)에 pack된다.
+$BaselineFloor = @{ user = 2; product = 2; stress = 1 }
+$WarmFloor = @{ user = 4; product = 2; stress = 2 }
+$PressureFloor = @{ user = 6; product = 4; stress = 3 }
+$MaxSafetyCap = @{ user = 20; product = 20; stress = 12 }
+$HpaTargetUtilization = @{ user = 33; product = 29; stress = 60 }
+$UserCpuRequest = '70m'
+$ProductCpuRequest = '70m'
+$StressCpuRequest = '550m'
 $StressNodePool = 'stress'
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
-$NodePoolSafetyCapNodes = @{ default = 6; stress = 8 }
+$NodePoolSafetyCapNodes = @{ default = 1; stress = 4 }
+$NodePoolBaselineCpu = @{ default = 2; stress = 8 }
 $FallbackNodeCpu = 2
-$ActiveConsolidateAfter = '10m'
+$ActiveConsolidateAfter = '5m'
 $ActivityCpuM = @{ user = 15.0; product = 15.0; stress = 250.0 }
 $HotCpuM = @{ user = 50.0; product = 50.0; stress = 500.0 }
 $script:History = @()
@@ -154,8 +158,10 @@ function Initialize-Baseline {
             $savedMin = $annotations.'wsi2026.io/live-tune-baseline-min'
             $savedScaleDown = $annotations.'wsi2026.io/live-tune-baseline-scale-down'
         }
-        $baselineMin = if ($null -ne $savedMin -and [string]$savedMin -match '^\d+$') { [int]$savedMin } else { [int]$hpa.spec.minReplicas }
-        $baselineScaleDown = if ($null -ne $savedScaleDown -and [string]$savedScaleDown -match '^\d+$') { [int]$savedScaleDown } else { Get-HpaScaleDownSeconds $hpa }
+        # 과거 observer annotation은 공격적 실험값일 수 있다. 검증된 2-node
+        # operational floor를 source of truth로 사용해 재실행이 항상 수렴하게 한다.
+        $baselineMin = [int]$BaselineFloor[$app]
+        $baselineScaleDown = [int]$ScaleDownStabilizationSeconds
         $script:Baseline[$app] = [pscustomobject]@{
             Min = $baselineMin
             ScaleDownSeconds = $baselineScaleDown
@@ -170,8 +176,8 @@ function Initialize-Baseline {
         $annotations = $nodePool.metadata.annotations
         $savedLimit = if ($null -ne $annotations) { $annotations.'wsi2026.io/live-tune-baseline-limit-cpu' } else { $null }
         $savedConsolidate = if ($null -ne $annotations) { $annotations.'wsi2026.io/live-tune-baseline-consolidate-after' } else { $null }
-        $baselineLimit = if ($null -ne $savedLimit -and [string]$savedLimit -match '^\d+$') { [int]$savedLimit } else { [int]$nodePool.spec.limits.cpu }
-        $baselineConsolidate = if (-not [string]::IsNullOrWhiteSpace([string]$savedConsolidate)) { [string]$savedConsolidate } else { Get-NodePoolConsolidateAfter $nodePool }
+        $baselineLimit = [int]$NodePoolBaselineCpu[$pool]
+        $baselineConsolidate = '1m'
         $script:NodePoolBaseline[$pool] = [pscustomobject]@{
             LimitCpu = $baselineLimit
             ConsolidateAfter = $baselineConsolidate
@@ -185,20 +191,22 @@ function Initialize-PerformanceProfile {
         return
     }
 
-    $deployments = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'user', 'stress', '-o', 'json')
+    $deployments = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'user', 'product', 'stress', '-o', 'json')
     $userDeployment = @($deployments.items | Where-Object { $_.metadata.name -eq 'user' } | Select-Object -First 1)
+    $productDeployment = @($deployments.items | Where-Object { $_.metadata.name -eq 'product' } | Select-Object -First 1)
     $stressDeployment = @($deployments.items | Where-Object { $_.metadata.name -eq 'stress' } | Select-Object -First 1)
-    if (-not $userDeployment -or -not $stressDeployment) { throw 'user/stress Deployment를 찾지 못했습니다.' }
+    if (-not $userDeployment -or -not $productDeployment -or -not $stressDeployment) { throw 'user/product/stress Deployment를 찾지 못했습니다.' }
 
     # ceiling은 Pod/EC2를 직접 만들지 않는다. HPA prewarm 전에 열어 Pending이
     # NodePool limit 때문에 수 분간 정체되는 것을 방지한다.
     foreach ($pool in @('default', 'stress')) {
-        $targetLimit = [int]$NodePoolSafetyCapNodes[$pool] * $FallbackNodeCpu
+        $targetLimit = [int]$NodePoolBaselineCpu[$pool]
+        $targetConsolidate = [string]$script:NodePoolBaseline[$pool].ConsolidateAfter
         $current = Get-KubeJson @('get', 'nodepool', $pool, '-o', 'json')
         $currentLimit = [int]$current.spec.limits.cpu
         $currentConsolidate = Get-NodePoolConsolidateAfter $current
-        if ($currentLimit -eq $targetLimit -and $currentConsolidate -eq $ActiveConsolidateAfter) { continue }
-        $description = "NodePool/$pool ceiling cpu=$targetLimit consolidate=$ActiveConsolidateAfter"
+        if ($currentLimit -eq $targetLimit -and $currentConsolidate -eq $targetConsolidate) { continue }
+        $description = "NodePool/$pool ceiling cpu=$targetLimit consolidate=$targetConsolidate"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("NodePool/$pool", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
             continue
@@ -209,7 +217,7 @@ function Initialize-PerformanceProfile {
                 'wsi2026.io/live-tune-baseline-limit-cpu' = [string]$baseline.LimitCpu
                 'wsi2026.io/live-tune-baseline-consolidate-after' = [string]$baseline.ConsolidateAfter
             } }
-            spec = @{ limits = @{ cpu = [string]$targetLimit }; disruption = @{ consolidateAfter = $ActiveConsolidateAfter } }
+            spec = @{ limits = @{ cpu = [string]$targetLimit }; disruption = @{ consolidateAfter = $targetConsolidate } }
         } | ConvertTo-Json -Compress -Depth 10
         Write-Host "[적용/비용주의] $description" -ForegroundColor Magenta
         Invoke-Kubectl @('patch', 'nodepool', $pool, '--type=merge', '-p', $patch) | Out-Null
@@ -218,13 +226,13 @@ function Initialize-PerformanceProfile {
     $userContainer = [string]$userDeployment.spec.template.spec.containers[0].name
     $currentUserRequest = [string]$userDeployment.spec.template.spec.containers[0].resources.requests.cpu
     if ($currentUserRequest -ne $UserCpuRequest) {
-        $description = "Deployment/user CPU request $currentUserRequest->$UserCpuRequest (실측 spike 약 300m/pod)"
+        $description = "Deployment/user CPU request $currentUserRequest->$UserCpuRequest (검증된 control point 23.1m)"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/user", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
             $patch = @{
                 spec = @{ template = @{
-                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'user-200m-v2' } }
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'elastic-39point-v1' } }
                     spec = @{ containers = @(@{ name = $userContainer; resources = @{ requests = @{ cpu = $UserCpuRequest } } }) }
                 } }
             } | ConvertTo-Json -Compress -Depth 12
@@ -233,16 +241,34 @@ function Initialize-PerformanceProfile {
         }
     }
 
+    $productContainer = [string]$productDeployment.spec.template.spec.containers[0].name
+    $currentProductRequest = [string]$productDeployment.spec.template.spec.containers[0].resources.requests.cpu
+    if ($currentProductRequest -ne $ProductCpuRequest) {
+        $description = "Deployment/product CPU request $currentProductRequest->$ProductCpuRequest (검증된 control point 20.3m)"
+        if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/product", $description)) {
+            Write-Host "[권고] $description" -ForegroundColor Yellow
+        } else {
+            $patch = @{
+                spec = @{ template = @{
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'elastic-39point-v1' } }
+                    spec = @{ containers = @(@{ name = $productContainer; resources = @{ requests = @{ cpu = $ProductCpuRequest } } }) }
+                } }
+            } | ConvertTo-Json -Compress -Depth 12
+            Write-Host "[적용/rollout] $description" -ForegroundColor Cyan
+            Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'product', '--type=strategic', '-p', $patch) | Out-Null
+        }
+    }
+
     $stressContainer = [string]$stressDeployment.spec.template.spec.containers[0].name
     $currentStressRequest = [string]$stressDeployment.spec.template.spec.containers[0].resources.requests.cpu
     if ($currentStressRequest -ne $StressCpuRequest) {
-        $description = "Deployment/stress CPU request $currentStressRequest->$StressCpuRequest (1 Pod/Node, control point 330m 보존)"
+        $description = "Deployment/stress CPU request $currentStressRequest->$StressCpuRequest (3 Pod/Node, control point 330m 보존)"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
             $patch = @{
                 spec = @{ template = @{
-                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'stress-1000m-v3' } }
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'elastic-39point-v1' } }
                     spec = @{ containers = @(@{ name = $stressContainer; resources = @{ requests = @{ cpu = $StressCpuRequest } } }) }
                 } }
             } | ConvertTo-Json -Compress -Depth 12
@@ -274,7 +300,7 @@ function Initialize-PerformanceProfile {
     $hpas = Get-KubeJson @('-n', $Namespace, 'get', 'hpa', '-o', 'json')
     foreach ($app in $MutationOrder) {
         $hpa = @($hpas.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
-        $targetMin = [int][math]::Max([int]$script:Baseline[$app].Min, [int]$WarmFloor[$app])
+        $targetMin = [int]$BaselineFloor[$app]
         $targetMax = [int]$MaxSafetyCap[$app]
         $targetUtil = [int]$HpaTargetUtilization[$app]
         $currentUtil = [int]$hpa.spec.metrics[0].resource.target.averageUtilization
@@ -290,7 +316,7 @@ function Initialize-PerformanceProfile {
             metadata = @{ annotations = @{
                 'wsi2026.io/live-tune-baseline-min' = [string]$script:Baseline[$app].Min
                 'wsi2026.io/live-tune-baseline-scale-down' = [string]$script:Baseline[$app].ScaleDownSeconds
-                'wsi2026.io/live-profile' = 'performance-first-v1'
+                'wsi2026.io/live-profile' = 'elastic-39point-v1'
             } }
             spec = @{
                 minReplicas = $targetMin
@@ -305,9 +331,13 @@ function Initialize-PerformanceProfile {
 
     if (-not $ObserveOnly -and -not $WhatIfPreference) {
         $verifyUser = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'user', '-o', 'json')
+        $verifyProduct = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'product', '-o', 'json')
         $verifyStress = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'stress', '-o', 'json')
         if ([string]$verifyUser.spec.template.spec.containers[0].resources.requests.cpu -ne $UserCpuRequest) {
             throw '시작 프로필 검증 실패: user CPU request'
+        }
+        if ([string]$verifyProduct.spec.template.spec.containers[0].resources.requests.cpu -ne $ProductCpuRequest) {
+            throw '시작 프로필 검증 실패: product CPU request'
         }
         if ([string]$verifyStress.spec.template.spec.containers[0].resources.requests.cpu -ne $StressCpuRequest) {
             throw '시작 프로필 검증 실패: stress CPU request'
@@ -317,7 +347,7 @@ function Initialize-PerformanceProfile {
         }
         foreach ($pool in @('default', 'stress')) {
             $verifyPool = Get-KubeJson @('get', 'nodepool', $pool, '-o', 'json')
-            $expectedLimit = [int]$NodePoolSafetyCapNodes[$pool] * $FallbackNodeCpu
+            $expectedLimit = [int]$NodePoolBaselineCpu[$pool]
             if ([int]$verifyPool.spec.limits.cpu -ne $expectedLimit) {
                 throw "시작 프로필 검증 실패: NodePool/$pool ceiling"
             }
@@ -513,10 +543,15 @@ function Get-Recommendation([string]$App) {
         $targetScaleDown = [math]::Max([int]$baseline.ScaleDownSeconds, $ScaleDownStabilizationSeconds)
         $reason = 'HPA_MAX_PRESSURE'
     } elseif ($active -and ($pressure -or $hotObserved)) {
-        $warmCap = [math]::Min([int]$MaxSafetyCap[$App], [math]::Max([int]$baseline.Min, [int]$WarmFloor[$App]))
-        $targetMin = $warmCap
+        # peak가 확인된 뒤에도 2-node packing 경계 안에서 먼저 prewarm한다.
+        # 그 이상의 replica는 HPA가 실수요만큼 만들므로 비용은 부하와 함께 증가한다.
+        $targetMin = [math]::Min([int]$MaxSafetyCap[$App], [int]$PressureFloor[$App])
         $targetScaleDown = [math]::Max([int]$baseline.ScaleDownSeconds, $ScaleDownStabilizationSeconds)
         $reason = if ($hotObserved) { 'HOT_POD' } else { 'HPA_PRESSURE' }
+    } elseif ($active) {
+        $targetMin = [math]::Min([int]$MaxSafetyCap[$App], [int]$WarmFloor[$App])
+        $targetScaleDown = [math]::Max([int]$baseline.ScaleDownSeconds, $ScaleDownStabilizationSeconds)
+        $reason = 'TRAFFIC_WARM'
     } elseif ($idle) {
         $targetMin = [int]$baseline.Min
         $targetScaleDown = [int]$baseline.ScaleDownSeconds
@@ -738,11 +773,13 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($WarmFloor.user -ne 12 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('앱별 warm floor') }
-    if ($UserCpuRequest -ne '200m' -or $HpaTargetUtilization.user -ne 12) { $failures.Add('user control point profile') }
-    if ([math]::Abs((200 * 0.12) - (70 * 0.33)) -gt 1.0) { $failures.Add('user control point 보존') }
-    if ($StressCpuRequest -ne '1000m' -or $HpaTargetUtilization.stress -ne 33) { $failures.Add('stress one-pod-per-node profile') }
-    if ([math]::Abs((1000 * 0.33) - (600 * 0.55)) -gt 1.0) { $failures.Add('stress control point 보존') }
+    if ($BaselineFloor.user -ne 2 -or $BaselineFloor.product -ne 2 -or $BaselineFloor.stress -ne 1) { $failures.Add('2-node baseline floor') }
+    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 2) { $failures.Add('앱별 traffic warm floor') }
+    if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 3) { $failures.Add('앱별 pressure floor') }
+    if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
+    if ([math]::Abs((70 * 0.33) - 23.1) -gt 0.1) { $failures.Add('user control point') }
+    if ($StressCpuRequest -ne '550m' -or $HpaTargetUtilization.stress -ne 60) { $failures.Add('stress packed profile') }
+    if ([math]::Abs((550 * 0.60) - (600 * 0.55)) -gt 0.1) { $failures.Add('stress control point 보존') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -756,8 +793,8 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ stress = $pressure } }
     )
     $recommendation = Get-Recommendation 'stress'
-    if ($recommendation.TargetMin -ne 4) { $failures.Add('stress warm min 추천') }
-    if ($recommendation.TargetScaleDown -ne 600) { $failures.Add('scale-down 안정화 추천') }
+    if ($recommendation.TargetMin -ne 3) { $failures.Add('stress pressure min 추천') }
+    if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
         Ready = 20; Pending = 0; Current = 20; Desired = 20; Min = 2; Max = 10
@@ -770,12 +807,12 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $ceiling } }
     )
     $maxRecommendation = Get-Recommendation 'user'
-    if ($maxRecommendation.Reason -ne 'HPA_MAX_PRESSURE' -or $maxRecommendation.TargetMax -ne 48) { $failures.Add('HPA max performance expansion') }
+    if ($maxRecommendation.Reason -ne 'HPA_MAX_PRESSURE' -or $maxRecommendation.TargetMax -ne 20) { $failures.Add('HPA max performance expansion') }
     $ceiling.Pending = 1
     $blockedRecommendation = Get-Recommendation 'user'
     if ($blockedRecommendation.TargetMax -ne 10) { $failures.Add('Pending 중 HPA max 확장 차단') }
-    if ((Get-HpaMaxTarget 38 100 40) -ne 40) { $failures.Add('HPA max safety cap') }
-    if ((Get-HpaMaxTarget 1 2 40) -ne 40 -or (Get-HpaMaxTarget 1 2 12) -ne 12) { $failures.Add('HPA max cold-start 즉시 개방') }
+    if ((Get-HpaMaxTarget 18 100 20) -ne 20) { $failures.Add('HPA max safety cap') }
+    if ((Get-HpaMaxTarget 1 2 20) -ne 20 -or (Get-HpaMaxTarget 1 2 12) -ne 12) { $failures.Add('HPA max cold-start 즉시 개방') }
     $ceiling.Pending = 2
     $script:NodePoolBaseline['default'] = [pscustomobject]@{ LimitCpu = 2; ConsolidateAfter = '1m' }
     $poolAtLimit = [pscustomobject]@{ LimitCpu = 2; UsedCpu = 2; Nodes = 1; CpuPerNode = 2; ConsolidateAfter = '1m' }
@@ -784,7 +821,7 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $ceiling; product = $ceiling }; NodePools = @{ default = $poolAtLimit }; NotReadyNodes = 0 }
     )
     $poolRecommendation = Get-NodePoolRecommendation 'default'
-    if ($poolRecommendation.TargetLimitCpu -ne 12 -or $poolRecommendation.TargetConsolidateAfter -ne '10m') { $failures.Add('NodePool performance ceiling 확장') }
+    if ($poolRecommendation.TargetLimitCpu -ne 2 -or $poolRecommendation.TargetConsolidateAfter -ne '5m') { $failures.Add('NodePool performance retention') }
     $script:History[0].NotReadyNodes = 1
     $script:History[1].NotReadyNodes = 1
     if ((Get-NodePoolRecommendation 'default').TargetLimitCpu -ne 2) { $failures.Add('NotReady 중 NodePool 중복 확장 차단') }
@@ -798,12 +835,12 @@ function Invoke-SelfTest {
     )
     $restoreRecommendation = Get-NodePoolRecommendation 'default'
     if ($restoreRecommendation.TargetLimitCpu -ne 2 -or $restoreRecommendation.TargetConsolidateAfter -ne '1m') { $failures.Add("유휴 NodePool 기준값 복구(actual=$($restoreRecommendation.TargetLimitCpu)/$($restoreRecommendation.TargetConsolidateAfter), reason=$($restoreRecommendation.Reason))") }
-    if ($NodePoolSafetyCapNodes.default -ne 6 -or $NodePoolSafetyCapNodes.stress -ne 8) { $failures.Add('NodePool node safety cap') }
+    if ($NodePoolSafetyCapNodes.default -ne 1 -or $NodePoolSafetyCapNodes.stress -ne 4) { $failures.Add('NodePool node safety cap') }
     $script:History = @()
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 18/18' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 21/21' -ForegroundColor Green
 }
 
 if ($SelfTest) {
@@ -822,7 +859,7 @@ try {
     $mode = if ($ObserveOnly) { 'OBSERVE' } else { 'SAFE-AUTO' }
     if ($WhatIfPreference) { $mode = 'WHATIF' }
     Write-Host "WSC LIVE TUNER 시작: mode=$mode interval=${IntervalSeconds}s log=$script:LogPath" -ForegroundColor Green
-    Write-Host '추가 트래픽/API/DB/Terraform 변경 없음. 시작 시 user/stress rollout 1회와 prewarm이 발생하며 EC2 비용이 증가할 수 있음. 종료: Ctrl+C' -ForegroundColor DarkGray
+    Write-Host '추가 트래픽/API/DB/Terraform 변경 없음. 시작 시 검증된 2-node 프로필로 수렴하며 부하에서만 prewarm한다. 종료: Ctrl+C' -ForegroundColor DarkGray
 
     do {
         try {

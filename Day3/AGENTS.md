@@ -252,6 +252,7 @@ Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/stop" `
 
 ## 최근 작업 로그
 
+| 2026-08-25 | pending | **observe-live 비용-성능 탄력 프로필 복구** — 0.5x 60분 39/40 실측(run-1787385221)을 기준으로 user/product `70m`, stress `550m@60%`, HPA `2..20/2..20/1..12`를 시작 상태로 고정. 저부하 `2/2/1`, 트래픽 warm `4/2/2`, 압력 warm `6/4/3`이 모두 Managed 1대+stress 1대에 pack되며, NodePool ceiling(default 1대/stress 4대)은 실제 HPA 수요에만 노드가 생성되도록 분리. 유휴 300초 복귀, peak 중 consolidation 5분 유지, 오염된 과거 baseline annotation 무시, PS7/PS5 self-test 21/21 및 live 2-node rollout 검증. |
 | 2026-08-25 | pending | 저장소를 Day3 전용으로 정리 — `destroy-plan.txt` Terraform 산출물 제거, feature/day3-tuning을 main에 통합하고 Day1 기능 브랜치 제거 |
 | 2026-08-25 | pending | `feature/day3-tuning` 실운영 정리 — 무인 `observe-live.ps1` 추가(검증된 scale-down 300초), `get-test-data.ps1` 로직을 `check.ps1`에 내장, DB/S3 삭제 도구·중복 Stress 평가 도구·커밋된 테스트 결과 3개 제거. observe self-test 6/6, tune self-test 26/26, Python 5/5 및 live JSONL 갱신 확인 |
 | 2026-08-25 | pending | 다음 240초 BASE에서 최종 Pending 4개는 모두 NodePool CPU `Unschedulable`인데, profile 중 이미 사라진 stress Pod의 일시적 `FailedCreatePodSandBox: failed to setup network policy` 이벤트 때문에 `CNI_UNRESOLVED`로 오판한 문제 수정. CNI/PDB/NodePool 이벤트는 최신 sample의 동일 Pending Pod 이름과 일치할 때만 unresolved/current evidence로 인정하고, 복구된 과거 CNI Event는 JSON evidence에만 보존. 종료 cleanup 후 user2/product2/stress1·HPA min 건강 확인. self-test26/26·localhost5/5 통과. |
