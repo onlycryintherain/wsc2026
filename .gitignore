@@ -26,3 +26,9 @@ override.tf.json
 *.tfplan
 *.tfplan.*
 tfplan*
+
+# Day3 runtime/test outputs belong in temporary storage, not Git.
+Day3/tools/profile-sweep-*.json
+Day3/tools/test-results*.txt
+**/__pycache__/
+*.pyc
