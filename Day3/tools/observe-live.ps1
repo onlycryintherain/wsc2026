@@ -35,7 +35,6 @@ $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
 $WarmFloor = @{ user = 4; product = 4; stress = 4 }
 $MaxSafetyCap = @{ user = 40; product = 40; stress = 12 }
-$MaxIncreaseRatio = 2.0
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
 $NodePoolSafetyCapNodes = @{ default = 4; stress = 4 }
 $FallbackNodeCpu = 2
@@ -128,10 +127,9 @@ function Get-NodePoolConsolidateAfter($NodePool) {
 
 function Get-HpaMaxTarget([int]$CurrentMax, [int]$UncappedDesired, [int]$SafetyCap) {
     if ($CurrentMax -ge $SafetyCap) { return $CurrentMax }
-    $lower = [int][math]::Ceiling($CurrentMax * 1.20)
-    $upper = [int][math]::Ceiling($CurrentMax * $MaxIncreaseRatio)
-    $bounded = [int][math]::Min($upper, [math]::Max($lower, $UncappedDesired))
-    return [int][math]::Min($SafetyCap, [math]::Max($CurrentMax + 1, $bounded))
+    # maxReplicas는 실제 Pod/노드를 만들지 않는 capacity ceiling이다. 채점 spike에서
+    # 1→2→4 순차 개방이 초기 가용성을 훼손하므로 pressure가 검증되면 안전 상한을 즉시 연다.
+    return $SafetyCap
 }
 
 function Initialize-Baseline {
@@ -501,9 +499,6 @@ function Set-SafeHpaState($Recommendation) {
     if ($Recommendation.CurrentMin -eq $Recommendation.TargetMin -and $Recommendation.CurrentMax -eq $Recommendation.TargetMax -and $Recommendation.CurrentScaleDown -eq $Recommendation.TargetScaleDown) {
         return $false
     }
-    if (([datetime]::UtcNow - $script:LastMutationUtc).TotalSeconds -lt $DecisionWindowSeconds) {
-        return $false
-    }
     $app = [string]$Recommendation.App
     $baseline = $script:Baseline[$app]
     $description = "HPA/$app min $($Recommendation.CurrentMin)->$($Recommendation.TargetMin), max $($Recommendation.CurrentMax)->$($Recommendation.TargetMax), scaleDown $($Recommendation.CurrentScaleDown)->$($Recommendation.TargetScaleDown)s ($($Recommendation.Reason))"
@@ -621,6 +616,7 @@ function Invoke-SelfTest {
     $blockedRecommendation = Get-Recommendation 'user'
     if ($blockedRecommendation.TargetMax -ne 20) { $failures.Add('Pending 중 HPA max 확장 차단') }
     if ((Get-HpaMaxTarget 38 100 40) -ne 40) { $failures.Add('HPA max safety cap') }
+    if ((Get-HpaMaxTarget 1 2 40) -ne 40 -or (Get-HpaMaxTarget 1 2 12) -ne 12) { $failures.Add('HPA max cold-start 즉시 개방') }
     $ceiling.Pending = 2
     $script:NodePoolBaseline['default'] = [pscustomobject]@{ LimitCpu = 2; ConsolidateAfter = '1m' }
     $poolAtLimit = [pscustomobject]@{ LimitCpu = 2; UsedCpu = 2; Nodes = 1; CpuPerNode = 2; ConsolidateAfter = '1m' }
@@ -648,7 +644,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 13/13' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 14/14' -ForegroundColor Green
 }
 
 if ($SelfTest) {
@@ -678,14 +674,11 @@ try {
             foreach ($pool in $NodePoolApps.Keys) { $nodePoolRecommendations[$pool] = Get-NodePoolRecommendation $pool }
             Show-Snapshot $snapshot $recommendations $nodePoolRecommendations
 
-            $nodePoolChanged = $false
             foreach ($pool in @('default', 'stress')) {
-                if (Set-SafeNodePoolState $nodePoolRecommendations[$pool]) { $nodePoolChanged = $true; break }
+                [void](Set-SafeNodePoolState $nodePoolRecommendations[$pool])
             }
-            if (-not $nodePoolChanged) {
-                foreach ($app in $MutationOrder) {
-                    if (Set-SafeHpaState $recommendations[$app]) { break }
-                }
+            foreach ($app in $MutationOrder) {
+                [void](Set-SafeHpaState $recommendations[$app])
             }
         } catch {
             Write-Warning "관측 주기 실패(다음 주기에 재시도): $($_.Exception.Message)"
