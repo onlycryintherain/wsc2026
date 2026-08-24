@@ -36,13 +36,13 @@ $ErrorActionPreference = 'Stop'
 $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
-$WarmFloor = @{ user = 8; product = 2; stress = 4 }
-$MaxSafetyCap = @{ user = 32; product = 20; stress = 8 }
-$HpaTargetUtilization = @{ user = 15; product = 29; stress = 55 }
-$UserCpuRequest = '150m'
+$WarmFloor = @{ user = 12; product = 2; stress = 4 }
+$MaxSafetyCap = @{ user = 48; product = 20; stress = 12 }
+$HpaTargetUtilization = @{ user = 12; product = 29; stress = 55 }
+$UserCpuRequest = '200m'
 $StressNodePool = 'stress'
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
-$NodePoolSafetyCapNodes = @{ default = 4; stress = 3 }
+$NodePoolSafetyCapNodes = @{ default = 6; stress = 4 }
 $FallbackNodeCpu = 2
 $ActiveConsolidateAfter = '10m'
 $ActivityCpuM = @{ user = 15.0; product = 15.0; stress = 250.0 }
@@ -196,7 +196,7 @@ function Initialize-PerformanceProfile {
         } else {
             $patch = @{
                 spec = @{ template = @{
-                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'user-150m-v2' } }
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'user-200m-v1' } }
                     spec = @{ containers = @(@{ name = $userContainer; resources = @{ requests = @{ cpu = $UserCpuRequest } } }) }
                 } }
             } | ConvertTo-Json -Compress -Depth 12
@@ -679,8 +679,8 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($WarmFloor.user -ne 8 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('비대칭 warm floor') }
-    if ($UserCpuRequest -ne '150m' -or $HpaTargetUtilization.user -ne 15) { $failures.Add('user control point profile') }
+    if ($WarmFloor.user -ne 12 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('비대칭 warm floor') }
+    if ($UserCpuRequest -ne '200m' -or $HpaTargetUtilization.user -ne 12) { $failures.Add('user control point profile') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -708,7 +708,7 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $ceiling } }
     )
     $maxRecommendation = Get-Recommendation 'user'
-    if ($maxRecommendation.Reason -ne 'HPA_MAX_PRESSURE' -or $maxRecommendation.TargetMax -ne 32) { $failures.Add('HPA max performance expansion') }
+    if ($maxRecommendation.Reason -ne 'HPA_MAX_PRESSURE' -or $maxRecommendation.TargetMax -ne 48) { $failures.Add('HPA max performance expansion') }
     $ceiling.Pending = 1
     $blockedRecommendation = Get-Recommendation 'user'
     if ($blockedRecommendation.TargetMax -ne 20) { $failures.Add('Pending 중 HPA max 확장 차단') }
@@ -722,7 +722,7 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $ceiling; product = $ceiling }; NodePools = @{ default = $poolAtLimit }; NotReadyNodes = 0 }
     )
     $poolRecommendation = Get-NodePoolRecommendation 'default'
-    if ($poolRecommendation.TargetLimitCpu -ne 8 -or $poolRecommendation.TargetConsolidateAfter -ne '10m') { $failures.Add('NodePool performance ceiling 확장') }
+    if ($poolRecommendation.TargetLimitCpu -ne 12 -or $poolRecommendation.TargetConsolidateAfter -ne '10m') { $failures.Add('NodePool performance ceiling 확장') }
     $script:History[0].NotReadyNodes = 1
     $script:History[1].NotReadyNodes = 1
     if ((Get-NodePoolRecommendation 'default').TargetLimitCpu -ne 2) { $failures.Add('NotReady 중 NodePool 중복 확장 차단') }
@@ -736,7 +736,7 @@ function Invoke-SelfTest {
     )
     $restoreRecommendation = Get-NodePoolRecommendation 'default'
     if ($restoreRecommendation.TargetLimitCpu -ne 2 -or $restoreRecommendation.TargetConsolidateAfter -ne '1m') { $failures.Add("유휴 NodePool 기준값 복구(actual=$($restoreRecommendation.TargetLimitCpu)/$($restoreRecommendation.TargetConsolidateAfter), reason=$($restoreRecommendation.Reason))") }
-    if ($NodePoolSafetyCapNodes.default -ne 4 -or $NodePoolSafetyCapNodes.stress -ne 3) { $failures.Add('NodePool node safety cap') }
+    if ($NodePoolSafetyCapNodes.default -ne 6 -or $NodePoolSafetyCapNodes.stress -ne 4) { $failures.Add('NodePool node safety cap') }
     $script:History = @()
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
