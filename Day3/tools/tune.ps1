@@ -319,7 +319,7 @@ function Get-Sample([datetime]$ProfileStartedAt, [hashtable]$InitialRestarts) {
                 if ($status.state.waiting.reason) { $messages.Add([string]$status.state.waiting.reason) }
                 if ($status.state.waiting.message) { $messages.Add([string]$status.state.waiting.message) }
             }
-            $pendingRecords.Add([pscustomobject]@{App=$app;Pod=[string]$pod.metadata.name;Reason=($messages -join '; ')})
+            $pendingRecords.Add([pscustomobject]@{App=$app;Pod=[string]$pod.metadata.name;Phase=[string]$pod.status.phase;NodeName=[string]$pod.spec.nodeName;Reason=($messages -join '; ')})
         }
 
         $cpuTotal = 0.0; $memoryTotal = 0.0; $metricPods = 0
@@ -353,11 +353,20 @@ function Get-Sample([datetime]$ProfileStartedAt, [hashtable]$InitialRestarts) {
     }
 
     $eventMessages = [System.Collections.Generic.List[string]]::new()
+    $currentPendingNames=[System.Collections.Generic.HashSet[string]]::new()
+    foreach($record in $pendingRecords){[void]$currentPendingNames.Add([string]$record.Pod)}
+    $cniUnresolved=[bool](@($pendingRecords.Reason) -match 'FailedCreatePodSandBox|failed to assign an IP')
+    $pdbUnresolved=[bool](@($pendingRecords.Reason) -match 'disruption budget')
+    $nodePoolLimited=[bool](@($pendingRecords.Reason) -match 'exceed limits for nodepool|nodepool.+limit')
     foreach ($event in @($events.items)) {
         $timestamp = $event.eventTime
         if (-not $timestamp) { $timestamp = $event.lastTimestamp }
         if (-not $timestamp) { $timestamp = $event.firstTimestamp }
         if ($timestamp -and ([datetime]$timestamp).ToUniversalTime() -lt $ProfileStartedAt.ToUniversalTime()) { continue }
+        $eventTargetsCurrentPending=$currentPendingNames.Contains([string]$event.involvedObject.name)
+        if($eventTargetsCurrentPending -and $event.reason -eq 'FailedCreatePodSandBox'){$cniUnresolved=$true}
+        if($eventTargetsCurrentPending -and [string]$event.message -match 'disruption budget'){$pdbUnresolved=$true}
+        if($eventTargetsCurrentPending -and [string]$event.message -match 'exceed limits for nodepool|nodepool.+limit'){$nodePoolLimited=$true}
         if ($event.reason -in @('FailedScheduling','FailedCreatePodSandBox') -or [string]$event.message -match 'disruption budget|Insufficient|failed to assign an IP') {
             $eventMessages.Add("$($event.reason): $($event.message)")
         }
@@ -384,9 +393,9 @@ function Get-Sample([datetime]$ProfileStartedAt, [hashtable]$InitialRestarts) {
             InsufficientCpu=([bool]($allReasons -match 'Insufficient cpu'))
             InsufficientMemory=([bool]($allReasons -match 'Insufficient memory'))
             FailedScheduling=([bool]($allReasons -match 'FailedScheduling|Unschedulable'))
-            CniError=([bool]($allReasons -match 'FailedCreatePodSandBox|failed to assign an IP'))
-            PdbConstraint=([bool]($allReasons -match 'disruption budget'))
-            NodePoolLimit=([bool]($allReasons -match 'exceed limits for nodepool|nodepool.+limit'))
+            CniError=$cniUnresolved
+            PdbConstraint=$pdbUnresolved
+            NodePoolLimit=$nodePoolLimited
             Reasons=$allReasons
         }
     }

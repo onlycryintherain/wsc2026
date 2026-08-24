@@ -32,7 +32,7 @@ BASE 전에 Deployment replica/resources, HPA, behavior, topology, PDB, NodePool
 - `MIN_DOWN`
 - `REQUEST_CONTROL_POINT` (`requests.cpu` + absolute HPA trigger compensation)
 
-Placement, topology, PDB, NodePool은 변경하지 않습니다. `Insufficient CPU/memory`와 `NODEPOOL_LIMIT`은 중단 조건이 아니라 resource/HPA candidate를 만드는 병목 evidence입니다. 미해결 CNI, PDB constraint, metrics 부재, local generator limit처럼 측정 자체가 무효인 경우에만 search/FINAL을 중단합니다.
+Placement, topology, PDB, NodePool은 변경하지 않습니다. `Insufficient CPU/memory`와 `NODEPOOL_LIMIT`은 중단 조건이 아니라 resource/HPA candidate를 만드는 병목 evidence입니다. CNI/PDB 이벤트는 **최신 sample에 실제로 남아 있는 동일 Pod**와 연관될 때만 unresolved로 판정합니다. 이미 Running으로 복구됐거나 현재 Pending 원인이 NodePool CPU인 경우 과거 `FailedCreatePodSandBox` 이벤트로 중단하지 않습니다. 미해결 CNI, PDB constraint, metrics 부재, local generator limit처럼 측정 자체가 무효인 경우에만 search/FINAL을 중단합니다.
 
 ## Recommendation order
 

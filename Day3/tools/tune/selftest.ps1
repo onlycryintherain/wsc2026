@@ -241,6 +241,8 @@ Assert-Test '18d terminal CNI evidence still skips FINAL' {
     $sample.Scheduling.CniError=$true
     $eval=New-TestEvaluation $config stress 0 0 0 @($sample,$sample,$sample)
     if((Get-InfrastructureStop $eval).Type-ne'CNI_UNRESOLVED'){throw 'CNI did not invalidate measurement'}
+    if($source.Contains('CniError=([bool]($allReasons')){throw 'historical CNI events still poison latest Pending'}
+    if(-not$source.Contains("`$eventTargetsCurrentPending=`$currentPendingNames.Contains")){throw 'CNI event is not correlated to current Pending Pod'}
     if(-not$source.Contains('if ($skipFinalReason)')-or-not$source.Contains('FINAL_SKIPPED: $skipFinalReason')){throw 'terminal invalid measurement can still run FINAL'}
 }
 
