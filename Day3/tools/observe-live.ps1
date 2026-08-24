@@ -1,12 +1,12 @@
 ﻿<#
 .SYNOPSIS
-    저부하는 2노드에 유지하고 강한 부하에서만 성능 보호 용량을 자동 준비한다.
+    저부하는 1노드 shared, 강한 부하는 stress 전용 NodePool로 자동 전환한다.
 .DESCRIPTION
     인자 없이 실행한다. 추가 트래픽을 만들지 않고 Kubernetes metrics와 애플리케이션
-    JSON access log를 분석한다. 시작 시 39/40 실측 프로필과 stress 전용 NodePool,
+    JSON access log를 분석한다. 시작 시 실측 리소스/HPA 프로필을 적용하고,
     최소 HPA floor를 적용한다. 이후 트래픽/CPU 편중/HPA 압력이
     확인되면 minReplicas, maxReplicas, NodePool CPU ceiling과 scale-down/consolidation
-    시간을 조정한다. 유휴가 지속되면 HPA와 NodePool을 검증된 2노드 기준으로
+    시간을 조정한다. 유휴가 지속되면 stress를 shared placement와 1노드 기준으로
     단계 복구한다. maxReplicas는 비용을 직접 발생시키지 않으므로 자동 축소하지 않는다.
 
     시작 프로필은 세 앱 CPU request와 stress nodeSelector만 변경하므로 Deployment rollout이
@@ -40,8 +40,8 @@ $MutationOrder = @('stress', 'user', 'product')
 # 0.5x 60분 39/40(run-1787385221)의 control point를 보존한다. 현재 바이너리의
 # keep-alive 연결 편중을 막기 위해 stress 2개를 부하 전에 한 노드에 prewarm한다.
 # 600m은 t3.medium allocatable 1930m에서 daemon overhead를 포함해 노드당 정확히 2 Pod만 허용한다.
-$BaselineFloor = @{ user = 2; product = 2; stress = 2 }
-$LoadFloor = @{ user = 2; product = 2; stress = 4 }
+$BaselineFloor = @{ user = 1; product = 1; stress = 1 }
+$LoadFloor = @{ user = 1; product = 1; stress = 1 }
 $WarmFloor = @{ user = 4; product = 2; stress = 4 }
 $PressureFloor = @{ user = 6; product = 4; stress = 6 }
 $MaxSafetyCap = @{ user = 20; product = 20; stress = 8 }
@@ -60,7 +60,9 @@ $HotCpuM = @{ user = 50.0; product = 50.0; stress = 500.0 }
 $script:History = @()
 $script:Baseline = @{}
 $script:NodePoolBaseline = @{}
+$script:ManagedNodeGroup = $null
 $script:LastMutationUtc = [datetime]::MinValue
+$script:LastPlacementMutationUtc = [datetime]::MinValue
 $script:LogPath = Join-Path ([IO.Path]::GetTempPath()) ("wsi-live-tune-{0}.jsonl" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
 function Convert-CpuToMillicores([string]$Value) {
@@ -149,6 +151,13 @@ function Get-HpaMaxTarget([int]$CurrentMax, [int]$UncappedDesired, [int]$SafetyC
 }
 
 function Initialize-Baseline {
+    $nodes = Get-KubeJson @('get', 'nodes', '-o', 'json')
+    $managedNode = @($nodes.items | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_.metadata.labels.'eks.amazonaws.com/nodegroup')
+    } | Select-Object -First 1)
+    if (-not $managedNode) { throw 'Managed NodeGroup 노드를 찾지 못했습니다.' }
+    $script:ManagedNodeGroup = [string]$managedNode.metadata.labels.'eks.amazonaws.com/nodegroup'
+
     $hpas = Get-KubeJson @('-n', $Namespace, 'get', 'hpa', '-o', 'json')
     foreach ($app in $ManagedApps) {
         $hpa = @($hpas.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
@@ -280,22 +289,22 @@ function Initialize-PerformanceProfile {
         }
     }
 
-    # stress를 shared로 두면 60분 run에서 default 4대 CPU를 모두 소모하면서
-    # stress 28.46%, user 43.2%로 동반 하락했다. scoring session 동안은 placement
-    # rollout을 반복하지 않고 전용 tainted NodePool에 고정한다.
+    # 저부하는 Managed 노드의 유휴 CPU를 공유한다. 압력 시 main loop가 전용
+    # NodePool로 rolling 전환하고 5분 유휴 뒤에만 다시 shared로 병합한다.
     $currentStressPool = [string]$stressDeployment.spec.template.spec.nodeSelector.'karpenter.sh/nodepool'
-    if ($currentStressPool -ne $StressNodePool) {
-        $description = "Deployment/stress nodeSelector -> karpenter.sh/nodepool=$StressNodePool"
+    $currentManagedGroup = [string]$stressDeployment.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup'
+    if ($PrepareForLoad -and $currentManagedGroup -ne $script:ManagedNodeGroup) {
+        $description = "Deployment/stress -> SHARED Managed NodeGroup/$($script:ManagedNodeGroup)"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
             $patch = @{
                 spec = @{ template = @{
-                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'stress-dedicated-v2' } }
-                    spec = @{ nodeSelector = @{ 'karpenter.sh/nodepool' = $StressNodePool } }
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-placement' = 'shared' } }
+                    spec = @{ nodeSelector = @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } }
                 } }
             } | ConvertTo-Json -Compress -Depth 10
-            Write-Host "[적용/rollout/비용주의] $description" -ForegroundColor Magenta
+            Write-Host "[적용/rollout] $description" -ForegroundColor Cyan
             Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=merge', '-p', $patch) | Out-Null
         }
     }
@@ -375,8 +384,8 @@ function Initialize-PerformanceProfile {
         if ([string]$verifyStress.spec.template.spec.containers[0].resources.requests.cpu -ne $StressCpuRequest) {
             throw '시작 프로필 검증 실패: stress CPU request'
         }
-        if ([string]$verifyStress.spec.template.spec.nodeSelector.'karpenter.sh/nodepool' -ne $StressNodePool) {
-            throw '시작 프로필 검증 실패: stress nodeSelector'
+        if ($PrepareForLoad -and [string]$verifyStress.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup' -ne $script:ManagedNodeGroup) {
+            throw '시작 프로필 검증 실패: stress shared placement'
         }
         if ($null -ne $verifyStress.spec.template.spec.topologySpreadConstraints) {
             throw '시작 프로필 검증 실패: stress topology spread 잔존'
@@ -435,8 +444,7 @@ function Reset-IdleStateForLoad {
         } while ([datetime]::UtcNow -lt $deadline)
         if (-not $ready) { throw 'LOAD_PREPARE_TIMEOUT: baseline Deployment Ready 실패' }
 
-        # rollout 직후에는 Pod가 이전 stress 노드에 흩어진 채 Deployment만 Ready가 될 수 있다.
-        # 빠른 disruption을 유지한 상태에서 실제 3-node/Pending=0까지 기다려 비용 시작점을 보장한다.
+        # rollout 직후 종료 중인 전용 노드가 남을 수 있으므로 실제 1-node/Pending=0까지 기다린다.
         $nodeDeadline = [datetime]::UtcNow.AddSeconds(180)
         do {
             $nodes = Get-KubeJson @('get', 'nodes', '-o', 'json')
@@ -446,18 +454,18 @@ function Reset-IdleStateForLoad {
             }).Count
             $totalNodeCount = @($nodes.items).Count
             $pendingCount = @($pods.items | Where-Object { $_.status.phase -eq 'Pending' }).Count
-            if ($totalNodeCount -le 3 -and $readyNodeCount -eq 3 -and $pendingCount -eq 0) { break }
+            if ($totalNodeCount -eq 1 -and $readyNodeCount -eq 1 -and $pendingCount -eq 0) { break }
             Start-Sleep -Seconds 5
         } while ([datetime]::UtcNow -lt $nodeDeadline)
-        if ($totalNodeCount -gt 3 -or $readyNodeCount -ne 3 -or $pendingCount -gt 0) {
-            throw "LOAD_PREPARE_TIMEOUT: 3-node scoring 수렴 실패(Node=$totalNodeCount ReadyNode=$readyNodeCount Pending=$pendingCount)"
+        if ($totalNodeCount -ne 1 -or $readyNodeCount -ne 1 -or $pendingCount -gt 0) {
+            throw "LOAD_PREPARE_TIMEOUT: 1-node shared 수렴 실패(Node=$totalNodeCount ReadyNode=$readyNodeCount Pending=$pendingCount)"
         }
 
         foreach ($app in $MutationOrder) {
             $restorePatch = @{ spec = @{ minReplicas = [int]$LoadFloor[$app]; maxReplicas = [int]$MaxSafetyCap[$app]; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = $ScaleDownStabilizationSeconds } } } } | ConvertTo-Json -Compress -Depth 8
             Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $restorePatch) | Out-Null
         }
-        Write-Host '[준비] scoring floor/3-node Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
+        Write-Host '[준비] shared floor/1-node Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
     } finally {
         Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=merge', '-p', $normalRestartStrategy) -AllowFailure | Out-Null
         Invoke-Kubectl @('patch', 'nodepool', $StressNodePool, '--type=merge', '-p', $normalConsolidation) -AllowFailure | Out-Null
@@ -686,6 +694,53 @@ function Get-Recommendation([string]$App) {
     }
 }
 
+function Get-StressPlacementTarget($Recommendation) {
+    if ($null -eq $Recommendation) { return 'HOLD' }
+    if ($Recommendation.Reason -in @('HOT_POD', 'HPA_PRESSURE', 'HPA_MAX_PRESSURE')) { return 'ISOLATED' }
+    if ($Recommendation.Reason -eq 'IDLE_RESTORE') { return 'SHARED' }
+    return 'HOLD'
+}
+
+function Set-DynamicStressPlacement($Recommendation) {
+    $target = Get-StressPlacementTarget $Recommendation
+    if ($target -eq 'HOLD') { return $false }
+    if (([datetime]::UtcNow - $script:LastPlacementMutationUtc).TotalSeconds -lt $DecisionWindowSeconds) { return $false }
+
+    $deployment = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'stress', '-o', 'json')
+    $currentPool = [string]$deployment.spec.template.spec.nodeSelector.'karpenter.sh/nodepool'
+    $isIsolated = $currentPool -eq $StressNodePool
+    if (($target -eq 'ISOLATED' -and $isIsolated) -or ($target -eq 'SHARED' -and -not $isIsolated)) { return $false }
+
+    $description = if ($target -eq 'ISOLATED') {
+        "stress SHARED->ISOLATED (NodePool/$StressNodePool, reason=$($Recommendation.Reason))"
+    } else {
+        'stress ISOLATED->SHARED (5분 유휴 복귀)'
+    }
+    if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
+        Write-Host "[권고] $description" -ForegroundColor Yellow
+        return $false
+    }
+
+    $selector = if ($target -eq 'ISOLATED') {
+        @{ 'karpenter.sh/nodepool' = $StressNodePool }
+    } else {
+        @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup }
+    }
+    $patch = @{
+        spec = @{ template = @{
+            metadata = @{ annotations = @{
+                'wsi2026.io/live-placement' = $target.ToLowerInvariant()
+                'wsi2026.io/live-placement-reason' = [string]$Recommendation.Reason
+            } }
+            spec = @{ nodeSelector = $selector }
+        } }
+    } | ConvertTo-Json -Compress -Depth 10
+    Write-Host "[배치전환/rollout] $description" -ForegroundColor Magenta
+    Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=merge', '-p', $patch) | Out-Null
+    $script:LastPlacementMutationUtc = [datetime]::UtcNow
+    return $true
+}
+
 function Get-NodePoolRecommendation([string]$Pool) {
     $window = @(Get-Window $DecisionWindowSeconds)
     $idleWindow = @(Get-Window $IdleRestoreSeconds)
@@ -882,8 +937,8 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($BaselineFloor.user -ne 2 -or $BaselineFloor.product -ne 2 -or $BaselineFloor.stress -ne 2) { $failures.Add('2-node baseline floor') }
-    if ($LoadFloor.user -ne 2 -or $LoadFloor.product -ne 2 -or $LoadFloor.stress -ne 4) { $failures.Add('3-node scoring load floor') }
+    if ($BaselineFloor.user -ne 1 -or $BaselineFloor.product -ne 1 -or $BaselineFloor.stress -ne 1) { $failures.Add('1-node shared baseline floor') }
+    if ($LoadFloor.user -ne 1 -or $LoadFloor.product -ne 1 -or $LoadFloor.stress -ne 1) { $failures.Add('1-node scoring load floor') }
     if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('앱별 traffic warm floor') }
     if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 6) { $failures.Add('앱별 pressure floor') }
     if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
@@ -906,6 +961,9 @@ function Invoke-SelfTest {
     $recommendation = Get-Recommendation 'stress'
     if ($recommendation.TargetMin -ne 6) { $failures.Add('stress pressure min 추천') }
     if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
+    if ((Get-StressPlacementTarget $recommendation) -ne 'ISOLATED') { $failures.Add('stress pressure isolation') }
+    if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'IDLE_RESTORE' })) -ne 'SHARED') { $failures.Add('stress idle merge') }
+    if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'TRAFFIC_WARM' })) -ne 'HOLD') { $failures.Add('stress placement hysteresis') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
         Ready = 20; Pending = 0; Current = 20; Desired = 20; Min = 2; Max = 10
@@ -951,7 +1009,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 23/23' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 26/26' -ForegroundColor Green
 }
 
 if ($SelfTest) {
@@ -971,7 +1029,7 @@ try {
     $mode = if ($ObserveOnly) { 'OBSERVE' } else { 'SAFE-AUTO' }
     if ($WhatIfPreference) { $mode = 'WHATIF' }
     Write-Host "WSC LIVE TUNER 시작: mode=$mode interval=${IntervalSeconds}s log=$script:LogPath" -ForegroundColor Green
-    Write-Host '추가 트래픽/API/DB/Terraform 변경 없음. idle은 2-node, scoring 준비는 3-node prewarm으로 수렴한다. 종료: Ctrl+C' -ForegroundColor DarkGray
+    Write-Host '추가 트래픽/API/DB/Terraform 변경 없음. idle SHARED 1-node, pressure ISOLATED, 5분 유휴 시 병합한다. 종료: Ctrl+C' -ForegroundColor DarkGray
 
     do {
         try {
@@ -983,6 +1041,8 @@ try {
             foreach ($pool in $NodePoolApps.Keys) { $nodePoolRecommendations[$pool] = Get-NodePoolRecommendation $pool }
             Show-Snapshot $snapshot $recommendations $nodePoolRecommendations
 
+            # placement를 먼저 바꿔 이후 HPA scale-up Pod가 올바른 domain에 생성되게 한다.
+            [void](Set-DynamicStressPlacement $recommendations['stress'])
             foreach ($pool in @('default', 'stress')) {
                 [void](Set-SafeNodePoolState $nodePoolRecommendations[$pool])
             }
