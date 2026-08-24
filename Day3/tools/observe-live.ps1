@@ -110,6 +110,20 @@ function Get-KubeJson([string[]]$Arguments) {
     return $raw | ConvertFrom-Json
 }
 
+function Set-DeploymentPlacementSelector([string]$App, $Selector, [string]$Placement, [string]$Reason) {
+    $operations = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Selector) {
+        $operations.Add(@{ op = 'remove'; path = '/spec/template/spec/nodeSelector' })
+    } else {
+        # JSON Patch add는 기존 object member가 있으면 전체 값을 교체하므로 stale selector가 남지 않는다.
+        $operations.Add(@{ op = 'add'; path = '/spec/template/spec/nodeSelector'; value = $Selector })
+    }
+    $operations.Add(@{ op = 'add'; path = '/spec/template/metadata/annotations/wsi2026.io~1live-placement'; value = $Placement })
+    $operations.Add(@{ op = 'add'; path = '/spec/template/metadata/annotations/wsi2026.io~1live-placement-reason'; value = $Reason })
+    $patch = $operations | ConvertTo-Json -Compress -Depth 10
+    Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', $App, '--type=json', '-p', $patch) | Out-Null
+}
+
 function Test-Prerequisites {
     foreach ($command in @('aws', 'kubectl')) {
         if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
@@ -299,19 +313,14 @@ function Initialize-PerformanceProfile {
     foreach ($foreground in @($userDeployment, $productDeployment)) {
         $app = [string]$foreground.metadata.name
         $currentManagedGroup = [string]$foreground.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup'
-        if (-not $PrepareForLoad -or $currentManagedGroup -eq $script:ManagedNodeGroup) { continue }
+        $selectorCount = @($foreground.spec.template.spec.nodeSelector.PSObject.Properties).Count
+        if (-not $PrepareForLoad -or ($currentManagedGroup -eq $script:ManagedNodeGroup -and $selectorCount -eq 1)) { continue }
         $description = "Deployment/$app -> SHARED Managed NodeGroup/$($script:ManagedNodeGroup)"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/$app", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
-            $patch = @{
-                spec = @{ template = @{
-                    metadata = @{ annotations = @{ 'wsi2026.io/live-placement' = 'managed' } }
-                    spec = @{ nodeSelector = @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } }
-                } }
-            } | ConvertTo-Json -Compress -Depth 10
             Write-Host "[적용/rollout] $description" -ForegroundColor Cyan
-            Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', $app, '--type=merge', '-p', $patch) | Out-Null
+            Set-DeploymentPlacementSelector $app @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } 'managed' 'PREPARE_FOR_LOAD'
         }
     }
 
@@ -319,19 +328,14 @@ function Initialize-PerformanceProfile {
     # NodePool로 rolling 전환하고 5분 유휴 뒤에만 다시 shared로 병합한다.
     $currentStressPool = [string]$stressDeployment.spec.template.spec.nodeSelector.'karpenter.sh/nodepool'
     $currentManagedGroup = [string]$stressDeployment.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup'
-    if ($PrepareForLoad -and $currentManagedGroup -ne $script:ManagedNodeGroup) {
+    $stressSelectorCount = @($stressDeployment.spec.template.spec.nodeSelector.PSObject.Properties).Count
+    if ($PrepareForLoad -and ($currentManagedGroup -ne $script:ManagedNodeGroup -or $stressSelectorCount -ne 1)) {
         $description = "Deployment/stress -> SHARED Managed NodeGroup/$($script:ManagedNodeGroup)"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
-            $patch = @{
-                spec = @{ template = @{
-                    metadata = @{ annotations = @{ 'wsi2026.io/live-placement' = 'shared' } }
-                    spec = @{ nodeSelector = @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } }
-                } }
-            } | ConvertTo-Json -Compress -Depth 10
             Write-Host "[적용/rollout] $description" -ForegroundColor Cyan
-            Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=merge', '-p', $patch) | Out-Null
+            Set-DeploymentPlacementSelector 'stress' @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } 'shared' 'PREPARE_FOR_LOAD'
         }
     }
 
@@ -755,7 +759,8 @@ function Set-DynamicForegroundPlacement([string]$App, $Recommendation) {
 
     $deployment = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', $App, '-o', 'json')
     $currentManagedGroup = [string]$deployment.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup'
-    $isManaged = $currentManagedGroup -eq $script:ManagedNodeGroup
+    $selectorCount = @($deployment.spec.template.spec.nodeSelector.PSObject.Properties).Count
+    $isManaged = $currentManagedGroup -eq $script:ManagedNodeGroup -and $selectorCount -eq 1
     if (($target -eq 'MANAGED' -and $isManaged) -or ($target -eq 'ELASTIC' -and -not $isManaged)) { return $false }
 
     $description = if ($target -eq 'ELASTIC') {
@@ -769,17 +774,8 @@ function Set-DynamicForegroundPlacement([string]$App, $Recommendation) {
     }
 
     $selector = if ($target -eq 'MANAGED') { @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } } else { $null }
-    $patch = @{
-        spec = @{ template = @{
-            metadata = @{ annotations = @{
-                'wsi2026.io/live-placement' = $target.ToLowerInvariant()
-                'wsi2026.io/live-placement-reason' = [string]$Recommendation.Reason
-            } }
-            spec = @{ nodeSelector = $selector }
-        } }
-    } | ConvertTo-Json -Compress -Depth 10
     Write-Host "[배치전환/rollout] $description" -ForegroundColor Magenta
-    Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', $App, '--type=merge', '-p', $patch) | Out-Null
+    Set-DeploymentPlacementSelector $App $selector $target.ToLowerInvariant() ([string]$Recommendation.Reason)
     $script:LastPlacementMutationUtc[$App] = [datetime]::UtcNow
     return $true
 }
@@ -791,7 +787,8 @@ function Set-DynamicStressPlacement($Recommendation) {
 
     $deployment = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'stress', '-o', 'json')
     $currentPool = [string]$deployment.spec.template.spec.nodeSelector.'karpenter.sh/nodepool'
-    $isIsolated = $currentPool -eq $StressNodePool
+    $selectorCount = @($deployment.spec.template.spec.nodeSelector.PSObject.Properties).Count
+    $isIsolated = $currentPool -eq $StressNodePool -and $selectorCount -eq 1
     if (($target -eq 'ISOLATED' -and $isIsolated) -or ($target -eq 'SHARED' -and -not $isIsolated)) { return $false }
 
     $description = if ($target -eq 'ISOLATED') {
@@ -809,17 +806,8 @@ function Set-DynamicStressPlacement($Recommendation) {
     } else {
         @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup }
     }
-    $patch = @{
-        spec = @{ template = @{
-            metadata = @{ annotations = @{
-                'wsi2026.io/live-placement' = $target.ToLowerInvariant()
-                'wsi2026.io/live-placement-reason' = [string]$Recommendation.Reason
-            } }
-            spec = @{ nodeSelector = $selector }
-        } }
-    } | ConvertTo-Json -Compress -Depth 10
     Write-Host "[배치전환/rollout] $description" -ForegroundColor Magenta
-    Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=merge', '-p', $patch) | Out-Null
+    Set-DeploymentPlacementSelector 'stress' $selector $target.ToLowerInvariant() ([string]$Recommendation.Reason)
     $script:LastPlacementMutationUtc['stress'] = [datetime]::UtcNow
     return $true
 }
