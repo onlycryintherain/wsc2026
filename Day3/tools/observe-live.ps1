@@ -4,11 +4,12 @@
 .DESCRIPTION
     인자 없이 실행한다. 추가 트래픽을 만들지 않고 Kubernetes metrics와 애플리케이션
     JSON access log를 분석한다. 트래픽/CPU 편중/HPA 압력이 확인되면 warm minReplicas,
-    maxReplicas와 scale-down stabilization을 조정하고, 유휴가 지속되면 minReplicas와
-    scale-down stabilization을 시작 전 기준으로 복구한다. maxReplicas는 비용을 직접
-    발생시키지 않으므로 자동 축소하지 않는다.
+    maxReplicas, NodePool CPU ceiling과 scale-down/consolidation 시간을 조정한다. 유휴가
+    지속되면 HPA warm 상태와 NodePool을 시작 전 기준으로 단계 복구한다. maxReplicas는
+    비용을 직접 발생시키지 않으므로 자동 축소하지 않는다.
 
-    Deployment, resource request/limit, NodePool, Terraform은 변경하지 않는다.
+    Deployment, resource request/limit, Terraform은 변경하지 않는다. NodePool은 Pod를
+    직접 생성하지 않고 허용 ceiling만 노드 1대분씩 bounded 조정한다.
     Ctrl+C로 종료하며 결과는 임시 디렉터리의 JSONL 파일에 기록한다.
 .EXAMPLE
     .\tools\observe-live.ps1
@@ -35,10 +36,15 @@ $MutationOrder = @('stress', 'user', 'product')
 $WarmFloor = @{ user = 2; product = 2; stress = 4 }
 $MaxSafetyCap = @{ user = 40; product = 40; stress = 12 }
 $MaxIncreaseRatio = 1.25
+$NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
+$NodePoolSafetyCapNodes = @{ default = 4; stress = 4 }
+$FallbackNodeCpu = 2
+$ActiveConsolidateAfter = '5m'
 $ActivityCpuM = @{ user = 15.0; product = 15.0; stress = 250.0 }
 $HotCpuM = @{ user = 50.0; product = 50.0; stress = 500.0 }
 $script:History = @()
 $script:Baseline = @{}
+$script:NodePoolBaseline = @{}
 $script:LastMutationUtc = [datetime]::MinValue
 $script:LogPath = Join-Path ([IO.Path]::GetTempPath()) ("wsi-live-tune-{0}.jsonl" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
@@ -56,6 +62,14 @@ function Get-Percentile([double[]]$Values, [double]$Percentile) {
     $index = [math]::Ceiling(($Percentile / 100.0) * $sorted.Count) - 1
     $index = [math]::Max(0, [math]::Min($sorted.Count - 1, $index))
     return [double]$sorted[$index]
+}
+
+function Convert-ToUtcDateTime($Value) {
+    return [datetimeoffset]::Parse(
+        [string]$Value,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind
+    ).UtcDateTime
 }
 
 function Invoke-Kubectl([string[]]$Arguments, [switch]$AllowFailure) {
@@ -95,12 +109,21 @@ function Test-Prerequisites {
         Invoke-Kubectl @('-n', $Namespace, 'get', 'deployment', $app, '-o', 'name') | Out-Null
         Invoke-Kubectl @('-n', $Namespace, 'get', 'hpa', $app, '-o', 'name') | Out-Null
     }
+    foreach ($pool in $NodePoolApps.Keys) {
+        Invoke-Kubectl @('get', 'nodepool', $pool, '-o', 'name') | Out-Null
+    }
 }
 
 function Get-HpaScaleDownSeconds($Hpa) {
     $value = $Hpa.spec.behavior.scaleDown.stabilizationWindowSeconds
     if ($null -eq $value) { return 300 }
     return [int]$value
+}
+
+function Get-NodePoolConsolidateAfter($NodePool) {
+    $value = [string]$NodePool.spec.disruption.consolidateAfter
+    if ([string]::IsNullOrWhiteSpace($value)) { return '1m' }
+    return $value
 }
 
 function Get-HpaMaxTarget([int]$CurrentMax, [int]$UncappedDesired, [int]$SafetyCap) {
@@ -130,6 +153,21 @@ function Initialize-Baseline {
             Min = $baselineMin
             ScaleDownSeconds = $baselineScaleDown
             Max = [int]$hpa.spec.maxReplicas
+        }
+    }
+
+    $nodePools = Get-KubeJson @('get', 'nodepool', '-o', 'json')
+    foreach ($pool in $NodePoolApps.Keys) {
+        $nodePool = @($nodePools.items | Where-Object { $_.metadata.name -eq $pool } | Select-Object -First 1)
+        if (-not $nodePool) { throw "NodePool/$pool 을 찾지 못했습니다." }
+        $annotations = $nodePool.metadata.annotations
+        $savedLimit = if ($null -ne $annotations) { $annotations.'wsi2026.io/live-tune-baseline-limit-cpu' } else { $null }
+        $savedConsolidate = if ($null -ne $annotations) { $annotations.'wsi2026.io/live-tune-baseline-consolidate-after' } else { $null }
+        $baselineLimit = if ($null -ne $savedLimit -and [string]$savedLimit -match '^\d+$') { [int]$savedLimit } else { [int]$nodePool.spec.limits.cpu }
+        $baselineConsolidate = if (-not [string]::IsNullOrWhiteSpace([string]$savedConsolidate)) { [string]$savedConsolidate } else { Get-NodePoolConsolidateAfter $nodePool }
+        $script:NodePoolBaseline[$pool] = [pscustomobject]@{
+            LimitCpu = $baselineLimit
+            ConsolidateAfter = $baselineConsolidate
         }
     }
 }
@@ -170,6 +208,7 @@ function Get-LiveSnapshot {
         $podMetrics = [pscustomobject]@{ items = @() }
     }
     $nodes = Get-KubeJson @('get', 'nodes', '-o', 'json')
+    $nodePools = Get-KubeJson @('get', 'nodepool', '-o', 'json')
 
     $podApp = @{}
     $readyByApp = @{}
@@ -238,9 +277,25 @@ function Get-LiveSnapshot {
         $ready = @($node.status.conditions | Where-Object { $_.type -eq 'Ready' -and $_.status -eq 'True' }).Count -gt 0
         if ($ready) { $readyNodes++ } else { $notReadyNodes++ }
     }
+    $poolState = @{}
+    foreach ($pool in $NodePoolApps.Keys) {
+        $nodePool = @($nodePools.items | Where-Object { $_.metadata.name -eq $pool } | Select-Object -First 1)
+        if (-not $nodePool) { throw "NodePool/$pool 을 찾지 못했습니다." }
+        $usedCpu = if ($null -eq $nodePool.status.resources.cpu) { 0 } else { [int]$nodePool.status.resources.cpu }
+        $poolNodes = if ($null -eq $nodePool.status.resources.nodes) { 0 } else { [int]$nodePool.status.resources.nodes }
+        $cpuPerNode = if ($poolNodes -gt 0 -and $usedCpu -gt 0) { [int][math]::Ceiling($usedCpu / [double]$poolNodes) } else { $FallbackNodeCpu }
+        $poolState[$pool] = [pscustomobject]@{
+            LimitCpu = [int]$nodePool.spec.limits.cpu
+            UsedCpu = $usedCpu
+            Nodes = $poolNodes
+            CpuPerNode = $cpuPerNode
+            ConsolidateAfter = Get-NodePoolConsolidateAfter $nodePool
+        }
+    }
     return [pscustomobject]@{
         TimestampUtc = $now.ToString('o')
         Apps = $apps
+        NodePools = $poolState
         ReadyNodes = $readyNodes
         NotReadyNodes = $notReadyNodes
     }
@@ -249,13 +304,13 @@ function Get-LiveSnapshot {
 function Add-Snapshot($Snapshot) {
     $script:History += $Snapshot
     $cutoff = [datetime]::UtcNow.AddSeconds(-[math]::Max($IdleRestoreSeconds + $IntervalSeconds, $DecisionWindowSeconds * 3))
-    $script:History = @($script:History | Where-Object { [datetime]$_.TimestampUtc -ge $cutoff })
+    $script:History = @($script:History | Where-Object { (Convert-ToUtcDateTime $_.TimestampUtc) -ge $cutoff })
     $Snapshot | ConvertTo-Json -Compress -Depth 10 | Add-Content -LiteralPath $script:LogPath -Encoding UTF8
 }
 
 function Get-Window([int]$Seconds) {
     $cutoff = [datetime]::UtcNow.AddSeconds(-$Seconds)
-    return @($script:History | Where-Object { [datetime]$_.TimestampUtc -ge $cutoff })
+    return @($script:History | Where-Object { (Convert-ToUtcDateTime $_.TimestampUtc) -ge $cutoff })
 }
 
 function Get-Recommendation([string]$App) {
@@ -285,7 +340,7 @@ function Get-Recommendation([string]$App) {
 
     $idle = $false
     if ($idleWindow.Count -gt 0) {
-        $oldest = [datetime]$idleWindow[0].TimestampUtc
+        $oldest = Convert-ToUtcDateTime $idleWindow[0].TimestampUtc
         $coversIdleWindow = ([datetime]::UtcNow - $oldest).TotalSeconds -ge ($IdleRestoreSeconds - $IntervalSeconds * 2)
         $idleMetrics = @($idleWindow | ForEach-Object { $_.Apps[$App] })
         $idleCpuMax = [double](($idleMetrics.CpuTotalM | Measure-Object -Maximum).Maximum)
@@ -331,6 +386,114 @@ function Get-Recommendation([string]$App) {
         MaxUtil = $maxUtil
         CeilingSamples = [int]$ceilingMetrics.Count
         UncappedDesired = [int]$uncappedDesired
+    }
+}
+
+function Get-NodePoolRecommendation([string]$Pool) {
+    $window = @(Get-Window $DecisionWindowSeconds)
+    $idleWindow = @(Get-Window $IdleRestoreSeconds)
+    if ($window.Count -eq 0) { return $null }
+    $latest = $window[-1].NodePools[$Pool]
+    $baseline = $script:NodePoolBaseline[$Pool]
+    $apps = @($NodePoolApps[$Pool])
+    $minimumPressureSamples = [math]::Max(2, [math]::Ceiling($window.Count / 2.0))
+    $pressureSamples = @($window | Where-Object {
+        if ($_.NotReadyNodes -gt 0) { return $false }
+        $poolState = $_.NodePools[$Pool]
+        if ($poolState.UsedCpu -lt $poolState.LimitCpu) { return $false }
+        foreach ($app in $apps) {
+            $metric = $_.Apps[$app]
+            if ($metric.Pending -gt 0 -or $metric.Desired -gt $metric.Ready -or
+                ($metric.Desired -ge $metric.Max -and $metric.TargetUtil -gt 0 -and $metric.CurrentUtil -gt $metric.TargetUtil)) {
+                return $true
+            }
+        }
+        return $false
+    })
+
+    $idle = $false
+    if ($idleWindow.Count -gt 0) {
+        $oldest = Convert-ToUtcDateTime $idleWindow[0].TimestampUtc
+        $coversIdleWindow = ([datetime]::UtcNow - $oldest).TotalSeconds -ge ($IdleRestoreSeconds - $IntervalSeconds * 2)
+        $busyIdleSamples = @($idleWindow | Where-Object {
+            if ($_.NotReadyNodes -gt 0) { return $true }
+            foreach ($app in $apps) {
+                $metric = $_.Apps[$app]
+                if ($metric.Requests -gt 0 -or $metric.CpuTotalM -ge $ActivityCpuM[$app] -or
+                    $metric.Desired -gt $metric.Min -or $metric.Pending -gt 0) { return $true }
+            }
+            return $false
+        })
+        $idle = $coversIdleWindow -and $busyIdleSamples.Count -eq 0
+    }
+
+    $targetLimit = [int]$latest.LimitCpu
+    $targetConsolidate = [string]$latest.ConsolidateAfter
+    $reason = 'HOLD'
+    if ($window.Count -lt 2) {
+        $reason = 'WARMUP'
+    } elseif ($pressureSamples.Count -ge $minimumPressureSamples) {
+        $cpuPerNode = [int][math]::Max(1, $latest.CpuPerNode)
+        $safetyCapCpu = [int]$NodePoolSafetyCapNodes[$Pool] * $cpuPerNode
+        $targetLimit = [int][math]::Min($safetyCapCpu, $latest.LimitCpu + $cpuPerNode)
+        $targetConsolidate = $ActiveConsolidateAfter
+        $reason = if ($targetLimit -gt $latest.LimitCpu) { 'NODEPOOL_PRESSURE' } else { 'NODEPOOL_AT_CAP' }
+    } elseif ($idle) {
+        $targetConsolidate = [string]$baseline.ConsolidateAfter
+        if ($latest.UsedCpu -le $baseline.LimitCpu) { $targetLimit = [int]$baseline.LimitCpu }
+        $reason = 'IDLE_RESTORE'
+    }
+
+    return [pscustomobject]@{
+        Pool = $Pool
+        Reason = $reason
+        CurrentLimitCpu = [int]$latest.LimitCpu
+        TargetLimitCpu = [int]$targetLimit
+        UsedCpu = [int]$latest.UsedCpu
+        Nodes = [int]$latest.Nodes
+        CurrentConsolidateAfter = [string]$latest.ConsolidateAfter
+        TargetConsolidateAfter = [string]$targetConsolidate
+        PressureSamples = [int]$pressureSamples.Count
+    }
+}
+
+function Set-SafeNodePoolState($Recommendation) {
+    if ($Recommendation.CurrentLimitCpu -eq $Recommendation.TargetLimitCpu -and
+        $Recommendation.CurrentConsolidateAfter -eq $Recommendation.TargetConsolidateAfter) { return $false }
+    if (([datetime]::UtcNow - $script:LastMutationUtc).TotalSeconds -lt $DecisionWindowSeconds) { return $false }
+    $pool = [string]$Recommendation.Pool
+    $baseline = $script:NodePoolBaseline[$pool]
+    $description = "NodePool/$pool cpu $($Recommendation.CurrentLimitCpu)->$($Recommendation.TargetLimitCpu), consolidate $($Recommendation.CurrentConsolidateAfter)->$($Recommendation.TargetConsolidateAfter) ($($Recommendation.Reason))"
+    if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("NodePool/$pool", $description)) {
+        Write-Host "[권고] $description" -ForegroundColor Yellow
+        return $false
+    }
+    $patch = [ordered]@{
+        metadata = [ordered]@{ annotations = [ordered]@{
+            'wsi2026.io/live-tune-baseline-limit-cpu' = [string]$baseline.LimitCpu
+            'wsi2026.io/live-tune-baseline-consolidate-after' = [string]$baseline.ConsolidateAfter
+        } }
+        spec = [ordered]@{
+            limits = [ordered]@{ cpu = [string]$Recommendation.TargetLimitCpu }
+            disruption = [ordered]@{ consolidateAfter = [string]$Recommendation.TargetConsolidateAfter }
+        }
+    } | ConvertTo-Json -Compress -Depth 10
+    Write-Host "[적용/비용주의] $description" -ForegroundColor Magenta
+    try {
+        Invoke-Kubectl @('patch', 'nodepool', $pool, '--type=merge', '-p', $patch) | Out-Null
+        $verify = Get-KubeJson @('get', 'nodepool', $pool, '-o', 'json')
+        $verifiedLimit = [int]$verify.spec.limits.cpu
+        $verifiedConsolidate = Get-NodePoolConsolidateAfter $verify
+        if ($verifiedLimit -ne $Recommendation.TargetLimitCpu -or $verifiedConsolidate -ne $Recommendation.TargetConsolidateAfter) {
+            throw "검증 불일치: cpu=$verifiedLimit consolidateAfter=$verifiedConsolidate"
+        }
+        $script:LastMutationUtc = [datetime]::UtcNow
+        return $true
+    } catch {
+        Write-Warning "적용 실패, NodePool/$pool 직전값 복구: $($_.Exception.Message)"
+        $rollback = @{ spec = @{ limits = @{ cpu = [string]$Recommendation.CurrentLimitCpu }; disruption = @{ consolidateAfter = [string]$Recommendation.CurrentConsolidateAfter } } } | ConvertTo-Json -Compress -Depth 8
+        Invoke-Kubectl @('patch', 'nodepool', $pool, '--type=merge', '-p', $rollback) -AllowFailure | Out-Null
+        return $false
     }
 }
 
@@ -385,8 +548,8 @@ function Set-SafeHpaState($Recommendation) {
     }
 }
 
-function Show-Snapshot($Snapshot, $Recommendations) {
-    $kst = ([datetime]$Snapshot.TimestampUtc).ToLocalTime().ToString('HH:mm:ss')
+function Show-Snapshot($Snapshot, $Recommendations, $NodePoolRecommendations) {
+    $kst = (Convert-ToUtcDateTime $Snapshot.TimestampUtc).ToLocalTime().ToString('HH:mm:ss')
     Write-Host "`n[$kst KST] ReadyNode=$($Snapshot.ReadyNodes) NotReadyNode=$($Snapshot.NotReadyNodes)" -ForegroundColor Green
     $rows = foreach ($app in $ManagedApps) {
         $m = $Snapshot.Apps[$app]
@@ -406,6 +569,18 @@ function Show-Snapshot($Snapshot, $Recommendations) {
         }
     }
     $rows | Format-Table -AutoSize | Out-Host
+    $poolRows = foreach ($pool in @('default', 'stress')) {
+        $m = $Snapshot.NodePools[$pool]
+        $r = $NodePoolRecommendations[$pool]
+        [pscustomobject]@{
+            NodePool = $pool
+            Nodes = $m.Nodes
+            Cpu = "$($m.UsedCpu)/$($m.LimitCpu)->$($r.TargetLimitCpu)"
+            Consolidate = "$($m.ConsolidateAfter)->$($r.TargetConsolidateAfter)"
+            Decision = $r.Reason
+        }
+    }
+    $poolRows | Format-Table -AutoSize | Out-Host
 }
 
 function Invoke-SelfTest {
@@ -446,10 +621,34 @@ function Invoke-SelfTest {
     $blockedRecommendation = Get-Recommendation 'user'
     if ($blockedRecommendation.TargetMax -ne 20) { $failures.Add('Pending 중 HPA max 확장 차단') }
     if ((Get-HpaMaxTarget 38 100 40) -ne 40) { $failures.Add('HPA max safety cap') }
+    $ceiling.Pending = 2
+    $script:NodePoolBaseline['default'] = [pscustomobject]@{ LimitCpu = 2; ConsolidateAfter = '1m' }
+    $poolAtLimit = [pscustomobject]@{ LimitCpu = 2; UsedCpu = 2; Nodes = 1; CpuPerNode = 2; ConsolidateAfter = '1m' }
+    $script:History = @(
+        [pscustomobject]@{ TimestampUtc = $now.AddSeconds(-5).ToString('o'); Apps = @{ user = $ceiling; product = $ceiling }; NodePools = @{ default = $poolAtLimit }; NotReadyNodes = 0 },
+        [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $ceiling; product = $ceiling }; NodePools = @{ default = $poolAtLimit }; NotReadyNodes = 0 }
+    )
+    $poolRecommendation = Get-NodePoolRecommendation 'default'
+    if ($poolRecommendation.TargetLimitCpu -ne 4 -or $poolRecommendation.TargetConsolidateAfter -ne '5m') { $failures.Add('NodePool 한 노드 bounded 확장') }
+    $script:History[0].NotReadyNodes = 1
+    $script:History[1].NotReadyNodes = 1
+    if ((Get-NodePoolRecommendation 'default').TargetLimitCpu -ne 2) { $failures.Add('NotReady 중 NodePool 중복 확장 차단') }
+    $idleMetric = $ceiling.PSObject.Copy()
+    $idleMetric.Pending = 0; $idleMetric.Requests = 0; $idleMetric.CpuTotalM = 0; $idleMetric.Current = 2; $idleMetric.Desired = 2; $idleMetric.Min = 2
+    $expandedPool = [pscustomobject]@{ LimitCpu = 8; UsedCpu = 2; Nodes = 1; CpuPerNode = 2; ConsolidateAfter = '5m' }
+    $script:History = @(
+        [pscustomobject]@{ TimestampUtc = $now.AddSeconds(-($IdleRestoreSeconds - $IntervalSeconds)).ToString('o'); Apps = @{ user = $idleMetric; product = $idleMetric }; NodePools = @{ default = $expandedPool }; NotReadyNodes = 0 },
+        [pscustomobject]@{ TimestampUtc = $now.AddSeconds(-5).ToString('o'); Apps = @{ user = $idleMetric; product = $idleMetric }; NodePools = @{ default = $expandedPool }; NotReadyNodes = 0 },
+        [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $idleMetric; product = $idleMetric }; NodePools = @{ default = $expandedPool }; NotReadyNodes = 0 }
+    )
+    $restoreRecommendation = Get-NodePoolRecommendation 'default'
+    if ($restoreRecommendation.TargetLimitCpu -ne 2 -or $restoreRecommendation.TargetConsolidateAfter -ne '1m') { $failures.Add("유휴 NodePool 기준값 복구(actual=$($restoreRecommendation.TargetLimitCpu)/$($restoreRecommendation.TargetConsolidateAfter), reason=$($restoreRecommendation.Reason))") }
+    if ($NodePoolSafetyCapNodes.default -ne 4 -or $NodePoolSafetyCapNodes.stress -ne 4) { $failures.Add('NodePool node safety cap') }
     $script:History = @()
     $script:Baseline = @{}
+    $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 9/9' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 13/13' -ForegroundColor Green
 }
 
 if ($SelfTest) {
@@ -467,7 +666,7 @@ try {
     $mode = if ($ObserveOnly) { 'OBSERVE' } else { 'SAFE-AUTO' }
     if ($WhatIfPreference) { $mode = 'WHATIF' }
     Write-Host "WSC LIVE TUNER 시작: mode=$mode interval=${IntervalSeconds}s log=$script:LogPath" -ForegroundColor Green
-    Write-Host '추가 트래픽/Deployment rollout/NodePool/Terraform 변경 없음. HPA max는 포화 시 bounded 확장하며 자동 축소하지 않음. 종료: Ctrl+C' -ForegroundColor DarkGray
+    Write-Host '추가 트래픽/Deployment rollout/Terraform 변경 없음. HPA와 NodePool ceiling을 bounded 조정하며 NodePool 확장은 EC2 비용이 발생할 수 있음. 종료: Ctrl+C' -ForegroundColor DarkGray
 
     do {
         try {
@@ -475,10 +674,18 @@ try {
             Add-Snapshot $snapshot
             $recommendations = @{}
             foreach ($app in $ManagedApps) { $recommendations[$app] = Get-Recommendation $app }
-            Show-Snapshot $snapshot $recommendations
+            $nodePoolRecommendations = @{}
+            foreach ($pool in $NodePoolApps.Keys) { $nodePoolRecommendations[$pool] = Get-NodePoolRecommendation $pool }
+            Show-Snapshot $snapshot $recommendations $nodePoolRecommendations
 
-            foreach ($app in $MutationOrder) {
-                if (Set-SafeHpaState $recommendations[$app]) { break }
+            $nodePoolChanged = $false
+            foreach ($pool in @('default', 'stress')) {
+                if (Set-SafeNodePoolState $nodePoolRecommendations[$pool]) { $nodePoolChanged = $true; break }
+            }
+            if (-not $nodePoolChanged) {
+                foreach ($app in $MutationOrder) {
+                    if (Set-SafeHpaState $recommendations[$app]) { break }
+                }
             }
         } catch {
             Write-Warning "관측 주기 실패(다음 주기에 재시도): $($_.Exception.Message)"
