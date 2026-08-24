@@ -244,6 +244,20 @@ Assert-Test '18d terminal CNI evidence still skips FINAL' {
     if(-not$source.Contains('if ($skipFinalReason)')-or-not$source.Contains('FINAL_SKIPPED: $skipFinalReason')){throw 'terminal invalid measurement can still run FINAL'}
 }
 
+Assert-Test '18e resource rollout drains stale replicas before patch' {
+    $start=$source.IndexOf('function Set-ConfigExact')
+    $end=$source.IndexOf('function Test-CandidateBetter',$start)
+    $block=$source.Substring($start,$end-$start)
+    $hpa=$block.IndexOf('Patch-AppHpa')
+    $drain=$block.IndexOf('Reset-AppToMinForResourceRollout')
+    $resource=$block.IndexOf('Patch-AppResources')
+    if($hpa-lt0-or$drain-lt$hpa-or$resource-lt$drain){throw 'unsafe HPA/drain/resource order'}
+    if($source-notmatch 'wsi-measured-tune-\$PID-\$\(\[datetime\]::UtcNow'){throw 'run output directory is reused'}
+    if(-not$source.Contains("if(`$Name -ne 'BASE'){Prepare-FreshMeasurement `$Config `$Name}")){throw 'candidate/final fresh-start prep missing'}
+    if(-not$source.Contains("Prepare-FreshMeasurement `$bestConfig 'SHUTDOWN'")){throw 'normal shutdown replica cleanup missing'}
+    if(-not$source.Contains("'delete','pod','-l','app=stress'")){throw 'stress CPU backlog replacement missing'}
+}
+
 Assert-Test '19 production contains no PDB mutation' {
     if($source-match "patch[^\r\n]*pdb|Repair-InvalidPdb|Set-CooldownPdb|PROFILE_COOLDOWN_PDB"){throw 'PDB mutation found'}
 }
@@ -258,7 +272,7 @@ Assert-Test '21 no shared-domain packing optimizer' {
 
 Assert-Test '22 worst-case runtime <= 20 minutes' {
     $seconds=Get-WorstCaseRuntimeSeconds
-    if($seconds-ne975-or$seconds-gt1200){throw "worst-case=$seconds expected=975"}
+    if($seconds-ne1185-or$seconds-gt1200){throw "worst-case=$seconds expected=1185"}
 }
 
 Write-Host "`nSelf-tests: $pass/$($pass+$fail) passed" -ForegroundColor $(if($fail-eq0){'Green'}else{'Red'})

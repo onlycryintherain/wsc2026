@@ -16,7 +16,7 @@ param(
     [ValidateRange(5, 10)][int]$SampleIntervalSec = 7,
     [ValidateRange(0.0, 2.0)][double]$NoiseTolerance = 0.5,
     [ValidateRange(95.0, 100.0)][double]$PerformancePassPercent = 99.0,
-    [string]$OutputDir = (Join-Path ([IO.Path]::GetTempPath()) "wsi-measured-tune-$PID"),
+    [string]$OutputDir = (Join-Path ([IO.Path]::GetTempPath()) "wsi-measured-tune-$PID-$([datetime]::UtcNow.ToString('yyyyMMddHHmmss'))"),
     [switch]$NoApply,
     [switch]$DiscardResults,
     [switch]$SelfTestOnly
@@ -29,12 +29,14 @@ $script:HardDeadline = $script:StartTime.AddMinutes(20)
 $script:Apps = @('user', 'product', 'stress')
 $script:SloMs = @{user=200.0; product=200.0; stress=1000.0}
 $script:ProfileNames = @('Ramp')
-$script:ApplyBudgetSec = 45
-$script:RollbackBudgetSec = 45
+$script:ApplyBudgetSec = 120
+$script:RollbackBudgetSec = 120
 $script:EvidenceSaveBudgetSec = 15
-# Single k6-compatible ramp; reserve one bounded Kubernetes sample overrun.
-$script:FinalMeasurementBudgetSec = $ProfileDurationSec + 10
-$script:CandidateMeasurementBudgetSec = $ProfileDurationSec + 10
+# Single k6-compatible ramp; reserve one sample overrun and 30 seconds to
+# reset non-BASE measurements to the same HPA-min starting point.
+$script:BaseMeasurementBudgetSec = $ProfileDurationSec + 10
+$script:FinalMeasurementBudgetSec = $ProfileDurationSec + 40
+$script:CandidateMeasurementBudgetSec = $ProfileDurationSec + 40
 $script:LocalRun = $null
 $script:PythonExe = $null
 $script:PythonArgs = @()
@@ -51,8 +53,7 @@ function Get-DeadlineTimeout([int]$RequestedSec, [int]$ReserveSec = 10) {
 }
 
 function Test-CanStartBase {
-    $required = $script:CandidateMeasurementBudgetSec + $script:FinalMeasurementBudgetSec + $ShutdownReserveSeconds
-    return (Get-RemainingSeconds) -ge $required
+    return (Get-RemainingSeconds) -ge (Get-WorstCaseRuntimeSeconds)
 }
 
 function Test-CanStartCandidate {
@@ -67,7 +68,7 @@ function Test-CanStartFinal {
 }
 
 function Get-WorstCaseRuntimeSeconds {
-    $base = $script:CandidateMeasurementBudgetSec
+    $base = $script:BaseMeasurementBudgetSec
     $candidate = $script:ApplyBudgetSec + $script:CandidateMeasurementBudgetSec + $script:RollbackBudgetSec
     return $base + ($MaxProfileCandidates * $candidate) + $script:FinalMeasurementBudgetSec +
         $ShutdownReserveSeconds + $script:EvidenceSaveBudgetSec
@@ -588,7 +589,24 @@ function Get-Objective($Runs, $Config, [string]$Name) {
     }
 }
 
+function Restart-StressAtMin([int]$MinReplicas,[string]$Reason) {
+    Write-Host "  stress backlog reset: replace Pods at min=$MinReplicas ($Reason)" -ForegroundColor DarkCyan
+    Invoke-Kubectl @('-n',$Namespace,'scale','deployment/stress',"--replicas=$MinReplicas") | Out-Null
+    Invoke-Kubectl @('-n',$Namespace,'delete','pod','-l','app=stress','--wait=false') | Out-Null
+    Start-Sleep -Seconds 2
+}
+
+function Prepare-FreshMeasurement($Config,[string]$Reason) {
+    Write-Host "  fresh-start prep: scale apps to measured HPA min ($Reason)" -ForegroundColor DarkCyan
+    foreach($app in $script:Apps){
+        Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$app","--replicas=$([int]$Config[$app].minReplicas)") | Out-Null
+    }
+    Restart-StressAtMin ([int]$Config.stress.minReplicas) $Reason
+    foreach($app in $script:Apps){Wait-MinReady $app ([int]$Config[$app].minReplicas) 20}
+}
+
 function Invoke-Measurement($Config, [string]$Name) {
+    if($Name -ne 'BASE'){Prepare-FreshMeasurement $Config $Name}
     $script:MeasurementConfig = $Config
     $runs = [System.Collections.Generic.List[object]]::new()
     foreach ($profile in $script:ProfileNames) {
@@ -843,7 +861,7 @@ function Patch-AppHpa([string]$App, $Value) {
     Invoke-Kubectl @('-n',$Namespace,'patch','hpa',$App,'--type=merge','-p',$patch) | Out-Null
 }
 
-function Wait-Deployment([string]$App, [int]$TimeoutSec = 45) {
+function Wait-Deployment([string]$App, [int]$TimeoutSec = 120) {
     $timeout = Get-DeadlineTimeout $TimeoutSec 10
     $output = @(& kubectl --request-timeout=5s -n $Namespace rollout status "deployment/$App" "--timeout=${timeout}s" 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "ROLLOUT_TIMEOUT: $App $($output -join ' ')" }
@@ -859,6 +877,12 @@ function Wait-MinReady([string]$App, [int]$Minimum, [int]$TimeoutSec = 30) {
     throw "MIN_READY_TIMEOUT: $App expected=$Minimum"
 }
 
+function Reset-AppToMinForResourceRollout([string]$App,[int]$MinReplicas) {
+    Write-Host "  rollout prep: $App replicas → $MinReplicas" -ForegroundColor DarkCyan
+    Invoke-Kubectl @('-n',$Namespace,'scale',"deployment/$App","--replicas=$MinReplicas") | Out-Null
+    if($App -eq 'stress'){Restart-StressAtMin $MinReplicas 'RESOURCE_ROLLOUT'}
+}
+
 function Set-ConfigExact($Expected, [string]$Mode) {
     $current = Get-LiveConfig "${Mode}_BEFORE"
     $diff = @(Get-ConfigDiff $Expected $current)
@@ -868,11 +892,17 @@ function Set-ConfigExact($Expected, [string]$Mode) {
     $hpaFields = @('minReplicas','maxReplicas','hpaTarget','behaviorJson')
     $resourceApps = @($diff | Where-Object { $_.Field -in $resourceFields } | ForEach-Object App | Sort-Object -Unique)
     $hpaApps = @($diff | Where-Object { $_.Field -in $hpaFields } | ForEach-Object App | Sort-Object -Unique)
-    foreach ($app in $resourceApps) { Patch-AppResources $app $Expected[$app] }
+
+    # Apply the target HPA first, then remove stale high-load replicas before a
+    # resource rollout. This prevents maxSurge=1/maxUnavailable=0 deadlock when
+    # the old request only fits fewer Pods than the current HPA replica count.
     foreach ($app in $hpaApps) { Patch-AppHpa $app $Expected[$app] }
-    foreach ($app in $resourceApps) { Wait-Deployment $app }
-    foreach ($app in $hpaApps) {
-        if ([int]$Expected[$app].minReplicas -gt [int]$current[$app].minReplicas) { Wait-MinReady $app ([int]$Expected[$app].minReplicas) }
+    foreach ($app in $resourceApps) { Reset-AppToMinForResourceRollout $app ([int]$Expected[$app].minReplicas) }
+    foreach ($app in $resourceApps) { Patch-AppResources $app $Expected[$app] }
+    $rolloutBudget=if($Mode -eq 'ROLLBACK'){$script:RollbackBudgetSec}else{$script:ApplyBudgetSec}
+    foreach ($app in $resourceApps) { Wait-Deployment $app $rolloutBudget }
+    foreach ($app in @($hpaApps+$resourceApps | Sort-Object -Unique)) {
+        Wait-MinReady $app ([int]$Expected[$app].minReplicas) 30
     }
     $errorCode = if ($Mode -eq 'ROLLBACK') { 'ROLLBACK_DRIFT' } else { 'CONFIG_DRIFT' }
     Assert-LiveConfig $Expected $errorCode | Out-Null
@@ -937,6 +967,7 @@ function Invoke-TuningLifecycle($BaseConfig) {
     $skipFinalReason = $null
 
     if ($NoApply) {
+        Prepare-FreshMeasurement $bestConfig 'NO_APPLY_SHUTDOWN'
         $lifecycle = [pscustomobject]@{StartedAt=$script:StartTime;HardDeadline=$script:HardDeadline;StopReason='NO_APPLY_BASE_ONLY';Best=$best;BestConfig=$bestConfig;Final=$null;History=@($history)}
         Save-Lifecycle $lifecycle
         return $lifecycle
@@ -1012,6 +1043,7 @@ function Invoke-TuningLifecycle($BaseConfig) {
             $stopReason = if ($stopReason -eq 'NO_SAFE_MEASURED_DELTA') { 'NO_TIME_FOR_FINAL_FRESH' } else { $stopReason }
         }
     }
+    Prepare-FreshMeasurement $bestConfig 'SHUTDOWN'
     $lifecycle = [pscustomobject]@{
         StartedAt=$script:StartTime
         HardDeadline=$script:HardDeadline
@@ -1068,7 +1100,10 @@ try {
     $errorRecord = $_
     Write-Error "TUNE_FAILED: $($errorRecord.Exception.Message)"
     if ($originalConfig) {
-        try { Set-ConfigExact $originalConfig 'ROLLBACK' } catch { Write-Error "ORIGINAL_ROLLBACK_FAILED: $($_.Exception.Message)" }
+        try {
+            Set-ConfigExact $originalConfig 'ROLLBACK'
+            Prepare-FreshMeasurement $originalConfig 'ERROR_SHUTDOWN'
+        } catch { Write-Error "ORIGINAL_ROLLBACK_FAILED: $($_.Exception.Message)" }
     }
     throw
 } finally {

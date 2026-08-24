@@ -24,7 +24,7 @@ immutable live snapshot
 → lifecycle.json
 ```
 
-BASE 전에 Deployment replica/resources, HPA, behavior, topology, PDB, NodePool, Karpenter를 변경하지 않습니다. Production candidate가 변경할 수 있는 축은 다음뿐입니다.
+BASE 전에 Deployment replica/resources, HPA, behavior, topology, PDB, NodePool, Karpenter를 변경하지 않습니다. Resource candidate/rollback 시에는 stale high-load Pod와 불가능한 rolling surge를 제거하기 위해 대상 Deployment를 HPA min으로 축소한 뒤 resource template을 적용합니다. Candidate/FINAL 직전에는 세 앱을 measured HPA min으로 맞춰 같은 시작점에서 측정하고, 정상·오류 종료 때도 min으로 정리합니다. 이 replica 축소는 candidate 비교 축이 아니며 HPA spec은 measured config 그대로 유지됩니다. Production candidate가 변경할 수 있는 축은 다음뿐입니다.
 
 - `HPA_MAX`
 - `HPA_TARGET`
@@ -112,14 +112,14 @@ $script:HardDeadline = $script:StartTime.AddMinutes(20)
 
 ```text
 BASE measurement:       240s + sample overrun 10s = 250s
-candidate apply:         45s
-candidate measurement:  250s
-possible rollback:       45s
-FINAL measurement:      250s
+candidate apply:         120s
+candidate measurement:  280s (fresh-start prep 30s 포함)
+possible rollback:       120s
+FINAL measurement:      280s (fresh-start prep 30s 포함)
 candidate:               최대 1개
 shutdown reserve:        120s
 save reserve:            15s
-worst-case planned:      975s (16m15s)
+worst-case planned:      1185s (19m45s)
 ```
 
 Candidate 시작 전 다음을 비교합니다.
