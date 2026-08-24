@@ -252,6 +252,7 @@ Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/stop" `
 
 ## 최근 작업 로그
 
+| 2026-08-25 | pending | 저장소를 Day3 전용으로 정리 — `destroy-plan.txt` Terraform 산출물 제거, feature/day3-tuning을 main에 통합하고 Day1 기능 브랜치 제거 |
 | 2026-08-25 | pending | `feature/day3-tuning` 실운영 정리 — 무인 `observe-live.ps1` 추가(검증된 scale-down 300초), `get-test-data.ps1` 로직을 `check.ps1`에 내장, DB/S3 삭제 도구·중복 Stress 평가 도구·커밋된 테스트 결과 3개 제거. observe self-test 6/6, tune self-test 26/26, Python 5/5 및 live JSONL 갱신 확인 |
 | 2026-08-25 | pending | 다음 240초 BASE에서 최종 Pending 4개는 모두 NodePool CPU `Unschedulable`인데, profile 중 이미 사라진 stress Pod의 일시적 `FailedCreatePodSandBox: failed to setup network policy` 이벤트 때문에 `CNI_UNRESOLVED`로 오판한 문제 수정. CNI/PDB/NodePool 이벤트는 최신 sample의 동일 Pending Pod 이름과 일치할 때만 unresolved/current evidence로 인정하고, 복구된 과거 CNI Event는 JSON evidence에만 보존. 종료 cleanup 후 user2/product2/stress1·HPA min 건강 확인. self-test26/26·localhost5/5 통과. |
 | 2026-08-25 | pending | 첫 240초 Python ramp 뒤 stress HPA12 상태에서 600→540m resource candidate rollout이 45초 timeout되고, rollback 540→600m은 4노드에 600m Pod 12개가 물리적으로 fit하지 않아 재차 timeout한 문제 수정. live는 HPA 55%/1..12·template600m으로 확인 후 stress scale1 및 candidate RS0으로 복구. Resource apply/rollback은 HPA 적용→min 축소→stress Pod 교체로 timeout 뒤에도 계속되는 CPU backlog 제거→resource patch→120초 rollout 순서로 변경. candidate/FINAL 전 fresh min reset, 정상/오류 종료 cleanup, PID+timestamp 결과 디렉터리를 추가하고 worst-case1185초 유지. self-test26/26·localhost5/5 통과. |
