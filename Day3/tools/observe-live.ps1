@@ -38,15 +38,16 @@ $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
 # 0.5x 60분 39/40(run-1787385221)의 control point를 보존한다. 현재 바이너리의
-# keep-alive 연결 편중을 막기 위해 stress 4개를 부하 전에 한 노드에 prewarm한다.
-$BaselineFloor = @{ user = 2; product = 2; stress = 4 }
-$WarmFloor = @{ user = 4; product = 2; stress = 4 }
-$PressureFloor = @{ user = 6; product = 4; stress = 6 }
-$MaxSafetyCap = @{ user = 20; product = 20; stress = 12 }
-$HpaTargetUtilization = @{ user = 33; product = 29; stress = 83 }
+# keep-alive 연결 편중을 막기 위해 stress 2개를 부하 전에 한 노드에 prewarm한다.
+# 600m은 t3.medium allocatable 1930m에서 daemon overhead를 포함해 노드당 정확히 2 Pod만 허용한다.
+$BaselineFloor = @{ user = 2; product = 2; stress = 2 }
+$WarmFloor = @{ user = 4; product = 2; stress = 2 }
+$PressureFloor = @{ user = 6; product = 4; stress = 4 }
+$MaxSafetyCap = @{ user = 20; product = 20; stress = 8 }
+$HpaTargetUtilization = @{ user = 33; product = 29; stress = 55 }
 $UserCpuRequest = '70m'
 $ProductCpuRequest = '70m'
-$StressCpuRequest = '400m'
+$StressCpuRequest = '600m'
 $StressNodePool = 'stress'
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
 $NodePoolSafetyCapNodes = @{ default = 1; stress = 4 }
@@ -263,7 +264,7 @@ function Initialize-PerformanceProfile {
     $stressContainer = [string]$stressDeployment.spec.template.spec.containers[0].name
     $currentStressRequest = [string]$stressDeployment.spec.template.spec.containers[0].resources.requests.cpu
     if ($currentStressRequest -ne $StressCpuRequest) {
-        $description = "Deployment/stress CPU request $currentStressRequest->$StressCpuRequest (4 Pod/Node, control point 332m 보존)"
+        $description = "Deployment/stress CPU request $currentStressRequest->$StressCpuRequest (2 Pod/Node, control point 330m 보존)"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
@@ -854,14 +855,14 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($BaselineFloor.user -ne 2 -or $BaselineFloor.product -ne 2 -or $BaselineFloor.stress -ne 4) { $failures.Add('2-node baseline floor') }
-    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('앱별 traffic warm floor') }
-    if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 6) { $failures.Add('앱별 pressure floor') }
+    if ($BaselineFloor.user -ne 2 -or $BaselineFloor.product -ne 2 -or $BaselineFloor.stress -ne 2) { $failures.Add('2-node baseline floor') }
+    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 2) { $failures.Add('앱별 traffic warm floor') }
+    if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 4) { $failures.Add('앱별 pressure floor') }
     if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
     if ([math]::Abs((70 * 0.33) - 23.1) -gt 0.1) { $failures.Add('user control point') }
-    if ($StressCpuRequest -ne '400m' -or $HpaTargetUtilization.stress -ne 83) { $failures.Add('stress packed prewarm profile') }
+    if ($StressCpuRequest -ne '600m' -or $HpaTargetUtilization.stress -ne 55 -or $MaxSafetyCap.stress -ne 8) { $failures.Add('stress two-pods-per-node profile') }
     if ($StressNodePool -ne 'stress') { $failures.Add('stress packed affinity pool') }
-    if ([math]::Abs((400 * 0.83) - (600 * 0.55)) -gt 2.1) { $failures.Add('stress control point 보존') }
+    if ([math]::Abs((600 * 0.55) - 330) -gt 1.0) { $failures.Add('stress control point 보존') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -875,7 +876,7 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ stress = $pressure } }
     )
     $recommendation = Get-Recommendation 'stress'
-    if ($recommendation.TargetMin -ne 6) { $failures.Add('stress pressure min 추천') }
+    if ($recommendation.TargetMin -ne 4) { $failures.Add('stress pressure min 추천') }
     if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
