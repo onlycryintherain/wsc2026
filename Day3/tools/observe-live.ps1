@@ -40,11 +40,12 @@ $MutationOrder = @('stress', 'user', 'product')
 # 만점권이라 작게 유지하고, 200ms user와 CPU-heavy stress에 시작 용량을 집중한다.
 $WarmFloor = @{ user = 12; product = 2; stress = 4 }
 $MaxSafetyCap = @{ user = 48; product = 20; stress = 8 }
-$HpaTargetUtilization = @{ user = 12; product = 29; stress = 55 }
+$HpaTargetUtilization = @{ user = 12; product = 29; stress = 33 }
 $UserCpuRequest = '200m'
+$StressCpuRequest = '1000m'
 $StressNodePool = 'stress'
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
-$NodePoolSafetyCapNodes = @{ default = 6; stress = 4 }
+$NodePoolSafetyCapNodes = @{ default = 6; stress = 8 }
 $FallbackNodeCpu = 2
 $ActiveConsolidateAfter = '10m'
 $ActivityCpuM = @{ user = 15.0; product = 15.0; stress = 250.0 }
@@ -232,6 +233,24 @@ function Initialize-PerformanceProfile {
         }
     }
 
+    $stressContainer = [string]$stressDeployment.spec.template.spec.containers[0].name
+    $currentStressRequest = [string]$stressDeployment.spec.template.spec.containers[0].resources.requests.cpu
+    if ($currentStressRequest -ne $StressCpuRequest) {
+        $description = "Deployment/stress CPU request $currentStressRequest->$StressCpuRequest (1 Pod/Node, control point 330m 보존)"
+        if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
+            Write-Host "[권고] $description" -ForegroundColor Yellow
+        } else {
+            $patch = @{
+                spec = @{ template = @{
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'stress-1000m-v3' } }
+                    spec = @{ containers = @(@{ name = $stressContainer; resources = @{ requests = @{ cpu = $StressCpuRequest } } }) }
+                } }
+            } | ConvertTo-Json -Compress -Depth 12
+            Write-Host "[적용/rollout/비용주의] $description" -ForegroundColor Magenta
+            Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=strategic', '-p', $patch) | Out-Null
+        }
+    }
+
     # stress를 shared로 두면 60분 run에서 default 4대 CPU를 모두 소모하면서
     # stress 28.46%, user 43.2%로 동반 하락했다. scoring session 동안은 placement
     # rollout을 반복하지 않고 전용 tainted NodePool에 고정한다.
@@ -289,6 +308,9 @@ function Initialize-PerformanceProfile {
         $verifyStress = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'stress', '-o', 'json')
         if ([string]$verifyUser.spec.template.spec.containers[0].resources.requests.cpu -ne $UserCpuRequest) {
             throw '시작 프로필 검증 실패: user CPU request'
+        }
+        if ([string]$verifyStress.spec.template.spec.containers[0].resources.requests.cpu -ne $StressCpuRequest) {
+            throw '시작 프로필 검증 실패: stress CPU request'
         }
         if ([string]$verifyStress.spec.template.spec.nodeSelector.'karpenter.sh/nodepool' -ne $StressNodePool) {
             throw '시작 프로필 검증 실패: stress nodeSelector'
@@ -719,6 +741,8 @@ function Invoke-SelfTest {
     if ($WarmFloor.user -ne 12 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('앱별 warm floor') }
     if ($UserCpuRequest -ne '200m' -or $HpaTargetUtilization.user -ne 12) { $failures.Add('user control point profile') }
     if ([math]::Abs((200 * 0.12) - (70 * 0.33)) -gt 1.0) { $failures.Add('user control point 보존') }
+    if ($StressCpuRequest -ne '1000m' -or $HpaTargetUtilization.stress -ne 33) { $failures.Add('stress one-pod-per-node profile') }
+    if ([math]::Abs((1000 * 0.33) - (600 * 0.55)) -gt 1.0) { $failures.Add('stress control point 보존') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -774,12 +798,12 @@ function Invoke-SelfTest {
     )
     $restoreRecommendation = Get-NodePoolRecommendation 'default'
     if ($restoreRecommendation.TargetLimitCpu -ne 2 -or $restoreRecommendation.TargetConsolidateAfter -ne '1m') { $failures.Add("유휴 NodePool 기준값 복구(actual=$($restoreRecommendation.TargetLimitCpu)/$($restoreRecommendation.TargetConsolidateAfter), reason=$($restoreRecommendation.Reason))") }
-    if ($NodePoolSafetyCapNodes.default -ne 6 -or $NodePoolSafetyCapNodes.stress -ne 4) { $failures.Add('NodePool node safety cap') }
+    if ($NodePoolSafetyCapNodes.default -ne 6 -or $NodePoolSafetyCapNodes.stress -ne 8) { $failures.Add('NodePool node safety cap') }
     $script:History = @()
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 16/16' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 18/18' -ForegroundColor Green
 }
 
 if ($SelfTest) {
