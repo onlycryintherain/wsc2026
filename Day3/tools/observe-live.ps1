@@ -42,7 +42,7 @@ $MutationOrder = @('stress', 'user', 'product')
 # 600m은 t3.medium allocatable 1930m에서 daemon overhead를 포함해 노드당 정확히 2 Pod만 허용한다.
 $BaselineFloor = @{ user = 1; product = 1; stress = 1 }
 $LoadFloor = @{ user = 1; product = 1; stress = 1 }
-$WarmFloor = @{ user = 4; product = 2; stress = 4 }
+$WarmFloor = @{ user = 4; product = 2; stress = 1 }
 $PressureFloor = @{ user = 6; product = 4; stress = 6 }
 $MaxSafetyCap = @{ user = 20; product = 20; stress = 8 }
 $HpaTargetUtilization = @{ user = 33; product = 29; stress = 55 }
@@ -622,7 +622,10 @@ function Get-Recommendation([string]$App) {
     $baseline = $script:Baseline[$App]
     $maxCpu = [double](($metrics.CpuTotalM | Measure-Object -Maximum).Maximum)
     $maxDesired = [int](($metrics.Desired | Measure-Object -Maximum).Maximum)
+    $maxPending = [int](($metrics.Pending | Measure-Object -Maximum).Maximum)
     $maxUtil = [int](($metrics.CurrentUtil | Measure-Object -Maximum).Maximum)
+    $p95Values = @($metrics | Where-Object { $null -ne $_.P95Ms } | ForEach-Object { [double]$_.P95Ms })
+    $maxP95 = if ($p95Values.Count) { [double](($p95Values | Measure-Object -Maximum).Maximum) } else { 0.0 }
     $minimumCeilingSamples = [math]::Max(2, [math]::Ceiling($window.Count / 2.0))
     $ceilingMetrics = @($metrics | Where-Object {
         $_.Desired -ge $_.Max -and $_.Current -ge $_.Max -and $_.Ready -ge $_.Current -and
@@ -688,7 +691,9 @@ function Get-Recommendation([string]$App) {
         TargetScaleDown = [int]$targetScaleDown
         MaxCpuM = [math]::Round($maxCpu, 1)
         MaxDesired = $maxDesired
+        MaxPending = $maxPending
         MaxUtil = $maxUtil
+        MaxP95Ms = [math]::Round($maxP95, 1)
         CeilingSamples = [int]$ceilingMetrics.Count
         UncappedDesired = [int]$uncappedDesired
     }
@@ -696,6 +701,7 @@ function Get-Recommendation([string]$App) {
 
 function Get-StressPlacementTarget($Recommendation) {
     if ($null -eq $Recommendation) { return 'HOLD' }
+    if ([int]$Recommendation.MaxPending -gt 0 -or [double]$Recommendation.MaxP95Ms -ge 600.0) { return 'ISOLATED' }
     if ($Recommendation.Reason -in @('HOT_POD', 'HPA_PRESSURE', 'HPA_MAX_PRESSURE')) { return 'ISOLATED' }
     if ($Recommendation.Reason -eq 'IDLE_RESTORE') { return 'SHARED' }
     return 'HOLD'
@@ -939,7 +945,7 @@ function Invoke-SelfTest {
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
     if ($BaselineFloor.user -ne 1 -or $BaselineFloor.product -ne 1 -or $BaselineFloor.stress -ne 1) { $failures.Add('1-node shared baseline floor') }
     if ($LoadFloor.user -ne 1 -or $LoadFloor.product -ne 1 -or $LoadFloor.stress -ne 1) { $failures.Add('1-node scoring load floor') }
-    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('앱별 traffic warm floor') }
+    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 1) { $failures.Add('앱별 traffic warm floor') }
     if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 6) { $failures.Add('앱별 pressure floor') }
     if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
     if ([math]::Abs((70 * 0.33) - 23.1) -gt 0.1) { $failures.Add('user control point') }
@@ -962,8 +968,9 @@ function Invoke-SelfTest {
     if ($recommendation.TargetMin -ne 6) { $failures.Add('stress pressure min 추천') }
     if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
     if ((Get-StressPlacementTarget $recommendation) -ne 'ISOLATED') { $failures.Add('stress pressure isolation') }
-    if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'IDLE_RESTORE' })) -ne 'SHARED') { $failures.Add('stress idle merge') }
-    if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'TRAFFIC_WARM' })) -ne 'HOLD') { $failures.Add('stress placement hysteresis') }
+    if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'IDLE_RESTORE'; MaxPending = 0; MaxP95Ms = 0 })) -ne 'SHARED') { $failures.Add('stress idle merge') }
+    if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'TRAFFIC_WARM'; MaxPending = 0; MaxP95Ms = 0 })) -ne 'HOLD') { $failures.Add('stress placement hysteresis') }
+    if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'TRAFFIC_WARM'; MaxPending = 0; MaxP95Ms = 700 })) -ne 'ISOLATED') { $failures.Add('stress p95 proactive isolation') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
         Ready = 20; Pending = 0; Current = 20; Desired = 20; Min = 2; Max = 10
@@ -1009,7 +1016,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 26/26' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 27/27' -ForegroundColor Green
 }
 
 if ($SelfTest) {
