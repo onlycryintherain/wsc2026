@@ -44,6 +44,8 @@ class LoadgenTests(unittest.IsolatedAsyncioTestCase):
         rps: int = 20,
         duration: float = 0.3,
         safety: dict | None = None,
+        start_rps: int | None = None,
+        kind: str = "load",
     ) -> dict:
         with tempfile.TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
@@ -54,7 +56,7 @@ class LoadgenTests(unittest.IsolatedAsyncioTestCase):
                 "endpoint": f"http://127.0.0.1:{self.port}",
                 "timeout_sec": timeout,
                 "safety": safety or {},
-                "phases": [{"rps": rps, "duration_sec": duration}],
+                "phases": [{"kind": kind, "start_rps": rps if start_rps is None else start_rps, "rps": rps, "duration_sec": duration}],
                 "apps": {
                     "mock-app": {
                         "share": 1.0,
@@ -88,6 +90,15 @@ class LoadgenTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(result["max_active"], result["workers"])
         self.assertIn("slo_success_rate", result["apps"]["mock-app"])
         self.assertEqual(len(result["phases"]), 1)
+        self.assertEqual(result["phases"][0]["kind"], "load")
+
+    async def test_linear_arrival_rate_phase_contract(self):
+        result = await self.run_generator("/ok", start_rps=5, rps=20, duration=0.5, kind="ramp")
+        phase = result["phases"][0]
+        self.assertEqual(phase["kind"], "ramp")
+        self.assertEqual(phase["start_rps"], 5.0)
+        self.assertEqual(phase["target_rps"], 20.0)
+        self.assertGreater(phase["apps"]["mock-app"]["requests"], 0)
 
     async def test_http_failure_is_counted(self):
         result = await self.run_generator("/failure")

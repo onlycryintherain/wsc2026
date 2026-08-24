@@ -198,6 +198,8 @@ class Metrics:
             for index, phase in enumerate(phase_specs):
                 phases.append({
                     "index": index,
+                    "kind": str(phase.get("kind", "load")),
+                    "start_rps": float(phase.get("start_rps", phase.get("rps", 0.0))),
                     "target_rps": float(phase.get("rps", 0.0)),
                     "duration_sec": float(phase["duration_sec"]),
                     "apps": {name: self.bucket_snapshot(value) for name, value in self.phases[index].items()},
@@ -275,23 +277,27 @@ async def scheduler(
     app: str,
     phase_index: int,
     spec: dict[str, Any],
-    rate: float,
+    start_rate: float,
+    end_rate: float,
     duration: float,
     queue: asyncio.Queue[RequestItem | None],
     metrics: Metrics,
     stop_event: asyncio.Event,
 ) -> None:
-    if rate <= 0 or duration <= 0:
+    if max(start_rate, end_rate) <= 0 or duration <= 0:
         await asyncio.sleep(max(0.0, duration))
         return
-    interval = 1.0 / rate
-    next_send = time.perf_counter()
-    end = next_send + duration
+    phase_start = time.perf_counter()
+    next_send = phase_start
+    end = phase_start + duration
     while not stop_event.is_set() and time.perf_counter() < end:
         now = time.perf_counter()
         if now < next_send:
             await asyncio.sleep(min(next_send - now, 0.05))
             continue
+        progress = min(1.0, max(0.0, (now - phase_start) / duration))
+        current_rate = start_rate + (end_rate - start_rate) * progress
+        interval = 1.0 / max(0.001, current_rate)
         lag = now - next_send
         await metrics.note_scheduler_lag(lag)
         missed = max(0, int(lag / interval))
@@ -384,6 +390,7 @@ async def run(config: dict[str, Any]) -> dict[str, Any]:
                             app,
                             phase_index,
                             spec,
+                            float(phase.get("start_rps", target_rps)) * float(spec.get("share", 0.0)),
                             target_rps * float(spec.get("share", 0.0)),
                             duration,
                             queue,

@@ -10,15 +10,14 @@ pwsh ./tools/tune.ps1
 
 ```text
 immutable live snapshot
-→ BASE: Default / Default-spike2 / Ramp
-→ local HTTP result + Kubernetes samples
+→ BASE: 240초 Python ramping-arrival-rate
+→ steady HTTP result + 전체 구간 Kubernetes samples
 → validity/infrastructure check
 → one recommendation
 → Copy(BEST) + one logical delta
 → exact apply and live verification
 → fresh candidate measurement
 → KEEP or exact BEST rollback
-→ remaining-time check and repeat
 → measured BEST apply
 → optional FINAL_FRESH
 → final regression rollback
@@ -33,18 +32,18 @@ BASE 전에 Deployment replica/resources, HPA, behavior, topology, PDB, NodePool
 - `MIN_DOWN`
 - `REQUEST_CONTROL_POINT` (`requests.cpu` + absolute HPA trigger compensation)
 
-Placement, topology, PDB, NodePool은 변경하지 않습니다. 관련 장애는 `PDB_CONSTRAINT`, `SCHEDULER_PLACEMENT`, `NODEPOOL_LIMIT`, `NODE_CPU_CAPACITY`, `NODE_MEMORY_CAPACITY`, `CNI_UNRESOLVED`로 측정을 중단합니다. Terminal infrastructure/generator evidence가 확인되면 같은 부하를 반복하는 FINAL은 생략합니다.
+Placement, topology, PDB, NodePool은 변경하지 않습니다. `Insufficient CPU/memory`와 `NODEPOOL_LIMIT`은 중단 조건이 아니라 resource/HPA candidate를 만드는 병목 evidence입니다. 미해결 CNI, PDB constraint, metrics 부재, local generator limit처럼 측정 자체가 무효인 경우에만 search/FINAL을 중단합니다.
 
 ## Recommendation order
 
 ```text
-1. measurement validity
-2. infrastructure validity
-3. performance recovery
-   A. HPA ceiling
-   B. sustained HPA scale-up lag
-   C. early burst failure followed by late recovery → min +1
-4. stable-performance cost work
+1. measurement validity(CNI/PDB/metrics/generator)
+2. performance recovery
+   A. NodePool limit + app Pending → bounded request -10% + absolute HPA trigger 보존
+   B. HPA ceiling
+   C. sustained HPA scale-up lag
+   D. early burst failure followed by late recovery → min +1
+3. stable-performance cost work
    A. min -1 only when calculated node floor can fall
    B. CPU request right-size with HPA absolute trigger preserved
 ```
@@ -68,6 +67,9 @@ py -3.14 -c "import aiohttp"
 - bounded connector: 최대 96
 - bounded queue: 최대 256
 - fixed scheduler tasks: phase당 app 수만큼
+- k6 `ramping-arrival-rate`와 같은 linear start→target rate
+- 20s warmup → 32s×5 ramp → 30s steady → 30s cooldown
+- steady phase만 availability/performance 판정에 사용
 - request timeout
 - graceful process cleanup
 - atomic JSON output
@@ -109,14 +111,15 @@ $script:HardDeadline = $script:StartTime.AddMinutes(20)
 기본 budget:
 
 ```text
-profile:                40s × 3
-measurement budget:    (40 + sample overrun 10)s × 3 = 150s
-candidate apply:        45s
-possible rollback:      45s
-candidates:             최대 3
-shutdown reserve:       120s
-save reserve:           15s
-worst-case planned:     1155s (19m15s)
+BASE measurement:       240s + sample overrun 10s = 250s
+candidate apply:         45s
+candidate measurement:  250s
+possible rollback:       45s
+FINAL measurement:      250s
+candidate:               최대 1개
+shutdown reserve:        120s
+save reserve:            15s
+worst-case planned:      975s (16m15s)
 ```
 
 Candidate 시작 전 다음을 비교합니다.

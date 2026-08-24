@@ -7,8 +7,12 @@ param(
     [string]$Namespace = 'app',
     [ValidateSet(20)][int]$MaxRuntimeMinutes = 20,
     [ValidateRange(60, 180)][int]$ShutdownReserveSeconds = 120,
-    [ValidateRange(20, 90)][int]$ProfileDurationSec = 40,
-    [ValidateRange(1, 5)][int]$MaxProfileCandidates = 3,
+    [ValidateRange(180, 300)][int]$ProfileDurationSec = 240,
+    [ValidateSet(1)][int]$MaxProfileCandidates = 1,
+    [ValidateRange(10, 100)][int]$TargetRate = 60,
+    [ValidateRange(10, 60)][int]$WarmupDurationSec = 20,
+    [ValidateRange(20, 60)][int]$SteadyDurationSec = 30,
+    [ValidateRange(15, 90)][int]$CooldownDurationSec = 30,
     [ValidateRange(5, 10)][int]$SampleIntervalSec = 7,
     [ValidateRange(0.0, 2.0)][double]$NoiseTolerance = 0.5,
     [ValidateRange(95.0, 100.0)][double]$PerformancePassPercent = 99.0,
@@ -24,14 +28,13 @@ $script:StartTime = [datetime]::UtcNow
 $script:HardDeadline = $script:StartTime.AddMinutes(20)
 $script:Apps = @('user', 'product', 'stress')
 $script:SloMs = @{user=200.0; product=200.0; stress=1000.0}
-$script:ProfileNames = @('Default', 'Default-spike2', 'Ramp')
+$script:ProfileNames = @('Ramp')
 $script:ApplyBudgetSec = 45
 $script:RollbackBudgetSec = 45
 $script:EvidenceSaveBudgetSec = 15
-# Each profile may finish while one bounded Kubernetes sample (5 calls × 2s)
-# is in progress, so reserve ten seconds per profile.
-$script:FinalMeasurementBudgetSec = ($ProfileDurationSec + 10) * $script:ProfileNames.Count
-$script:CandidateMeasurementBudgetSec = ($ProfileDurationSec + 10) * $script:ProfileNames.Count
+# Single k6-compatible ramp; reserve one bounded Kubernetes sample overrun.
+$script:FinalMeasurementBudgetSec = $ProfileDurationSec + 10
+$script:CandidateMeasurementBudgetSec = $ProfileDurationSec + 10
 $script:LocalRun = $null
 $script:PythonExe = $null
 $script:PythonArgs = @()
@@ -389,24 +392,30 @@ function Get-Sample([datetime]$ProfileStartedAt, [hashtable]$InitialRestarts) {
 }
 
 function Get-ProfileSteps([string]$Name) {
-    switch ($Name) {
-        'Default-spike2' { return @(10,30,60,30,60) }
-        'Ramp' { return @(10,20,30,40,50,60) }
-        default { return @(10,20,30,40,50,60) }
-    }
+    $steps=[System.Collections.Generic.List[int]]::new()
+    for($rate=10;$rate -lt $TargetRate;$rate+=10){$steps.Add($rate)}
+    $steps.Add($TargetRate)
+    return @($steps | Select-Object -Unique)
 }
 
 function Get-ProfileSpec([string]$Name) {
     $steps = @(Get-ProfileSteps $Name)
-    $loadSeconds = [math]::Max($steps.Count, $ProfileDurationSec - 2)
-    $base = [math]::Floor($loadSeconds / $steps.Count)
-    $remainder = $loadSeconds - ($base * $steps.Count)
+    $rampCount=[math]::Max(0,$steps.Count-1)
+    $loadWindow=$ProfileDurationSec-$CooldownDurationSec
+    $rampSeconds=if($rampCount){[math]::Floor(($loadWindow-$WarmupDurationSec-$SteadyDurationSec)/$rampCount)}else{0}
+    if($rampCount -and $rampSeconds -lt 10){throw 'PROFILE_DURATION_TOO_SHORT_FOR_K6_RAMP'}
     $phases = [System.Collections.Generic.List[hashtable]]::new()
-    for ($index=0; $index -lt $steps.Count; $index++) {
-        $duration = $base + $(if ($index -lt $remainder) { 1 } else { 0 })
-        $phases.Add(@{rps=[int]$steps[$index];duration_sec=[int]$duration})
+    $phases.Add(@{kind='warmup';start_rps=[int]$steps[0];rps=[int]$steps[0];duration_sec=$WarmupDurationSec})
+    $previous=[int]$steps[0]
+    foreach($rate in @($steps | Select-Object -Skip 1)){
+        $phases.Add(@{kind='ramp';start_rps=$previous;rps=[int]$rate;duration_sec=[int]$rampSeconds})
+        $previous=[int]$rate
     }
-    $phases.Add(@{rps=0;duration_sec=2})
+    $used=$WarmupDurationSec+($rampSeconds*$rampCount)+$SteadyDurationSec+$CooldownDurationSec
+    $steadySeconds=$SteadyDurationSec+($ProfileDurationSec-$used)
+    $phases.Add(@{kind='steady';start_rps=[int]$TargetRate;rps=[int]$TargetRate;duration_sec=[int]$steadySeconds})
+    $phases.Add(@{kind='cooldown';start_rps=[int]$TargetRate;rps=0;duration_sec=1})
+    $phases.Add(@{kind='cooldown';start_rps=0;rps=0;duration_sec=($CooldownDurationSec-1)})
     return @{
         profile=$Name
         endpoint=$script:Endpoint
@@ -415,7 +424,7 @@ function Get-ProfileSpec([string]$Name) {
         apps=@{
             user=@{share=0.50;slo_ms=$script:SloMs.user;expected_status=200;method='GET';path='/v1/user?email=dbdump500001@example.org&requestid=999999999999&uuid=7c5a3c6a-7584-4bc5-9bdf-3e573a0ad729';headers=@{'User-Agent'='wsi-local-loadgen/2.0'}}
             product=@{share=0.35;slo_ms=$script:SloMs.product;expected_status=200;method='GET';path='/v1/product?id=dbdump500001&requestid=999999999999&uuid=7c5a3c6a-7584-4bc5-9bdf-3e573a0ad729';headers=@{'User-Agent'='wsi-local-loadgen/2.0'}}
-            stress=@{share=0.15;slo_ms=$script:SloMs.stress;expected_status=201;method='POST';path='/v1/stress';body=@{requestid='999999999999';uuid='7c5a3c6a-7584-4bc5-9bdf-3e573a0ad729';length=128};headers=@{'User-Agent'='wsi-local-loadgen/2.0';'Content-Type'='application/json'}}
+            stress=@{share=0.15;slo_ms=$script:SloMs.stress;expected_status=201;method='POST';path='/v1/stress';body=@{requestid='999999999999';uuid='7c5a3c6a-7584-4bc5-9bdf-3e573a0ad729';length=256};headers=@{'User-Agent'='wsi-local-loadgen/2.0';'Content-Type'='application/json'}}
         }
     }
 }
@@ -449,6 +458,15 @@ function Stop-LocalLoad([switch]$Force) {
     finally { $script:LocalRun = $null }
 }
 
+function Get-LoadPhaseAtElapsed($ProfileSpec,[double]$ElapsedSec) {
+    $cursor=0.0
+    foreach($phase in @($ProfileSpec.phases)){
+        $cursor += [double]$phase.duration_sec
+        if($ElapsedSec -lt $cursor){return $phase}
+    }
+    return @($ProfileSpec.phases)[-1]
+}
+
 function Invoke-Profile([string]$CandidateName, [string]$ProfileName) {
     Assert-LiveConfig $script:MeasurementConfig 'CONFIG_DRIFT_BEFORE_PROFILE' | Out-Null
     Initialize-Python
@@ -456,7 +474,10 @@ function Invoke-Profile([string]$CandidateName, [string]$ProfileName) {
     $safe = ($CandidateName + '-' + $ProfileName) -replace '[^A-Za-z0-9_.-]','_'
     $configPath = Join-Path $OutputDir "$safe.loadgen.json"
     $resultPath = Join-Path $OutputDir "$safe.loadgen-result.json"
-    Get-ProfileSpec $ProfileName | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $configPath -Encoding utf8
+    $profileSpec=Get-ProfileSpec $ProfileName
+    $rampPhases=@($profileSpec.phases | Where-Object kind -eq 'ramp')
+    Write-Host ("  Python arrival-rate: warmup={0}s ramp={1}s×{2} steady={3}s cooldown={4}s target={5}rps" -f $WarmupDurationSec,$rampPhases[0].duration_sec,$rampPhases.Count,$SteadyDurationSec,$CooldownDurationSec,$TargetRate) -ForegroundColor DarkCyan
+    $profileSpec | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $configPath -Encoding utf8
     $processInfo = [Diagnostics.ProcessStartInfo]::new()
     $processInfo.FileName = $script:PythonExe
     $processInfo.UseShellExecute = $false
@@ -484,8 +505,11 @@ function Invoke-Profile([string]$CandidateName, [string]$ProfileName) {
                         $sample.Apps[$app].RestartDelta=0
                     }
                 }
+                $phase=Get-LoadPhaseAtElapsed $profileSpec ([double]$sample.ElapsedSec)
+                $sample | Add-Member -NotePropertyName LoadKind -NotePropertyValue ([string]$phase.kind) -Force
+                $sample | Add-Member -NotePropertyName TargetRps -NotePropertyValue ([double]$phase.rps) -Force
                 $samples.Add($sample)
-                Write-Host ("  sample {0}: nodes={1} pending={2}" -f $samples.Count,$sample.Node.ReadyCount,@($sample.Pending).Count) -ForegroundColor DarkGray
+                Write-Host ("  sample {0}: phase={1} rps={2} nodes={3} pending={4}" -f $samples.Count,$sample.LoadKind,$sample.TargetRps,$sample.Node.ReadyCount,@($sample.Pending).Count) -ForegroundColor DarkGray
                 $nextSample = [datetime]::UtcNow.AddSeconds($SampleIntervalSec)
             }
             Start-Sleep -Milliseconds 250
@@ -506,8 +530,9 @@ function Invoke-Profile([string]$CandidateName, [string]$ProfileName) {
 function Convert-ProfileResult($Evidence, [string]$ProfileName) {
     $apps = @{}
     $availability = 100.0; $performance = 100.0
+    $steady=@($Evidence.phases | Where-Object { [string]$_.kind -eq 'steady' }) | Select-Object -Last 1
     foreach ($app in $script:Apps) {
-        $value = $Evidence.apps.$app
+        $value = if($steady){$steady.apps.$app}else{$Evidence.apps.$app}
         $success = [double]$value.success_rate
         $slo = [double]$value.slo_success_rate
         $availability = [math]::Min($availability, $success)
@@ -580,17 +605,14 @@ function Get-AllSamples($Evaluation) {
     return @($Evaluation.Runs | ForEach-Object { @($_.Samples) })
 }
 
+function Get-AllLoadSamples($Evaluation) {
+    return @(Get-AllSamples $Evaluation | Where-Object { [string]$_.LoadKind -ne 'cooldown' })
+}
+
 function Get-PendingSummary($Sample) {
     $pending=@($Sample.Pending)
     $byApp=@($pending | Group-Object App | ForEach-Object { "$($_.Name)=$($_.Count)" })
     return "pending=$($pending.Count)$(if($byApp.Count){' ('+($byApp -join ',')+')'}else{''}) readyNodes=$($Sample.Node.ReadyCount)"
-}
-
-function Get-NodePoolLimitSummary($Sample) {
-    $names=[System.Collections.Generic.HashSet[string]]::new()
-    foreach($match in [regex]::Matches([string]$Sample.Scheduling.Reasons,'nodepool\s+"([^"]+)"')) { [void]$names.Add($match.Groups[1].Value) }
-    $pools=if($names.Count){(@($names) | Sort-Object)-join','}else{'unknown'}
-    return "$(Get-PendingSummary $Sample) nodepools=$pools hard CPU/resource limit reached"
 }
 
 function Get-InfrastructureStop($Evaluation) {
@@ -606,21 +628,15 @@ function Get-InfrastructureStop($Evaluation) {
     $latest = $samples[-1]
     if ($latest.Scheduling.CniError -and @($latest.Pending).Count) { return [pscustomobject]@{Type='CNI_UNRESOLVED';Reason="$(Get-PendingSummary $latest) unresolved CNI allocation failure"} }
     if ($latest.Scheduling.PdbConstraint) { return [pscustomobject]@{Type='PDB_CONSTRAINT';Reason="$(Get-PendingSummary $latest) disruption budget constraint"} }
-    if ($latest.Scheduling.NodePoolLimit -and @($latest.Pending).Count) { return [pscustomobject]@{Type='NODEPOOL_LIMIT';Reason=(Get-NodePoolLimitSummary $latest)} }
-    $threshold = [math]::Max(2, [math]::Ceiling($samples.Count*0.30))
-    $cpuPending = @($samples | Where-Object { $_.Scheduling.InsufficientCpu }).Count
-    $memoryPending = @($samples | Where-Object { $_.Scheduling.InsufficientMemory }).Count
-    $placementPending = @($samples | Where-Object { $_.Scheduling.FailedScheduling }).Count
-    if ($cpuPending -ge $threshold) { return [pscustomobject]@{Type='NODE_CPU_CAPACITY';Reason="samples=$cpuPending/$($samples.Count) $(Get-PendingSummary $latest)"} }
-    if ($memoryPending -ge $threshold) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Reason="samples=$memoryPending/$($samples.Count) $(Get-PendingSummary $latest)"} }
-    if ($placementPending -ge $threshold) { return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Reason="samples=$placementPending/$($samples.Count) $(Get-PendingSummary $latest)"} }
+    # Insufficient capacity and NodePool limits are measured bottleneck evidence.
+    # They must not suppress the bounded resource/HPA candidate lifecycle.
     return $null
 }
 
 function Get-AppTemporalEvidence($Evaluation, [string]$App) {
     $earlyWorst = 100.0; $lateWorst = 100.0; $profiles = 0
     foreach ($run in $Evaluation.Runs) {
-        $phases = @($run.Evidence.phases | Where-Object { [double]$_.target_rps -gt 0 })
+        $phases = @($run.Evidence.phases | Where-Object { [string]$_.kind -in @('ramp','steady') -and [double]$_.target_rps -gt 0 })
         if ($phases.Count -lt 2) { continue }
         $split = [math]::Ceiling($phases.Count/2.0)
         $early = @($phases | Select-Object -First $split)
@@ -678,10 +694,28 @@ function Test-RecommendationRejected($Rejected,[string]$Axis,[string]$App,$To,$N
 function Get-Recommendation($Best, $Rejected=$null) {
     $infra = Get-InfrastructureStop $Best
     if ($infra) { return [pscustomobject]@{Axis='INFRA_STOP';App=$null;To=$null;Reason="$($infra.Type): $($infra.Reason)"} }
-    $samples = @(Get-AllSamples $Best)
+    $samples = @(Get-AllLoadSamples $Best)
     $failingApps = @($script:Apps | Where-Object { [double]$Best.AppWorst[$_] -lt $PerformancePassPercent } | Sort-Object { [double]$Best.AppWorst[$_] })
     if ($failingApps.Count) {
+        # k6-compatible behavior: NodePool saturation is evidence for one bounded
+        # request/control-point packing probe, not a reason to abort measurement.
+        foreach($app in $failingApps){
+            $capacity=@($samples | Where-Object {
+                $_.Scheduling.NodePoolLimit -and @($_.Pending | Where-Object App -eq $app).Count -gt 0
+            })
+            $oldRequest=[int]$Best.Config[$app].requestCpuM
+            if($capacity.Count -ge 2 -and $oldRequest -gt 50){
+                $newRequest=[int][math]::Max(50,[math]::Floor(($oldRequest*0.90)/10.0)*10)
+                $absoluteTrigger=[double]$oldRequest*[double]$Best.Config[$app].hpaTarget/100.0
+                $newTarget=[int][math]::Round(100.0*$absoluteTrigger/$newRequest)
+                if($newTarget -ge 10 -and $newTarget -le 90 -and -not(Test-RecommendationRejected $Rejected 'REQUEST_CONTROL_POINT' $app $newRequest $newTarget)){
+                    return New-Recommendation 'REQUEST_CONTROL_POINT' $app $newRequest "nodepool limit samples=$($capacity.Count), bounded request -10%, preserve trigger=${absoluteTrigger}m" $newTarget
+                }
+            }
+        }
         foreach ($app in $failingApps) {
+            $capacity=@($samples | Where-Object { $_.Scheduling.NodePoolLimit -and @($_.Pending | Where-Object App -eq $app).Count -gt 0 })
+            if($capacity.Count -ge 2){continue}
             $ceiling = @($samples | Where-Object {
                 $metric=$_.Apps[$app]
                 $null -ne $metric.CpuUtilization -and [int]$metric.DesiredReplicas -ge [int]$metric.MaxReplicas -and [int]$metric.CpuUtilization -gt [int]$metric.CpuTarget

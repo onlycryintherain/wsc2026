@@ -55,7 +55,7 @@ function New-TestSample {
         }
     }
     return [pscustomobject]@{
-        MetricsAvailable=$true;Apps=$apps;Pending=@()
+        MetricsAvailable=$true;LoadKind='ramp';TargetRps=40;Apps=$apps;Pending=@()
         Node=[pscustomobject]@{ReadyCount=2;AverageAllocatableCpuM=1000;AverageAllocatableMemoryMi=1000;AllocatableCpuM=2000;AllocatableMemoryMi=2000;RequestedCpuM=800;RequestedMemoryMi=800;AppRequestedCpuM=400;AppRequestedMemoryMi=400}
         Scheduling=[pscustomobject]@{InsufficientCpu=$false;InsufficientMemory=$false;FailedScheduling=$false;CniError=$false;PdbConstraint=$false;NodePoolLimit=$false;Reasons=''}
     }
@@ -69,7 +69,7 @@ function New-PhaseEvidence([string]$App,[double]$Early,[double]$Late) {
             $value=if($name-eq$App){$rate}else{100.0}
             $apps|Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{slo_success_rate=$value})
         }
-        $phases += [pscustomobject]@{target_rps=20;apps=$apps}
+        $phases += [pscustomobject]@{kind='ramp';target_rps=20;apps=$apps}
     }
     return [pscustomobject]@{phases=$phases}
 }
@@ -212,16 +212,35 @@ Assert-Test '18 FINAL is measured BEST' {
     if($source-match 'FinalResourceOverride|hidden overlay'){throw 'hidden final overlay found'}
 }
 
-Assert-Test '18b explicit NodePool limit stops and skips FINAL' {
+Assert-Test '18b NodePool limit becomes bounded request candidate' {
     $config=New-TestConfig
     $sample=New-TestSample
     $sample.Pending=@([pscustomobject]@{App='stress';Reason='Unschedulable'})
     $sample.Scheduling.NodePoolLimit=$true
     $sample.Scheduling.Reasons='all available instance types exceed limits for nodepool "stress"'
     $eval=New-TestEvaluation $config stress 0 0 0 @($sample,$sample,$sample)
-    $stop=Get-InfrastructureStop $eval
-    if($stop.Type-ne'NODEPOOL_LIMIT'){throw ($stop|ConvertTo-Json -Compress)}
-    if($stop.Reason-ne'pending=1 (stress=1) readyNodes=2 nodepools=stress hard CPU/resource limit reached'){throw "unbounded reason: $($stop.Reason)"}
+    if($null-ne(Get-InfrastructureStop $eval)){throw 'NodePool limit incorrectly invalidated measurement'}
+    $rec=Get-Recommendation $eval
+    if($rec.Axis-ne'REQUEST_CONTROL_POINT'-or$rec.App-ne'stress'-or$rec.To-ne90-or$rec.NewTarget-ne56){throw ($rec|ConvertTo-Json -Compress)}
+}
+
+Assert-Test '18c k6-compatible Python ramp contract' {
+    $spec=Get-ProfileSpec 'Ramp'
+    $phases=@($spec.phases)
+    if($script:ProfileNames.Count-ne1-or$script:ProfileNames[0]-ne'Ramp'){throw 'single ramp profile missing'}
+    if((($phases.duration_sec|Measure-Object -Sum).Sum)-ne240){throw 'profile is not 240 seconds'}
+    if(($phases.rps-join',')-ne'10,20,30,40,50,60,60,0,0'){throw "rates=$($phases.rps-join',')"}
+    if(($phases.kind-join',')-ne'warmup,ramp,ramp,ramp,ramp,ramp,steady,cooldown,cooldown'){throw "kinds=$($phases.kind-join',')"}
+    if(($phases.start_rps-join',')-ne'10,10,20,30,40,50,60,60,0'){throw "startRates=$($phases.start_rps-join',')"}
+    if($spec.apps.stress.body.length-ne256){throw 'stress length differs from old k6 contract'}
+}
+
+Assert-Test '18d terminal CNI evidence still skips FINAL' {
+    $config=New-TestConfig;$sample=New-TestSample
+    $sample.Pending=@([pscustomobject]@{App='stress';Reason='ContainerCreating'})
+    $sample.Scheduling.CniError=$true
+    $eval=New-TestEvaluation $config stress 0 0 0 @($sample,$sample,$sample)
+    if((Get-InfrastructureStop $eval).Type-ne'CNI_UNRESOLVED'){throw 'CNI did not invalidate measurement'}
     if(-not$source.Contains('if ($skipFinalReason)')-or-not$source.Contains('FINAL_SKIPPED: $skipFinalReason')){throw 'terminal invalid measurement can still run FINAL'}
 }
 
@@ -239,7 +258,7 @@ Assert-Test '21 no shared-domain packing optimizer' {
 
 Assert-Test '22 worst-case runtime <= 20 minutes' {
     $seconds=Get-WorstCaseRuntimeSeconds
-    if($seconds-gt1200){throw "worst-case=$seconds"}
+    if($seconds-ne975-or$seconds-gt1200){throw "worst-case=$seconds expected=975"}
 }
 
 Write-Host "`nSelf-tests: $pass/$($pass+$fail) passed" -ForegroundColor $(if($fail-eq0){'Green'}else{'Red'})
