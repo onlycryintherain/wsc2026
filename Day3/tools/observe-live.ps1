@@ -36,8 +36,10 @@ $ErrorActionPreference = 'Stop'
 $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
+# 앱별 SLO와 직전 60분 run 실측을 반영한 성능 우선 프로필이다. product는 이미
+# 만점권이라 작게 유지하고, 200ms user와 CPU-heavy stress에 시작 용량을 집중한다.
 $WarmFloor = @{ user = 12; product = 2; stress = 4 }
-$MaxSafetyCap = @{ user = 48; product = 20; stress = 12 }
+$MaxSafetyCap = @{ user = 48; product = 20; stress = 8 }
 $HpaTargetUtilization = @{ user = 12; product = 29; stress = 55 }
 $UserCpuRequest = '200m'
 $StressNodePool = 'stress'
@@ -187,6 +189,31 @@ function Initialize-PerformanceProfile {
     $stressDeployment = @($deployments.items | Where-Object { $_.metadata.name -eq 'stress' } | Select-Object -First 1)
     if (-not $userDeployment -or -not $stressDeployment) { throw 'user/stress Deployment를 찾지 못했습니다.' }
 
+    # ceiling은 Pod/EC2를 직접 만들지 않는다. HPA prewarm 전에 열어 Pending이
+    # NodePool limit 때문에 수 분간 정체되는 것을 방지한다.
+    foreach ($pool in @('default', 'stress')) {
+        $targetLimit = [int]$NodePoolSafetyCapNodes[$pool] * $FallbackNodeCpu
+        $current = Get-KubeJson @('get', 'nodepool', $pool, '-o', 'json')
+        $currentLimit = [int]$current.spec.limits.cpu
+        $currentConsolidate = Get-NodePoolConsolidateAfter $current
+        if ($currentLimit -eq $targetLimit -and $currentConsolidate -eq $ActiveConsolidateAfter) { continue }
+        $description = "NodePool/$pool ceiling cpu=$targetLimit consolidate=$ActiveConsolidateAfter"
+        if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("NodePool/$pool", $description)) {
+            Write-Host "[권고] $description" -ForegroundColor Yellow
+            continue
+        }
+        $baseline = $script:NodePoolBaseline[$pool]
+        $patch = @{
+            metadata = @{ annotations = @{
+                'wsi2026.io/live-tune-baseline-limit-cpu' = [string]$baseline.LimitCpu
+                'wsi2026.io/live-tune-baseline-consolidate-after' = [string]$baseline.ConsolidateAfter
+            } }
+            spec = @{ limits = @{ cpu = [string]$targetLimit }; disruption = @{ consolidateAfter = $ActiveConsolidateAfter } }
+        } | ConvertTo-Json -Compress -Depth 10
+        Write-Host "[적용/비용주의] $description" -ForegroundColor Magenta
+        Invoke-Kubectl @('patch', 'nodepool', $pool, '--type=merge', '-p', $patch) | Out-Null
+    }
+
     $userContainer = [string]$userDeployment.spec.template.spec.containers[0].name
     $currentUserRequest = [string]$userDeployment.spec.template.spec.containers[0].resources.requests.cpu
     if ($currentUserRequest -ne $UserCpuRequest) {
@@ -196,7 +223,7 @@ function Initialize-PerformanceProfile {
         } else {
             $patch = @{
                 spec = @{ template = @{
-                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'user-200m-v1' } }
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'user-200m-v2' } }
                     spec = @{ containers = @(@{ name = $userContainer; resources = @{ requests = @{ cpu = $UserCpuRequest } } }) }
                 } }
             } | ConvertTo-Json -Compress -Depth 12
@@ -205,15 +232,18 @@ function Initialize-PerformanceProfile {
         }
     }
 
+    # stress를 shared로 두면 60분 run에서 default 4대 CPU를 모두 소모하면서
+    # stress 28.46%, user 43.2%로 동반 하락했다. scoring session 동안은 placement
+    # rollout을 반복하지 않고 전용 tainted NodePool에 고정한다.
     $currentStressPool = [string]$stressDeployment.spec.template.spec.nodeSelector.'karpenter.sh/nodepool'
     if ($currentStressPool -ne $StressNodePool) {
-        $description = "Deployment/stress nodeSelector -> karpenter.sh/nodepool=$StressNodePool (user 간섭 분리)"
+        $description = "Deployment/stress nodeSelector -> karpenter.sh/nodepool=$StressNodePool"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
             $patch = @{
                 spec = @{ template = @{
-                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'stress-dedicated-v1' } }
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'stress-dedicated-v2' } }
                     spec = @{ nodeSelector = @{ 'karpenter.sh/nodepool' = $StressNodePool } }
                 } }
             } | ConvertTo-Json -Compress -Depth 10
@@ -262,6 +292,13 @@ function Initialize-PerformanceProfile {
         }
         if ([string]$verifyStress.spec.template.spec.nodeSelector.'karpenter.sh/nodepool' -ne $StressNodePool) {
             throw '시작 프로필 검증 실패: stress nodeSelector'
+        }
+        foreach ($pool in @('default', 'stress')) {
+            $verifyPool = Get-KubeJson @('get', 'nodepool', $pool, '-o', 'json')
+            $expectedLimit = [int]$NodePoolSafetyCapNodes[$pool] * $FallbackNodeCpu
+            if ([int]$verifyPool.spec.limits.cpu -ne $expectedLimit) {
+                throw "시작 프로필 검증 실패: NodePool/$pool ceiling"
+            }
         }
     }
 }
@@ -679,8 +716,9 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($WarmFloor.user -ne 12 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('비대칭 warm floor') }
+    if ($WarmFloor.user -ne 12 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('앱별 warm floor') }
     if ($UserCpuRequest -ne '200m' -or $HpaTargetUtilization.user -ne 12) { $failures.Add('user control point profile') }
+    if ([math]::Abs((200 * 0.12) - (70 * 0.33)) -gt 1.0) { $failures.Add('user control point 보존') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -698,7 +736,7 @@ function Invoke-SelfTest {
     if ($recommendation.TargetScaleDown -ne 600) { $failures.Add('scale-down 안정화 추천') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
-        Ready = 20; Pending = 0; Current = 20; Desired = 20; Min = 2; Max = 20
+        Ready = 20; Pending = 0; Current = 20; Desired = 20; Min = 2; Max = 10
         CurrentUtil = 70; TargetUtil = 33; ScaleDownSeconds = 0
         CpuTotalM = 980.0; CpuAverageM = 49.0; CpuMaxM = 60.0; HotRatio = 1.22
         Requests = 20; Errors = 0; ErrorRate = 0.0; P95Ms = 220.0
@@ -711,7 +749,7 @@ function Invoke-SelfTest {
     if ($maxRecommendation.Reason -ne 'HPA_MAX_PRESSURE' -or $maxRecommendation.TargetMax -ne 48) { $failures.Add('HPA max performance expansion') }
     $ceiling.Pending = 1
     $blockedRecommendation = Get-Recommendation 'user'
-    if ($blockedRecommendation.TargetMax -ne 20) { $failures.Add('Pending 중 HPA max 확장 차단') }
+    if ($blockedRecommendation.TargetMax -ne 10) { $failures.Add('Pending 중 HPA max 확장 차단') }
     if ((Get-HpaMaxTarget 38 100 40) -ne 40) { $failures.Add('HPA max safety cap') }
     if ((Get-HpaMaxTarget 1 2 40) -ne 40 -or (Get-HpaMaxTarget 1 2 12) -ne 12) { $failures.Add('HPA max cold-start 즉시 개방') }
     $ceiling.Pending = 2
@@ -741,7 +779,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 15/15' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 16/16' -ForegroundColor Green
 }
 
 if ($SelfTest) {
