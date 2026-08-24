@@ -62,7 +62,11 @@ $script:Baseline = @{}
 $script:NodePoolBaseline = @{}
 $script:ManagedNodeGroup = $null
 $script:LastMutationUtc = [datetime]::MinValue
-$script:LastPlacementMutationUtc = [datetime]::MinValue
+$script:LastPlacementMutationUtc = @{
+    user = [datetime]::MinValue
+    product = [datetime]::MinValue
+    stress = [datetime]::MinValue
+}
 $script:LogPath = Join-Path ([IO.Path]::GetTempPath()) ("wsi-live-tune-{0}.jsonl" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 
 function Convert-CpuToMillicores([string]$Value) {
@@ -289,6 +293,27 @@ function Initialize-PerformanceProfile {
         }
     }
 
+    # PrepareForLoad에서는 세 앱을 Managed NodeGroup 한 대에 명시적으로 모은다.
+    # user/product는 압력 시 selector를 풀어 default Karpenter로 확장한다.
+    foreach ($foreground in @($userDeployment, $productDeployment)) {
+        $app = [string]$foreground.metadata.name
+        $currentManagedGroup = [string]$foreground.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup'
+        if (-not $PrepareForLoad -or $currentManagedGroup -eq $script:ManagedNodeGroup) { continue }
+        $description = "Deployment/$app -> SHARED Managed NodeGroup/$($script:ManagedNodeGroup)"
+        if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/$app", $description)) {
+            Write-Host "[권고] $description" -ForegroundColor Yellow
+        } else {
+            $patch = @{
+                spec = @{ template = @{
+                    metadata = @{ annotations = @{ 'wsi2026.io/live-placement' = 'managed' } }
+                    spec = @{ nodeSelector = @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } }
+                } }
+            } | ConvertTo-Json -Compress -Depth 10
+            Write-Host "[적용/rollout] $description" -ForegroundColor Cyan
+            Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', $app, '--type=merge', '-p', $patch) | Out-Null
+        }
+    }
+
     # 저부하는 Managed 노드의 유휴 CPU를 공유한다. 압력 시 main loop가 전용
     # NodePool로 rolling 전환하고 5분 유휴 뒤에만 다시 shared로 병합한다.
     $currentStressPool = [string]$stressDeployment.spec.template.spec.nodeSelector.'karpenter.sh/nodepool'
@@ -380,6 +405,13 @@ function Initialize-PerformanceProfile {
         }
         if ([string]$verifyProduct.spec.template.spec.containers[0].resources.requests.cpu -ne $ProductCpuRequest) {
             throw '시작 프로필 검증 실패: product CPU request'
+        }
+        if ($PrepareForLoad) {
+            foreach ($foreground in @($verifyUser, $verifyProduct)) {
+                if ([string]$foreground.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup' -ne $script:ManagedNodeGroup) {
+                    throw "시작 프로필 검증 실패: $($foreground.metadata.name) managed placement"
+                }
+            }
         }
         if ([string]$verifyStress.spec.template.spec.containers[0].resources.requests.cpu -ne $StressCpuRequest) {
             throw '시작 프로필 검증 실패: stress CPU request'
@@ -707,10 +739,53 @@ function Get-StressPlacementTarget($Recommendation) {
     return 'HOLD'
 }
 
+function Get-ForegroundPlacementTarget($Recommendation) {
+    if ($null -eq $Recommendation) { return 'HOLD' }
+    if ([int]$Recommendation.MaxPending -gt 0 -or $Recommendation.Reason -in @('HOT_POD', 'HPA_PRESSURE', 'HPA_MAX_PRESSURE')) { return 'ELASTIC' }
+    if ($Recommendation.Reason -eq 'IDLE_RESTORE') { return 'MANAGED' }
+    return 'HOLD'
+}
+
+function Set-DynamicForegroundPlacement([string]$App, $Recommendation) {
+    $target = Get-ForegroundPlacementTarget $Recommendation
+    if ($target -eq 'HOLD') { return $false }
+    if (([datetime]::UtcNow - $script:LastPlacementMutationUtc[$App]).TotalSeconds -lt $DecisionWindowSeconds) { return $false }
+
+    $deployment = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', $App, '-o', 'json')
+    $currentManagedGroup = [string]$deployment.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup'
+    $isManaged = $currentManagedGroup -eq $script:ManagedNodeGroup
+    if (($target -eq 'MANAGED' -and $isManaged) -or ($target -eq 'ELASTIC' -and -not $isManaged)) { return $false }
+
+    $description = if ($target -eq 'ELASTIC') {
+        "$App MANAGED->ELASTIC default NodePool (reason=$($Recommendation.Reason))"
+    } else {
+        "$App ELASTIC->MANAGED (5분 유휴 복귀)"
+    }
+    if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/$App", $description)) {
+        Write-Host "[권고] $description" -ForegroundColor Yellow
+        return $false
+    }
+
+    $selector = if ($target -eq 'MANAGED') { @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } } else { $null }
+    $patch = @{
+        spec = @{ template = @{
+            metadata = @{ annotations = @{
+                'wsi2026.io/live-placement' = $target.ToLowerInvariant()
+                'wsi2026.io/live-placement-reason' = [string]$Recommendation.Reason
+            } }
+            spec = @{ nodeSelector = $selector }
+        } }
+    } | ConvertTo-Json -Compress -Depth 10
+    Write-Host "[배치전환/rollout] $description" -ForegroundColor Magenta
+    Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', $App, '--type=merge', '-p', $patch) | Out-Null
+    $script:LastPlacementMutationUtc[$App] = [datetime]::UtcNow
+    return $true
+}
+
 function Set-DynamicStressPlacement($Recommendation) {
     $target = Get-StressPlacementTarget $Recommendation
     if ($target -eq 'HOLD') { return $false }
-    if (([datetime]::UtcNow - $script:LastPlacementMutationUtc).TotalSeconds -lt $DecisionWindowSeconds) { return $false }
+    if (([datetime]::UtcNow - $script:LastPlacementMutationUtc['stress']).TotalSeconds -lt $DecisionWindowSeconds) { return $false }
 
     $deployment = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', 'stress', '-o', 'json')
     $currentPool = [string]$deployment.spec.template.spec.nodeSelector.'karpenter.sh/nodepool'
@@ -743,7 +818,7 @@ function Set-DynamicStressPlacement($Recommendation) {
     } | ConvertTo-Json -Compress -Depth 10
     Write-Host "[배치전환/rollout] $description" -ForegroundColor Magenta
     Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=merge', '-p', $patch) | Out-Null
-    $script:LastPlacementMutationUtc = [datetime]::UtcNow
+    $script:LastPlacementMutationUtc['stress'] = [datetime]::UtcNow
     return $true
 }
 
@@ -971,6 +1046,9 @@ function Invoke-SelfTest {
     if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'IDLE_RESTORE'; MaxPending = 0; MaxP95Ms = 0 })) -ne 'SHARED') { $failures.Add('stress idle merge') }
     if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'TRAFFIC_WARM'; MaxPending = 0; MaxP95Ms = 0 })) -ne 'HOLD') { $failures.Add('stress placement hysteresis') }
     if ((Get-StressPlacementTarget ([pscustomobject]@{ Reason = 'TRAFFIC_WARM'; MaxPending = 0; MaxP95Ms = 700 })) -ne 'ISOLATED') { $failures.Add('stress p95 proactive isolation') }
+    if ((Get-ForegroundPlacementTarget ([pscustomobject]@{ Reason = 'HPA_PRESSURE'; MaxPending = 0 })) -ne 'ELASTIC') { $failures.Add('foreground pressure elastic') }
+    if ((Get-ForegroundPlacementTarget ([pscustomobject]@{ Reason = 'IDLE_RESTORE'; MaxPending = 0 })) -ne 'MANAGED') { $failures.Add('foreground idle managed') }
+    if ((Get-ForegroundPlacementTarget ([pscustomobject]@{ Reason = 'TRAFFIC_WARM'; MaxPending = 0 })) -ne 'HOLD') { $failures.Add('foreground placement hysteresis') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
         Ready = 20; Pending = 0; Current = 20; Desired = 20; Min = 2; Max = 10
@@ -1016,7 +1094,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 27/27' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 30/30' -ForegroundColor Green
 }
 
 if ($SelfTest) {
@@ -1049,6 +1127,8 @@ try {
             Show-Snapshot $snapshot $recommendations $nodePoolRecommendations
 
             # placement를 먼저 바꿔 이후 HPA scale-up Pod가 올바른 domain에 생성되게 한다.
+            [void](Set-DynamicForegroundPlacement 'user' $recommendations['user'])
+            [void](Set-DynamicForegroundPlacement 'product' $recommendations['product'])
             [void](Set-DynamicStressPlacement $recommendations['stress'])
             foreach ($pool in @('default', 'stress')) {
                 [void](Set-SafeNodePoolState $nodePoolRecommendations[$pool])
