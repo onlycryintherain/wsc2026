@@ -314,6 +314,9 @@ kind: NodePool
 metadata:
   name: stress
 spec:
+  # schedulable stress Pod가 Managed node에 먼저 배치되도록 NodePool 자체는
+  # 시작 노드를 만들지 않는다. 공유 용량이 부족해진 stress Pod만 이 pool을 우선 사용한다.
+  weight: 100
   template:
     metadata:
       labels:
@@ -507,8 +510,17 @@ spec:
       labels:
         app: stress
     spec:
-      nodeSelector:
-        workload-class: stress
+      # 시작 시에는 Managed node를 공유한다. 부하로 새 Pod가 Pending 되면 아래 preferred
+      # affinity + NodePool weight가 stress 전용 노드를 선택해 간섭을 단계적으로 분리한다.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: workload-class
+                operator: In
+                values: ["stress"]
       tolerations:
       - key: wsi2026.io/stress
         operator: Equal

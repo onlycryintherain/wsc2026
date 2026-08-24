@@ -321,6 +321,7 @@ Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/stop" `
 | 2026-08-20 | pending | `tune.ps1` 개선 — 38점 앱 세트 BASE seed를 live 오염 상태가 아닌 재현 구성(70m/70m/600m, HPA 33/29/55, min 2/2/1)으로 고정하고, 외부 부하 결과의 잘못된 EC2 telemetry(reported 1 vs actual 3)를 진단 import/경고하며 최종 적용 config를 BASE 결과에 저장 |
 
 | 날짜 | 커밋 | 변경 요약 |
+| 2026-08-25 | pending | 시작 노드 비용 축소: stress Deployment의 hard `nodeSelector`를 제거하고 stress label 선호 affinity + stress NodePool weight 100으로 전환. 최초 stress 1 Pod는 기존 Managed node를 공유해 Karpenter 시작 노드를 만들지 않고, 부하로 공유 용량이 부족해진 Pending stress Pod만 전용 NodePool을 우선 선택한다. live observer stress warm floor도 4→2로 낮춰 초기 전용 노드 급증을 완화. 고부하인 현재 live placement는 변경하지 않음. |
 | 2026-08-25 | pending | 실시간 HPA 확대가 default NodePool `cpu=2` ceiling에 막혀 user/product Pending을 만든 live 근거를 반영해 `observe-live.ps1`에 HPA+NodePool 통합 제어 추가. NodePool limit/사용량·노드당 vCPU·NotReady·Pending을 관측하고 포화가 결정 창 절반 이상 지속될 때 NodePool을 HPA보다 먼저 현재 인스턴스 1대분씩 pool당 최대 4대까지 확대, consolidation 5m 적용. 유휴 5분에는 consolidation을 기준값으로 먼저 복구하고 실제 사용 CPU가 내려온 뒤 원래 limit을 복구하며 적용 검증/rollback/비용 경고를 포함. |
 | 2026-08-25 | pending | `observe-live.ps1`이 user/product HPA 20/20 포화에서도 Max를 고정하던 문제 수정. 결정 창 절반 이상 CPU ceiling·Ready 충족·Pending 0일 때만 Max를 회당 최대 25% 확대하고 user/product 40·stress 12 안전 상한, 앱당 순차 변경, 적용 검증 실패 시 Max 포함 rollback을 추가. 유휴 시 비용을 직접 만들지 않는 Max는 자동 축소하지 않음. |
 | 2026-08-18 | pending | `bastion_setup.sh`/EKS Launch Template에 38점 기준 반영 — CNI prefix+warm prefix, MNG/Karpenter maxPods=110, user/product 70m·256Mi, stress 600m·2CPU·dedicated NodePool, HPA 33/29/55 및 20/20/6 |

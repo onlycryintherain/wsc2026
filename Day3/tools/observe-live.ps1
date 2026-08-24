@@ -33,7 +33,7 @@ $ErrorActionPreference = 'Stop'
 $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
-$WarmFloor = @{ user = 2; product = 2; stress = 4 }
+$WarmFloor = @{ user = 2; product = 2; stress = 2 }
 $MaxSafetyCap = @{ user = 40; product = 40; stress = 12 }
 $MaxIncreaseRatio = 1.25
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
@@ -588,7 +588,7 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($WarmFloor.stress -gt 4 -or $WarmFloor.user -gt 2 -or $WarmFloor.product -gt 2) { $failures.Add('warm cap 안전선') }
+    if ($WarmFloor.stress -gt 2 -or $WarmFloor.user -gt 2 -or $WarmFloor.product -gt 2) { $failures.Add('warm cap 안전선') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -602,7 +602,7 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ stress = $pressure } }
     )
     $recommendation = Get-Recommendation 'stress'
-    if ($recommendation.TargetMin -ne 4) { $failures.Add('stress warm min 추천') }
+    if ($recommendation.TargetMin -ne 2) { $failures.Add('stress warm min 추천') }
     if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
