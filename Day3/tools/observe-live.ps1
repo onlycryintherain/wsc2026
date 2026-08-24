@@ -41,8 +41,9 @@ $MutationOrder = @('stress', 'user', 'product')
 # keep-alive 연결 편중을 막기 위해 stress 2개를 부하 전에 한 노드에 prewarm한다.
 # 600m은 t3.medium allocatable 1930m에서 daemon overhead를 포함해 노드당 정확히 2 Pod만 허용한다.
 $BaselineFloor = @{ user = 2; product = 2; stress = 2 }
-$WarmFloor = @{ user = 4; product = 2; stress = 2 }
-$PressureFloor = @{ user = 6; product = 4; stress = 4 }
+$LoadFloor = @{ user = 2; product = 2; stress = 4 }
+$WarmFloor = @{ user = 4; product = 2; stress = 4 }
+$PressureFloor = @{ user = 6; product = 4; stress = 6 }
 $MaxSafetyCap = @{ user = 20; product = 20; stress = 8 }
 $HpaTargetUtilization = @{ user = 33; product = 29; stress = 55 }
 $UserCpuRequest = '70m'
@@ -397,17 +398,21 @@ function Initialize-PerformanceProfile {
 function Reset-IdleStateForLoad {
     if (-not $PrepareForLoad -or $ObserveOnly -or $WhatIfPreference) { return }
 
-    Write-Host '[준비] 이전 run replica/CPU backlog를 baseline floor로 정리' -ForegroundColor Cyan
+    Write-Host '[준비] 이전 run replica/CPU backlog를 scoring load floor로 정리' -ForegroundColor Cyan
     $fastConsolidation = @{ spec = @{ disruption = @{ consolidateAfter = '0s'; budgets = @(@{ nodes = '100%' }) } } } | ConvertTo-Json -Compress -Depth 8
     $normalConsolidation = @{ spec = @{ disruption = @{ consolidateAfter = '1m'; budgets = @(@{ nodes = '10%' }) } } } | ConvertTo-Json -Compress -Depth 8
     try {
         Invoke-Kubectl @('patch', 'nodepool', $StressNodePool, '--type=merge', '-p', $fastConsolidation) | Out-Null
         foreach ($app in $MutationOrder) {
-            $floor = [int]$BaselineFloor[$app]
+            $floor = [int]$LoadFloor[$app]
             $lockPatch = @{ spec = @{ minReplicas = $floor; maxReplicas = $floor; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = 0 } } } } | ConvertTo-Json -Compress -Depth 8
             Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $lockPatch) | Out-Null
             Invoke-Kubectl @('-n', $Namespace, 'scale', "deployment/$app", "--replicas=$floor") | Out-Null
         }
+        # 중지된 이전 stress 요청은 클라이언트가 사라져도 바이너리 내부 CPU 작업으로 남을 수 있다.
+        # workflow가 no-load를 확인한 PrepareForLoad 경로에서만 Pod를 교체해 backlog를 제거한다.
+        Write-Host '[준비] stress Pod 교체로 이전 run CPU backlog 제거' -ForegroundColor Cyan
+        Invoke-Kubectl @('-n', $Namespace, 'rollout', 'restart', 'deployment/stress') | Out-Null
 
         $deadline = [datetime]::UtcNow.AddSeconds(180)
         do {
@@ -415,7 +420,7 @@ function Reset-IdleStateForLoad {
             $ready = $true
             foreach ($app in $ManagedApps) {
                 $deployment = @($deployments.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
-                $floor = [int]$BaselineFloor[$app]
+                $floor = [int]$LoadFloor[$app]
                 if (-not $deployment -or [int]$deployment.status.replicas -ne $floor -or
                     [int]$deployment.status.readyReplicas -ne $floor -or [int]$deployment.status.unavailableReplicas -gt 0) {
                     $ready = $false
@@ -428,7 +433,7 @@ function Reset-IdleStateForLoad {
         if (-not $ready) { throw 'LOAD_PREPARE_TIMEOUT: baseline Deployment Ready 실패' }
 
         # rollout 직후에는 Pod가 이전 stress 노드에 흩어진 채 Deployment만 Ready가 될 수 있다.
-        # 빠른 disruption을 유지한 상태에서 실제 2-node/Pending=0까지 기다려 비용 시작점을 보장한다.
+        # 빠른 disruption을 유지한 상태에서 실제 3-node/Pending=0까지 기다려 비용 시작점을 보장한다.
         $nodeDeadline = [datetime]::UtcNow.AddSeconds(180)
         do {
             $nodes = Get-KubeJson @('get', 'nodes', '-o', 'json')
@@ -438,18 +443,18 @@ function Reset-IdleStateForLoad {
             }).Count
             $totalNodeCount = @($nodes.items).Count
             $pendingCount = @($pods.items | Where-Object { $_.status.phase -eq 'Pending' }).Count
-            if ($totalNodeCount -le 2 -and $readyNodeCount -eq 2 -and $pendingCount -eq 0) { break }
+            if ($totalNodeCount -le 3 -and $readyNodeCount -eq 3 -and $pendingCount -eq 0) { break }
             Start-Sleep -Seconds 5
         } while ([datetime]::UtcNow -lt $nodeDeadline)
-        if ($totalNodeCount -gt 2 -or $readyNodeCount -ne 2 -or $pendingCount -gt 0) {
-            throw "LOAD_PREPARE_TIMEOUT: 2-node 수렴 실패(Node=$totalNodeCount ReadyNode=$readyNodeCount Pending=$pendingCount)"
+        if ($totalNodeCount -gt 3 -or $readyNodeCount -ne 3 -or $pendingCount -gt 0) {
+            throw "LOAD_PREPARE_TIMEOUT: 3-node scoring 수렴 실패(Node=$totalNodeCount ReadyNode=$readyNodeCount Pending=$pendingCount)"
         }
 
         foreach ($app in $MutationOrder) {
-            $restorePatch = @{ spec = @{ minReplicas = [int]$BaselineFloor[$app]; maxReplicas = [int]$MaxSafetyCap[$app]; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = $ScaleDownStabilizationSeconds } } } } | ConvertTo-Json -Compress -Depth 8
+            $restorePatch = @{ spec = @{ minReplicas = [int]$LoadFloor[$app]; maxReplicas = [int]$MaxSafetyCap[$app]; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = $ScaleDownStabilizationSeconds } } } } | ConvertTo-Json -Compress -Depth 8
             Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $restorePatch) | Out-Null
         }
-        Write-Host '[준비] baseline floor/2-node Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
+        Write-Host '[준비] scoring floor/3-node Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
     } finally {
         Invoke-Kubectl @('patch', 'nodepool', $StressNodePool, '--type=merge', '-p', $normalConsolidation) -AllowFailure | Out-Null
     }
@@ -618,7 +623,7 @@ function Get-Recommendation([string]$App) {
     } else { [int]$latest.Max }
     $hotObserved = @($metrics | Where-Object { $_.Ready -ge 2 -and $_.CpuMaxM -ge $HotCpuM[$App] -and $_.HotRatio -ge 2.5 }).Count -gt 0
     $requestsObserved = [int](($metrics.Requests | Measure-Object -Sum).Sum) -gt 0
-    $active = $requestsObserved -or $maxCpu -ge $ActivityCpuM[$App] -or $maxDesired -gt $baseline.Min
+    $active = $requestsObserved -or $maxCpu -ge $ActivityCpuM[$App] -or $maxDesired -gt $latest.Min
     $pressure = $maxDesired -gt $latest.Min -or ($latest.TargetUtil -gt 0 -and $maxUtil -ge [math]::Floor($latest.TargetUtil * 0.85))
 
     $idle = $false
@@ -874,8 +879,9 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
     if ($BaselineFloor.user -ne 2 -or $BaselineFloor.product -ne 2 -or $BaselineFloor.stress -ne 2) { $failures.Add('2-node baseline floor') }
-    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 2) { $failures.Add('앱별 traffic warm floor') }
-    if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 4) { $failures.Add('앱별 pressure floor') }
+    if ($LoadFloor.user -ne 2 -or $LoadFloor.product -ne 2 -or $LoadFloor.stress -ne 4) { $failures.Add('3-node scoring load floor') }
+    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('앱별 traffic warm floor') }
+    if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 6) { $failures.Add('앱별 pressure floor') }
     if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
     if ([math]::Abs((70 * 0.33) - 23.1) -gt 0.1) { $failures.Add('user control point') }
     if ($StressCpuRequest -ne '600m' -or $HpaTargetUtilization.stress -ne 55 -or $MaxSafetyCap.stress -ne 8) { $failures.Add('stress two-pods-per-node profile') }
@@ -894,7 +900,7 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ stress = $pressure } }
     )
     $recommendation = Get-Recommendation 'stress'
-    if ($recommendation.TargetMin -ne 4) { $failures.Add('stress pressure min 추천') }
+    if ($recommendation.TargetMin -ne 6) { $failures.Add('stress pressure min 추천') }
     if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
@@ -941,7 +947,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 22/22' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 23/23' -ForegroundColor Green
 }
 
 if ($SelfTest) {
@@ -961,7 +967,7 @@ try {
     $mode = if ($ObserveOnly) { 'OBSERVE' } else { 'SAFE-AUTO' }
     if ($WhatIfPreference) { $mode = 'WHATIF' }
     Write-Host "WSC LIVE TUNER 시작: mode=$mode interval=${IntervalSeconds}s log=$script:LogPath" -ForegroundColor Green
-    Write-Host '추가 트래픽/API/DB/Terraform 변경 없음. 시작 시 검증된 2-node 프로필로 수렴하며 부하에서만 prewarm한다. 종료: Ctrl+C' -ForegroundColor DarkGray
+    Write-Host '추가 트래픽/API/DB/Terraform 변경 없음. idle은 2-node, scoring 준비는 3-node prewarm으로 수렴한다. 종료: Ctrl+C' -ForegroundColor DarkGray
 
     do {
         try {

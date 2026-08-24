@@ -95,7 +95,7 @@ function Wait-ObserveReady {
             }
             $pending = @(kubectl get pods -n app --field-selector=status.phase=Pending -o name 2>$null)
             $readyNodes = @(kubectl get nodes --no-headers 2>$null | Where-Object { $_ -match '\sReady\s' }).Count
-            if ($ready -and $pending.Count -eq 0 -and $readyNodes -le 2) {
+            if ($ready -and $pending.Count -eq 0 -and $readyNodes -le 3) {
                 Write-Host "  observer 준비 완료: warm Pod Ready, Pending=0, ReadyNode=$readyNodes" -ForegroundColor Green
                 return
             }
