@@ -3,8 +3,10 @@
     실제 유입 트래픽을 관측하면서 안전한 HPA 항목만 자동 조정한다.
 .DESCRIPTION
     인자 없이 실행한다. 추가 트래픽을 만들지 않고 Kubernetes metrics와 애플리케이션
-    JSON access log를 분석한다. 트래픽/CPU 편중/HPA 압력이 확인되면 warm minReplicas와
-    scale-down stabilization만 조정하고, 유휴가 지속되면 시작 전 기준으로 복구한다.
+    JSON access log를 분석한다. 트래픽/CPU 편중/HPA 압력이 확인되면 warm minReplicas,
+    maxReplicas와 scale-down stabilization을 조정하고, 유휴가 지속되면 minReplicas와
+    scale-down stabilization을 시작 전 기준으로 복구한다. maxReplicas는 비용을 직접
+    발생시키지 않으므로 자동 축소하지 않는다.
 
     Deployment, resource request/limit, NodePool, Terraform은 변경하지 않는다.
     Ctrl+C로 종료하며 결과는 임시 디렉터리의 JSONL 파일에 기록한다.
@@ -31,6 +33,8 @@ $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
 $WarmFloor = @{ user = 2; product = 2; stress = 4 }
+$MaxSafetyCap = @{ user = 40; product = 40; stress = 12 }
+$MaxIncreaseRatio = 1.25
 $ActivityCpuM = @{ user = 15.0; product = 15.0; stress = 250.0 }
 $HotCpuM = @{ user = 50.0; product = 50.0; stress = 500.0 }
 $script:History = @()
@@ -97,6 +101,14 @@ function Get-HpaScaleDownSeconds($Hpa) {
     $value = $Hpa.spec.behavior.scaleDown.stabilizationWindowSeconds
     if ($null -eq $value) { return 300 }
     return [int]$value
+}
+
+function Get-HpaMaxTarget([int]$CurrentMax, [int]$UncappedDesired, [int]$SafetyCap) {
+    if ($CurrentMax -ge $SafetyCap) { return $CurrentMax }
+    $lower = [int][math]::Ceiling($CurrentMax * 1.20)
+    $upper = [int][math]::Ceiling($CurrentMax * $MaxIncreaseRatio)
+    $bounded = [int][math]::Min($upper, [math]::Max($lower, $UncappedDesired))
+    return [int][math]::Min($SafetyCap, [math]::Max($CurrentMax + 1, $bounded))
 }
 
 function Initialize-Baseline {
@@ -256,6 +268,16 @@ function Get-Recommendation([string]$App) {
     $maxCpu = [double](($metrics.CpuTotalM | Measure-Object -Maximum).Maximum)
     $maxDesired = [int](($metrics.Desired | Measure-Object -Maximum).Maximum)
     $maxUtil = [int](($metrics.CurrentUtil | Measure-Object -Maximum).Maximum)
+    $minimumCeilingSamples = [math]::Max(2, [math]::Ceiling($window.Count / 2.0))
+    $ceilingMetrics = @($metrics | Where-Object {
+        $_.Desired -ge $_.Max -and $_.Current -ge $_.Max -and $_.Ready -ge $_.Current -and
+        $_.Pending -eq 0 -and $_.TargetUtil -gt 0 -and $_.CurrentUtil -gt $_.TargetUtil
+    })
+    $uncappedDesired = if ($ceilingMetrics.Count) {
+        [int](($ceilingMetrics | ForEach-Object {
+            [math]::Ceiling([double]$_.Current * [double]$_.CurrentUtil / [math]::Max(1.0, [double]$_.TargetUtil))
+        } | Measure-Object -Maximum).Maximum)
+    } else { [int]$latest.Max }
     $hotObserved = @($metrics | Where-Object { $_.Ready -ge 2 -and $_.CpuMaxM -ge $HotCpuM[$App] -and $_.HotRatio -ge 2.5 }).Count -gt 0
     $requestsObserved = [int](($metrics.Requests | Measure-Object -Sum).Sum) -gt 0
     $active = $requestsObserved -or $maxCpu -ge $ActivityCpuM[$App] -or $maxDesired -gt $baseline.Min
@@ -273,10 +295,15 @@ function Get-Recommendation([string]$App) {
     }
 
     $targetMin = [int]$latest.Min
+    $targetMax = [int]$latest.Max
     $targetScaleDown = [int]$latest.ScaleDownSeconds
     $reason = 'HOLD'
     if ($window.Count -lt 2) {
         $reason = 'WARMUP'
+    } elseif ($active -and $ceilingMetrics.Count -ge $minimumCeilingSamples -and $latest.Max -lt $MaxSafetyCap[$App]) {
+        $targetMax = Get-HpaMaxTarget ([int]$latest.Max) $uncappedDesired ([int]$MaxSafetyCap[$App])
+        $targetScaleDown = [math]::Max([int]$baseline.ScaleDownSeconds, $ScaleDownStabilizationSeconds)
+        $reason = 'HPA_MAX_PRESSURE'
     } elseif ($active -and ($pressure -or $hotObserved)) {
         $warmCap = [math]::Min([int]$baseline.Max, [math]::Max([int]$baseline.Min, [int]$WarmFloor[$App]))
         $targetMin = [math]::Min($warmCap, [math]::Max([int]$baseline.Min, $maxDesired))
@@ -295,16 +322,20 @@ function Get-Recommendation([string]$App) {
         HotObserved = $hotObserved
         CurrentMin = [int]$latest.Min
         TargetMin = [int]$targetMin
+        CurrentMax = [int]$latest.Max
+        TargetMax = [int]$targetMax
         CurrentScaleDown = [int]$latest.ScaleDownSeconds
         TargetScaleDown = [int]$targetScaleDown
         MaxCpuM = [math]::Round($maxCpu, 1)
         MaxDesired = $maxDesired
         MaxUtil = $maxUtil
+        CeilingSamples = [int]$ceilingMetrics.Count
+        UncappedDesired = [int]$uncappedDesired
     }
 }
 
 function Set-SafeHpaState($Recommendation) {
-    if ($Recommendation.CurrentMin -eq $Recommendation.TargetMin -and $Recommendation.CurrentScaleDown -eq $Recommendation.TargetScaleDown) {
+    if ($Recommendation.CurrentMin -eq $Recommendation.TargetMin -and $Recommendation.CurrentMax -eq $Recommendation.TargetMax -and $Recommendation.CurrentScaleDown -eq $Recommendation.TargetScaleDown) {
         return $false
     }
     if (([datetime]::UtcNow - $script:LastMutationUtc).TotalSeconds -lt $DecisionWindowSeconds) {
@@ -312,7 +343,7 @@ function Set-SafeHpaState($Recommendation) {
     }
     $app = [string]$Recommendation.App
     $baseline = $script:Baseline[$app]
-    $description = "HPA/$app min $($Recommendation.CurrentMin)->$($Recommendation.TargetMin), scaleDown $($Recommendation.CurrentScaleDown)->$($Recommendation.TargetScaleDown)s ($($Recommendation.Reason))"
+    $description = "HPA/$app min $($Recommendation.CurrentMin)->$($Recommendation.TargetMin), max $($Recommendation.CurrentMax)->$($Recommendation.TargetMax), scaleDown $($Recommendation.CurrentScaleDown)->$($Recommendation.TargetScaleDown)s ($($Recommendation.Reason))"
     if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/HPA/$app", $description)) {
         Write-Host "[권고] $description" -ForegroundColor Yellow
         return $false
@@ -327,6 +358,7 @@ function Set-SafeHpaState($Recommendation) {
         }
         spec = [ordered]@{
             minReplicas = [int]$Recommendation.TargetMin
+            maxReplicas = [int]$Recommendation.TargetMax
             behavior = [ordered]@{
                 scaleDown = [ordered]@{ stabilizationWindowSeconds = [int]$Recommendation.TargetScaleDown }
             }
@@ -338,15 +370,16 @@ function Set-SafeHpaState($Recommendation) {
         Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $patch) | Out-Null
         $verify = Get-KubeJson @('-n', $Namespace, 'get', 'hpa', $app, '-o', 'json')
         $verifiedMin = [int]$verify.spec.minReplicas
+        $verifiedMax = [int]$verify.spec.maxReplicas
         $verifiedScaleDown = Get-HpaScaleDownSeconds $verify
-        if ($verifiedMin -ne $Recommendation.TargetMin -or $verifiedScaleDown -ne $Recommendation.TargetScaleDown) {
-            throw "검증 불일치: min=$verifiedMin scaleDown=$verifiedScaleDown"
+        if ($verifiedMin -ne $Recommendation.TargetMin -or $verifiedMax -ne $Recommendation.TargetMax -or $verifiedScaleDown -ne $Recommendation.TargetScaleDown) {
+            throw "검증 불일치: min=$verifiedMin max=$verifiedMax scaleDown=$verifiedScaleDown"
         }
         $script:LastMutationUtc = [datetime]::UtcNow
         return $true
     } catch {
         Write-Warning "적용 실패, HPA/$app 기준값 복구: $($_.Exception.Message)"
-        $rollback = @{ spec = @{ minReplicas = [int]$Recommendation.CurrentMin; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = [int]$Recommendation.CurrentScaleDown } } } } | ConvertTo-Json -Compress -Depth 8
+        $rollback = @{ spec = @{ minReplicas = [int]$Recommendation.CurrentMin; maxReplicas = [int]$Recommendation.CurrentMax; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = [int]$Recommendation.CurrentScaleDown } } } } | ConvertTo-Json -Compress -Depth 8
         Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $rollback) -AllowFailure | Out-Null
         return $false
     }
@@ -368,6 +401,7 @@ function Show-Snapshot($Snapshot, $Recommendations) {
             Err = $m.Errors
             P95ms = if ($null -eq $m.P95Ms) { '-' } else { [math]::Round([double]$m.P95Ms, 1) }
             Min = "$($m.Min)->$($r.TargetMin)"
+            Max = "$($m.Max)->$($r.TargetMax)"
             Decision = $r.Reason
         }
     }
@@ -395,10 +429,27 @@ function Invoke-SelfTest {
     $recommendation = Get-Recommendation 'stress'
     if ($recommendation.TargetMin -ne 4) { $failures.Add('stress warm min 추천') }
     if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
+    $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
+    $ceiling = [pscustomobject]@{
+        Ready = 20; Pending = 0; Current = 20; Desired = 20; Min = 2; Max = 20
+        CurrentUtil = 70; TargetUtil = 33; ScaleDownSeconds = 0
+        CpuTotalM = 980.0; CpuAverageM = 49.0; CpuMaxM = 60.0; HotRatio = 1.22
+        Requests = 20; Errors = 0; ErrorRate = 0.0; P95Ms = 220.0
+    }
+    $script:History = @(
+        [pscustomobject]@{ TimestampUtc = $now.AddSeconds(-5).ToString('o'); Apps = @{ user = $ceiling } },
+        [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $ceiling } }
+    )
+    $maxRecommendation = Get-Recommendation 'user'
+    if ($maxRecommendation.Reason -ne 'HPA_MAX_PRESSURE' -or $maxRecommendation.TargetMax -ne 25) { $failures.Add('HPA max bounded +25% 추천') }
+    $ceiling.Pending = 1
+    $blockedRecommendation = Get-Recommendation 'user'
+    if ($blockedRecommendation.TargetMax -ne 20) { $failures.Add('Pending 중 HPA max 확장 차단') }
+    if ((Get-HpaMaxTarget 38 100 40) -ne 40) { $failures.Add('HPA max safety cap') }
     $script:History = @()
     $script:Baseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 6/6' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 9/9' -ForegroundColor Green
 }
 
 if ($SelfTest) {
@@ -416,7 +467,7 @@ try {
     $mode = if ($ObserveOnly) { 'OBSERVE' } else { 'SAFE-AUTO' }
     if ($WhatIfPreference) { $mode = 'WHATIF' }
     Write-Host "WSC LIVE TUNER 시작: mode=$mode interval=${IntervalSeconds}s log=$script:LogPath" -ForegroundColor Green
-    Write-Host '추가 트래픽/Deployment rollout/NodePool/Terraform 변경 없음. 종료: Ctrl+C' -ForegroundColor DarkGray
+    Write-Host '추가 트래픽/Deployment rollout/NodePool/Terraform 변경 없음. HPA max는 포화 시 bounded 확장하며 자동 축소하지 않음. 종료: Ctrl+C' -ForegroundColor DarkGray
 
     do {
         try {

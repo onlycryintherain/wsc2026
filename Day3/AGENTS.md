@@ -321,6 +321,7 @@ Invoke-RestMethod -Method Post -Uri "$LoadServer/api/load/stop" `
 | 2026-08-20 | pending | `tune.ps1` 개선 — 38점 앱 세트 BASE seed를 live 오염 상태가 아닌 재현 구성(70m/70m/600m, HPA 33/29/55, min 2/2/1)으로 고정하고, 외부 부하 결과의 잘못된 EC2 telemetry(reported 1 vs actual 3)를 진단 import/경고하며 최종 적용 config를 BASE 결과에 저장 |
 
 | 날짜 | 커밋 | 변경 요약 |
+| 2026-08-25 | pending | `observe-live.ps1`이 user/product HPA 20/20 포화에서도 Max를 고정하던 문제 수정. 결정 창 절반 이상 CPU ceiling·Ready 충족·Pending 0일 때만 Max를 회당 최대 25% 확대하고 user/product 40·stress 12 안전 상한, 앱당 순차 변경, 적용 검증 실패 시 Max 포함 rollback을 추가. 유휴 시 비용을 직접 만들지 않는 Max는 자동 축소하지 않음. |
 | 2026-08-18 | pending | `bastion_setup.sh`/EKS Launch Template에 38점 기준 반영 — CNI prefix+warm prefix, MNG/Karpenter maxPods=110, user/product 70m·256Mi, stress 600m·2CPU·dedicated NodePool, HPA 33/29/55 및 20/20/6 |
 | 2026-08-18 | pending | `tools/apply-38point.ps1` 추가 — CNI prefix delegation, maxPods=110, user/product/stress 38점 리소스/HPA, stress dedicated NodePool/taint/selector를 재현하고 MNG Launch Template 갱신은 명시적 opt-in |
 | 2026-08-18 | pending | tune BASE 분기 종료 시 GRADING_READY finalize 추가 — stress 전용 NodePool/selector 제거, shared placement, min replica warm(2/2/1), HPA max 유지, Karpenter 노드 예산 대기 |
