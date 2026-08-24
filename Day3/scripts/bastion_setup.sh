@@ -509,17 +509,8 @@ spec:
       labels:
         app: stress
     spec:
-      # 시작 시에는 Managed node를 공유한다. 부하로 새 Pod가 Pending 되면 아래 preferred
-      # affinity + NodePool weight가 stress 전용 노드를 선택해 간섭을 단계적으로 분리한다.
-      affinity:
-        nodeAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            preference:
-              matchExpressions:
-              - key: workload-class
-                operator: In
-                values: ["stress"]
+      # 시작 시에는 Managed node를 공유한다. 공유 용량이 부족해 Pod가 스케줄 불가능해지면
+      # stress toleration + NodePool weight가 전용 pool을 우선 선택한다.
       tolerations:
       - key: wsi2026.io/stress
         operator: Equal
