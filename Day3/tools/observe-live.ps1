@@ -438,4 +438,3 @@ try {
     if ($hasMutex) { $mutex.ReleaseMutex() }
     $mutex.Dispose()
 }
-
