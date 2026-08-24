@@ -28,6 +28,7 @@ param(
     [ValidateRange(120, 1800)][int]$IdleRestoreSeconds = 300,
     [switch]$ObserveOnly,
     [switch]$SkipStartupProfile,
+    [switch]$PrepareForLoad,
     [switch]$Once,
     [switch]$SelfTest
 )
@@ -36,16 +37,16 @@ $ErrorActionPreference = 'Stop'
 $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
-# 0.5x 60분 실측 39/40(run-1787385221)의 절대 control point를 시작점으로 쓴다.
-# 저부하 floor와 압력 floor는 모두 t3.medium 2대(Managed 1 + stress 1)에 pack된다.
-$BaselineFloor = @{ user = 2; product = 2; stress = 1 }
-$WarmFloor = @{ user = 4; product = 2; stress = 2 }
-$PressureFloor = @{ user = 6; product = 4; stress = 3 }
+# 0.5x 60분 39/40(run-1787385221)의 control point를 보존한다. 현재 바이너리의
+# keep-alive 연결 편중을 막기 위해 stress 4개를 부하 전에 한 노드에 prewarm한다.
+$BaselineFloor = @{ user = 2; product = 2; stress = 4 }
+$WarmFloor = @{ user = 4; product = 2; stress = 4 }
+$PressureFloor = @{ user = 6; product = 4; stress = 6 }
 $MaxSafetyCap = @{ user = 20; product = 20; stress = 12 }
-$HpaTargetUtilization = @{ user = 33; product = 29; stress = 60 }
+$HpaTargetUtilization = @{ user = 33; product = 29; stress = 83 }
 $UserCpuRequest = '70m'
 $ProductCpuRequest = '70m'
-$StressCpuRequest = '550m'
+$StressCpuRequest = '400m'
 $StressNodePool = 'stress'
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
 $NodePoolSafetyCapNodes = @{ default = 1; stress = 4 }
@@ -262,7 +263,7 @@ function Initialize-PerformanceProfile {
     $stressContainer = [string]$stressDeployment.spec.template.spec.containers[0].name
     $currentStressRequest = [string]$stressDeployment.spec.template.spec.containers[0].resources.requests.cpu
     if ($currentStressRequest -ne $StressCpuRequest) {
-        $description = "Deployment/stress CPU request $currentStressRequest->$StressCpuRequest (3 Pod/Node, control point 330m 보존)"
+        $description = "Deployment/stress CPU request $currentStressRequest->$StressCpuRequest (4 Pod/Node, control point 332m 보존)"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
@@ -353,6 +354,42 @@ function Initialize-PerformanceProfile {
             }
         }
     }
+}
+
+function Reset-IdleStateForLoad {
+    if (-not $PrepareForLoad -or $ObserveOnly -or $WhatIfPreference) { return }
+
+    Write-Host '[준비] 이전 run replica/CPU backlog를 baseline floor로 정리' -ForegroundColor Cyan
+    foreach ($app in $MutationOrder) {
+        $floor = [int]$BaselineFloor[$app]
+        $lockPatch = @{ spec = @{ minReplicas = $floor; maxReplicas = $floor; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = 0 } } } } | ConvertTo-Json -Compress -Depth 8
+        Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $lockPatch) | Out-Null
+        Invoke-Kubectl @('-n', $Namespace, 'scale', "deployment/$app", "--replicas=$floor") | Out-Null
+    }
+
+    $deadline = [datetime]::UtcNow.AddSeconds(180)
+    do {
+        $deployments = Get-KubeJson @('-n', $Namespace, 'get', 'deployment', '-o', 'json')
+        $ready = $true
+        foreach ($app in $ManagedApps) {
+            $deployment = @($deployments.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
+            $floor = [int]$BaselineFloor[$app]
+            if (-not $deployment -or [int]$deployment.status.replicas -ne $floor -or
+                [int]$deployment.status.readyReplicas -ne $floor -or [int]$deployment.status.unavailableReplicas -gt 0) {
+                $ready = $false
+                break
+            }
+        }
+        if ($ready) { break }
+        Start-Sleep -Seconds 3
+    } while ([datetime]::UtcNow -lt $deadline)
+    if (-not $ready) { throw 'LOAD_PREPARE_TIMEOUT: baseline Deployment Ready 실패' }
+
+    foreach ($app in $MutationOrder) {
+        $restorePatch = @{ spec = @{ minReplicas = [int]$BaselineFloor[$app]; maxReplicas = [int]$MaxSafetyCap[$app]; behavior = @{ scaleDown = @{ stabilizationWindowSeconds = $ScaleDownStabilizationSeconds } } } } | ConvertTo-Json -Compress -Depth 8
+        Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', $app, '--type=merge', '-p', $restorePatch) | Out-Null
+    }
+    Write-Host '[준비] baseline floor Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
 }
 
 function Get-AccessLogMetric([string]$App) {
@@ -773,13 +810,13 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($BaselineFloor.user -ne 2 -or $BaselineFloor.product -ne 2 -or $BaselineFloor.stress -ne 1) { $failures.Add('2-node baseline floor') }
-    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 2) { $failures.Add('앱별 traffic warm floor') }
-    if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 3) { $failures.Add('앱별 pressure floor') }
+    if ($BaselineFloor.user -ne 2 -or $BaselineFloor.product -ne 2 -or $BaselineFloor.stress -ne 4) { $failures.Add('2-node baseline floor') }
+    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 4) { $failures.Add('앱별 traffic warm floor') }
+    if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 6) { $failures.Add('앱별 pressure floor') }
     if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
     if ([math]::Abs((70 * 0.33) - 23.1) -gt 0.1) { $failures.Add('user control point') }
-    if ($StressCpuRequest -ne '550m' -or $HpaTargetUtilization.stress -ne 60) { $failures.Add('stress packed profile') }
-    if ([math]::Abs((550 * 0.60) - (600 * 0.55)) -gt 0.1) { $failures.Add('stress control point 보존') }
+    if ($StressCpuRequest -ne '400m' -or $HpaTargetUtilization.stress -ne 83) { $failures.Add('stress packed prewarm profile') }
+    if ([math]::Abs((400 * 0.83) - (600 * 0.55)) -gt 2.1) { $failures.Add('stress control point 보존') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -793,7 +830,7 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ stress = $pressure } }
     )
     $recommendation = Get-Recommendation 'stress'
-    if ($recommendation.TargetMin -ne 3) { $failures.Add('stress pressure min 추천') }
+    if ($recommendation.TargetMin -ne 6) { $failures.Add('stress pressure min 추천') }
     if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
@@ -856,6 +893,7 @@ try {
     Test-Prerequisites
     Initialize-Baseline
     Initialize-PerformanceProfile
+    Reset-IdleStateForLoad
     $mode = if ($ObserveOnly) { 'OBSERVE' } else { 'SAFE-AUTO' }
     if ($WhatIfPreference) { $mode = 'WHATIF' }
     Write-Host "WSC LIVE TUNER 시작: mode=$mode interval=${IntervalSeconds}s log=$script:LogPath" -ForegroundColor Green

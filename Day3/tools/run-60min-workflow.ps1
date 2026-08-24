@@ -66,7 +66,7 @@ function Get-ScoreVerified {
 }
 
 function Start-Observe {
-    $args = @('-NoProfile', '-NonInteractive', '-File', $ObserveScript)
+    $args = @('-NoProfile', '-NonInteractive', '-File', $ObserveScript, '-PrepareForLoad')
     if ($SkipStartupProfile) { $args += '-SkipStartupProfile' }
     $observeLog = Join-Path ([IO.Path]::GetTempPath()) ("wsi-60min-observe-{0}.log" -f (Get-Date -Format 'HHmmss'))
     Write-Host "  observe-live 시작: $ObserveScript (log=$observeLog)" -ForegroundColor DarkCyan
@@ -94,8 +94,9 @@ function Wait-ObserveReady {
                 }
             }
             $pending = @(kubectl get pods -n app --field-selector=status.phase=Pending -o name 2>$null)
-            if ($ready -and $pending.Count -eq 0) {
-                Write-Host '  observer 준비 완료: warm Pod Ready, Pending=0' -ForegroundColor Green
+            $readyNodes = @(kubectl get nodes --no-headers 2>$null | Where-Object { $_ -match '\sReady\s' }).Count
+            if ($ready -and $pending.Count -eq 0 -and $readyNodes -le 2) {
+                Write-Host "  observer 준비 완료: warm Pod Ready, Pending=0, ReadyNode=$readyNodes" -ForegroundColor Green
                 return
             }
         } catch { }
