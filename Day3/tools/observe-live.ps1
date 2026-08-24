@@ -38,17 +38,20 @@ $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
 # 0.5x 60분 39/40(run-1787385221)의 control point를 보존한다. 현재 바이너리의
-# keep-alive 연결 편중을 막기 위해 stress 2개를 부하 전에 한 노드에 prewarm한다.
-# 600m은 t3.medium allocatable 1930m에서 daemon overhead를 포함해 노드당 정확히 2 Pod만 허용한다.
-$BaselineFloor = @{ user = 1; product = 1; stress = 1 }
-$LoadFloor = @{ user = 1; product = 1; stress = 1 }
-$WarmFloor = @{ user = 4; product = 2; stress = 1 }
+# keep-alive 연결 편중을 막기 위해 shared에서는 stress 2개를 350m으로 한 노드에 prewarm한다.
+# 격리 시 600m으로 올려 t3.medium allocatable 1930m에서 노드당 정확히 2 Pod만 허용한다.
+$BaselineFloor = @{ user = 2; product = 2; stress = 2 }
+$LoadFloor = @{ user = 2; product = 2; stress = 2 }
+$WarmFloor = @{ user = 4; product = 2; stress = 2 }
 $PressureFloor = @{ user = 6; product = 4; stress = 6 }
 $MaxSafetyCap = @{ user = 20; product = 20; stress = 8 }
-$HpaTargetUtilization = @{ user = 33; product = 29; stress = 55 }
+$HpaTargetUtilization = @{ user = 33; product = 29; stress = 90 }
 $UserCpuRequest = '70m'
 $ProductCpuRequest = '70m'
-$StressCpuRequest = '600m'
+$SharedStressCpuRequest = '350m'
+$IsolatedStressCpuRequest = '600m'
+$SharedStressTargetUtilization = 90
+$IsolatedStressTargetUtilization = 55
 $StressNodePool = 'stress'
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
 $NodePoolSafetyCapNodes = @{ default = 1; stress = 4 }
@@ -110,7 +113,7 @@ function Get-KubeJson([string[]]$Arguments) {
     return $raw | ConvertFrom-Json
 }
 
-function Set-DeploymentPlacementSelector([string]$App, $Selector, [string]$Placement, [string]$Reason) {
+function Set-DeploymentPlacementSelector([string]$App, $Selector, [string]$Placement, [string]$Reason, [string]$CpuRequest = '') {
     $operations = [System.Collections.Generic.List[object]]::new()
     if ($null -eq $Selector) {
         $operations.Add(@{ op = 'remove'; path = '/spec/template/spec/nodeSelector' })
@@ -120,6 +123,9 @@ function Set-DeploymentPlacementSelector([string]$App, $Selector, [string]$Place
     }
     $operations.Add(@{ op = 'add'; path = '/spec/template/metadata/annotations/wsi2026.io~1live-placement'; value = $Placement })
     $operations.Add(@{ op = 'add'; path = '/spec/template/metadata/annotations/wsi2026.io~1live-placement-reason'; value = $Reason })
+    if (-not [string]::IsNullOrWhiteSpace($CpuRequest)) {
+        $operations.Add(@{ op = 'add'; path = '/spec/template/spec/containers/0/resources/requests/cpu'; value = $CpuRequest })
+    }
     $patch = $operations | ConvertTo-Json -Compress -Depth 10
     Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', $App, '--type=json', '-p', $patch) | Out-Null
 }
@@ -292,15 +298,20 @@ function Initialize-PerformanceProfile {
 
     $stressContainer = [string]$stressDeployment.spec.template.spec.containers[0].name
     $currentStressRequest = [string]$stressDeployment.spec.template.spec.containers[0].resources.requests.cpu
-    if ($currentStressRequest -ne $StressCpuRequest) {
-        $description = "Deployment/stress CPU request $currentStressRequest->$StressCpuRequest (2 Pod/Node, control point 330m 보존)"
+    $startupStressPool = [string]$stressDeployment.spec.template.spec.nodeSelector.'karpenter.sh/nodepool'
+    $startupSelectorCount = @($stressDeployment.spec.template.spec.nodeSelector.PSObject.Properties).Count
+    $startupIsolated = -not $PrepareForLoad -and $startupStressPool -eq $StressNodePool -and $startupSelectorCount -eq 1
+    $targetStressRequest = if ($startupIsolated) { $IsolatedStressCpuRequest } else { $SharedStressCpuRequest }
+    $targetStressUtilization = if ($startupIsolated) { $IsolatedStressTargetUtilization } else { $SharedStressTargetUtilization }
+    if ($currentStressRequest -ne $targetStressRequest) {
+        $description = "Deployment/stress CPU request $currentStressRequest->$targetStressRequest (placement-aware density)"
         if ($ObserveOnly -or -not $PSCmdlet.ShouldProcess("$Namespace/Deployment/stress", $description)) {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
             $patch = @{
                 spec = @{ template = @{
                     metadata = @{ annotations = @{ 'wsi2026.io/live-profile' = 'elastic-39point-v1' } }
-                    spec = @{ containers = @(@{ name = $stressContainer; resources = @{ requests = @{ cpu = $StressCpuRequest } } }) }
+                    spec = @{ containers = @(@{ name = $stressContainer; resources = @{ requests = @{ cpu = $targetStressRequest } } }) }
                 } }
             } | ConvertTo-Json -Compress -Depth 12
             Write-Host "[적용/rollout/비용주의] $description" -ForegroundColor Magenta
@@ -335,7 +346,7 @@ function Initialize-PerformanceProfile {
             Write-Host "[권고] $description" -ForegroundColor Yellow
         } else {
             Write-Host "[적용/rollout] $description" -ForegroundColor Cyan
-            Set-DeploymentPlacementSelector 'stress' @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } 'shared' 'PREPARE_FOR_LOAD'
+            Set-DeploymentPlacementSelector 'stress' @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup } 'shared' 'PREPARE_FOR_LOAD' $SharedStressCpuRequest
         }
     }
 
@@ -374,7 +385,7 @@ function Initialize-PerformanceProfile {
         $hpa = @($hpas.items | Where-Object { $_.metadata.name -eq $app } | Select-Object -First 1)
         $targetMin = [int]$BaselineFloor[$app]
         $targetMax = [int]$MaxSafetyCap[$app]
-        $targetUtil = [int]$HpaTargetUtilization[$app]
+        $targetUtil = if ($app -eq 'stress') { [int]$targetStressUtilization } else { [int]$HpaTargetUtilization[$app] }
         $currentUtil = [int]$hpa.spec.metrics[0].resource.target.averageUtilization
         if ([int]$hpa.spec.minReplicas -eq $targetMin -and [int]$hpa.spec.maxReplicas -eq $targetMax -and
             $currentUtil -eq $targetUtil -and (Get-HpaScaleDownSeconds $hpa) -eq $ScaleDownStabilizationSeconds) { continue }
@@ -418,7 +429,7 @@ function Initialize-PerformanceProfile {
                 }
             }
         }
-        if ([string]$verifyStress.spec.template.spec.containers[0].resources.requests.cpu -ne $StressCpuRequest) {
+        if ([string]$verifyStress.spec.template.spec.containers[0].resources.requests.cpu -ne $targetStressRequest) {
             throw '시작 프로필 검증 실패: stress CPU request'
         }
         if ($PrepareForLoad -and [string]$verifyStress.spec.template.spec.nodeSelector.'eks.amazonaws.com/nodegroup' -ne $script:ManagedNodeGroup) {
@@ -806,8 +817,17 @@ function Set-DynamicStressPlacement($Recommendation) {
     } else {
         @{ 'eks.amazonaws.com/nodegroup' = $script:ManagedNodeGroup }
     }
+    $cpuRequest = if ($target -eq 'ISOLATED') { $IsolatedStressCpuRequest } else { $SharedStressCpuRequest }
+    $targetUtilization = if ($target -eq 'ISOLATED') { $IsolatedStressTargetUtilization } else { $SharedStressTargetUtilization }
     Write-Host "[배치전환/rollout] $description" -ForegroundColor Magenta
-    Set-DeploymentPlacementSelector 'stress' $selector $target.ToLowerInvariant() ([string]$Recommendation.Reason)
+    Set-DeploymentPlacementSelector 'stress' $selector $target.ToLowerInvariant() ([string]$Recommendation.Reason) $cpuRequest
+    $hpaPatch = @{
+        spec = @{ metrics = @(@{
+            type = 'Resource'
+            resource = @{ name = 'cpu'; target = @{ type = 'Utilization'; averageUtilization = [int]$targetUtilization } }
+        }) }
+    } | ConvertTo-Json -Compress -Depth 10
+    Invoke-Kubectl @('-n', $Namespace, 'patch', 'hpa', 'stress', '--type=merge', '-p', $hpaPatch) | Out-Null
     $script:LastPlacementMutationUtc['stress'] = [datetime]::UtcNow
     return $true
 }
@@ -1008,16 +1028,17 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($BaselineFloor.user -ne 1 -or $BaselineFloor.product -ne 1 -or $BaselineFloor.stress -ne 1) { $failures.Add('1-node shared baseline floor') }
-    if ($LoadFloor.user -ne 1 -or $LoadFloor.product -ne 1 -or $LoadFloor.stress -ne 1) { $failures.Add('1-node scoring load floor') }
-    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 1) { $failures.Add('앱별 traffic warm floor') }
+    if ($BaselineFloor.user -ne 2 -or $BaselineFloor.product -ne 2 -or $BaselineFloor.stress -ne 2) { $failures.Add('1-node shared baseline floor') }
+    if ($LoadFloor.user -ne 2 -or $LoadFloor.product -ne 2 -or $LoadFloor.stress -ne 2) { $failures.Add('1-node scoring load floor') }
+    if ($WarmFloor.user -ne 4 -or $WarmFloor.product -ne 2 -or $WarmFloor.stress -ne 2) { $failures.Add('앱별 traffic warm floor') }
     if ($PressureFloor.user -ne 6 -or $PressureFloor.product -ne 4 -or $PressureFloor.stress -ne 6) { $failures.Add('앱별 pressure floor') }
     if ($UserCpuRequest -ne '70m' -or $ProductCpuRequest -ne '70m' -or $HpaTargetUtilization.user -ne 33) { $failures.Add('foreground 39point profile') }
     if ([math]::Abs((70 * 0.33) - 23.1) -gt 0.1) { $failures.Add('user control point') }
-    if ($StressCpuRequest -ne '600m' -or $HpaTargetUtilization.stress -ne 55 -or $MaxSafetyCap.stress -ne 8) { $failures.Add('stress two-pods-per-node profile') }
+    if ($SharedStressCpuRequest -ne '350m' -or $SharedStressTargetUtilization -ne 90) { $failures.Add('stress shared density profile') }
+    if ($IsolatedStressCpuRequest -ne '600m' -or $IsolatedStressTargetUtilization -ne 55 -or $MaxSafetyCap.stress -ne 8) { $failures.Add('stress isolated density profile') }
     if ($P95PressureMs.user -ne 150 -or $P95PressureMs.product -ne 150 -or $P95PressureMs.stress -ne 600) { $failures.Add('SLO proactive pressure thresholds') }
     if ($StressNodePool -ne 'stress') { $failures.Add('stress packed affinity pool') }
-    if ([math]::Abs((600 * 0.55) - 330) -gt 1.0) { $failures.Add('stress control point 보존') }
+    if ([math]::Abs((350 * 0.90) - 315) -gt 1.0 -or [math]::Abs((600 * 0.55) - 330) -gt 1.0) { $failures.Add('stress placement control points') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -1085,7 +1106,7 @@ function Invoke-SelfTest {
     $script:Baseline = @{}
     $script:NodePoolBaseline = @{}
     if ($failures.Count -gt 0) { throw "SELF-TEST FAIL: $($failures -join ', ')" }
-    Write-Host 'SELF-TEST PASS: 31/31' -ForegroundColor Green
+    Write-Host 'SELF-TEST PASS: 32/32' -ForegroundColor Green
 }
 
 if ($SelfTest) {
