@@ -33,7 +33,7 @@ BASE 전에 Deployment replica/resources, HPA, behavior, topology, PDB, NodePool
 - `MIN_DOWN`
 - `REQUEST_CONTROL_POINT` (`requests.cpu` + absolute HPA trigger compensation)
 
-Placement, topology, PDB, NodePool은 변경하지 않습니다. 관련 장애는 `PDB_CONSTRAINT`, `SCHEDULER_PLACEMENT`, `NODE_CPU_CAPACITY`, `NODE_MEMORY_CAPACITY`, `CNI_UNRESOLVED`로 측정을 중단합니다.
+Placement, topology, PDB, NodePool은 변경하지 않습니다. 관련 장애는 `PDB_CONSTRAINT`, `SCHEDULER_PLACEMENT`, `NODEPOOL_LIMIT`, `NODE_CPU_CAPACITY`, `NODE_MEMORY_CAPACITY`, `CNI_UNRESOLVED`로 측정을 중단합니다. Terminal infrastructure/generator evidence가 확인되면 같은 부하를 반복하는 FINAL은 생략합니다.
 
 ## Recommendation order
 
@@ -99,7 +99,7 @@ JSON에는 aggregate/app/phase별 다음 evidence가 포함됩니다.
 
 ## 20-minute deadline
 
-Script parameter binding 직후 다음 absolute deadline을 한 번만 생성합니다.
+20분은 목표 실행시간이나 최소 실행시간이 아니라 **hard maximum**입니다. 안전한 candidate가 없거나 terminal infrastructure/generator evidence가 있으면 더 일찍 종료합니다. Script parameter binding 직후 다음 absolute deadline을 한 번만 생성합니다.
 
 ```powershell
 $script:StartTime = [datetime]::UtcNow

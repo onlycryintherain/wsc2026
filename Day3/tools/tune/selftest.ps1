@@ -57,7 +57,7 @@ function New-TestSample {
     return [pscustomobject]@{
         MetricsAvailable=$true;Apps=$apps;Pending=@()
         Node=[pscustomobject]@{ReadyCount=2;AverageAllocatableCpuM=1000;AverageAllocatableMemoryMi=1000;AllocatableCpuM=2000;AllocatableMemoryMi=2000;RequestedCpuM=800;RequestedMemoryMi=800;AppRequestedCpuM=400;AppRequestedMemoryMi=400}
-        Scheduling=[pscustomobject]@{InsufficientCpu=$false;InsufficientMemory=$false;FailedScheduling=$false;CniError=$false;PdbConstraint=$false;Reasons=''}
+        Scheduling=[pscustomobject]@{InsufficientCpu=$false;InsufficientMemory=$false;FailedScheduling=$false;CniError=$false;PdbConstraint=$false;NodePoolLimit=$false;Reasons=''}
     }
 }
 
@@ -210,6 +210,18 @@ Assert-Test '18 FINAL is measured BEST' {
     if(-not $source.Contains("Set-ConfigExact `$bestConfig 'BEST_APPLY'")){throw 'BEST apply missing'}
     if(-not $source.Contains("Invoke-Measurement `$bestConfig 'FINAL_FRESH'")){throw 'fresh measured final missing'}
     if($source-match 'FinalResourceOverride|hidden overlay'){throw 'hidden final overlay found'}
+}
+
+Assert-Test '18b explicit NodePool limit stops and skips FINAL' {
+    $config=New-TestConfig
+    $sample=New-TestSample
+    $sample.Pending=@([pscustomobject]@{App='stress';Reason='Unschedulable'})
+    $sample.Scheduling.NodePoolLimit=$true
+    $sample.Scheduling.Reasons='all available instance types exceed limits for nodepool "stress"'
+    $eval=New-TestEvaluation $config stress 0 0 0 @($sample,$sample,$sample)
+    $stop=Get-InfrastructureStop $eval
+    if($stop.Type-ne'NODEPOOL_LIMIT'){throw ($stop|ConvertTo-Json -Compress)}
+    if(-not$source.Contains('if ($skipFinalReason)')-or-not$source.Contains('FINAL_SKIPPED: $skipFinalReason')){throw 'terminal invalid measurement can still run FINAL'}
 }
 
 Assert-Test '19 production contains no PDB mutation' {

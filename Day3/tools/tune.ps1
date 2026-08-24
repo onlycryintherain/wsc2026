@@ -382,6 +382,7 @@ function Get-Sample([datetime]$ProfileStartedAt, [hashtable]$InitialRestarts) {
             FailedScheduling=([bool]($allReasons -match 'FailedScheduling|Unschedulable'))
             CniError=([bool]($allReasons -match 'FailedCreatePodSandBox|failed to assign an IP'))
             PdbConstraint=([bool]($allReasons -match 'disruption budget'))
+            NodePoolLimit=([bool]($allReasons -match 'exceed limits for nodepool|nodepool.+limit'))
             Reasons=$allReasons
         }
     }
@@ -592,6 +593,7 @@ function Get-InfrastructureStop($Evaluation) {
     $latest = $samples[-1]
     if ($latest.Scheduling.CniError -and @($latest.Pending).Count) { return [pscustomobject]@{Type='CNI_UNRESOLVED';Reason=$latest.Scheduling.Reasons} }
     if ($latest.Scheduling.PdbConstraint) { return [pscustomobject]@{Type='PDB_CONSTRAINT';Reason=$latest.Scheduling.Reasons} }
+    if ($latest.Scheduling.NodePoolLimit -and @($latest.Pending).Count) { return [pscustomobject]@{Type='NODEPOOL_LIMIT';Reason=$latest.Scheduling.Reasons} }
     $threshold = [math]::Max(2, [math]::Ceiling($samples.Count*0.30))
     $cpuPending = @($samples | Where-Object { $_.Scheduling.InsufficientCpu }).Count
     $memoryPending = @($samples | Where-Object { $_.Scheduling.InsufficientMemory }).Count
@@ -885,6 +887,7 @@ function Invoke-TuningLifecycle($BaseConfig) {
     $history = [System.Collections.Generic.List[object]]::new()
     $rejected = [System.Collections.Generic.HashSet[string]]::new()
     $stopReason = 'NO_SAFE_MEASURED_DELTA'
+    $skipFinalReason = $null
 
     if ($NoApply) {
         $lifecycle = [pscustomobject]@{StartedAt=$script:StartTime;HardDeadline=$script:HardDeadline;StopReason='NO_APPLY_BASE_ONLY';Best=$best;BestConfig=$bestConfig;Final=$null;History=@($history)}
@@ -895,7 +898,12 @@ function Invoke-TuningLifecycle($BaseConfig) {
     for ($iteration=1; $iteration -le $MaxProfileCandidates; $iteration++) {
         $recommendation = Get-Recommendation $best $rejected
         if ($null -eq $recommendation) { $stopReason='NO_SAFE_MEASURED_DELTA'; break }
-        if ($recommendation.Axis -eq 'INFRA_STOP') { $stopReason=$recommendation.Reason; break }
+        if ($recommendation.Axis -eq 'INFRA_STOP') {
+            $stopReason=$recommendation.Reason
+            $skipFinalReason='INFRASTRUCTURE_INVALID'
+            Write-Warning "SEARCH_STOP: $stopReason"
+            break
+        }
         if (-not (Test-CanStartCandidate)) { $stopReason='NO_TIME_FOR_SAFE_CANDIDATE'; break }
         $candidate = New-CandidateFromBest $best $recommendation "CANDIDATE_$iteration"
         if ([string]$candidate.ParentFingerprint -ne [string]$best.ConfigFingerprint) { throw 'CANDIDATE_NOT_FROM_BEST' }
@@ -927,35 +935,42 @@ function Invoke-TuningLifecycle($BaseConfig) {
             }
             if ($candidateError -like 'GENERATOR_LIMIT:*') {
                 $stopReason=$candidateError
+                $skipFinalReason='GENERATOR_LIMIT_MEASUREMENT_INVALID'
                 $stopAfterRollback=$true
             } else { throw }
         }
         if ($stopAfterRollback) { break }
     }
 
-    Set-ConfigExact $bestConfig 'BEST_APPLY'
     $final = $null; $rolledBack = $false
-    if (Test-CanStartFinal) {
-        try { $final = Invoke-Measurement $bestConfig 'FINAL_FRESH' }
-        catch {
-            if ($_.Exception.Message -like 'GENERATOR_LIMIT:*') { $stopReason="FINAL_$($_.Exception.Message)" }
-            else { throw }
-        }
-        if ($final -and (Test-FinalRegression $final $best) -and (Get-ConfigFingerprint $bestConfig) -ne (Get-ConfigFingerprint $confirmedConfig)) {
-            Set-ConfigExact $confirmedConfig 'ROLLBACK'
-            $best = $confirmed
-            $bestConfig = Copy-Config $confirmedConfig 'FINAL_ROLLED_BACK_BEST'
-            $rolledBack = $true
-            $stopReason = 'FINAL_REGRESSION_ROLLBACK'
-        }
+    if ($skipFinalReason) {
+        Assert-LiveConfig $bestConfig 'BEST_DRIFT_AT_EARLY_STOP' | Out-Null
+        Write-Warning "FINAL_SKIPPED: $skipFinalReason"
     } else {
-        $stopReason = if ($stopReason -eq 'NO_SAFE_MEASURED_DELTA') { 'NO_TIME_FOR_FINAL_FRESH' } else { $stopReason }
+        Set-ConfigExact $bestConfig 'BEST_APPLY'
+        if (Test-CanStartFinal) {
+            try { $final = Invoke-Measurement $bestConfig 'FINAL_FRESH' }
+            catch {
+                if ($_.Exception.Message -like 'GENERATOR_LIMIT:*') { $stopReason="FINAL_$($_.Exception.Message)" }
+                else { throw }
+            }
+            if ($final -and (Test-FinalRegression $final $best) -and (Get-ConfigFingerprint $bestConfig) -ne (Get-ConfigFingerprint $confirmedConfig)) {
+                Set-ConfigExact $confirmedConfig 'ROLLBACK'
+                $best = $confirmed
+                $bestConfig = Copy-Config $confirmedConfig 'FINAL_ROLLED_BACK_BEST'
+                $rolledBack = $true
+                $stopReason = 'FINAL_REGRESSION_ROLLBACK'
+            }
+        } else {
+            $stopReason = if ($stopReason -eq 'NO_SAFE_MEASURED_DELTA') { 'NO_TIME_FOR_FINAL_FRESH' } else { $stopReason }
+        }
     }
     $lifecycle = [pscustomobject]@{
         StartedAt=$script:StartTime
         HardDeadline=$script:HardDeadline
         FinishedAt=[datetime]::UtcNow
         StopReason=$stopReason
+        FinalSkippedReason=$skipFinalReason
         RolledBack=$rolledBack
         Best=$best
         BestConfig=$bestConfig
@@ -989,6 +1004,7 @@ try {
         $script:Endpoint = if ($Endpoint -match '^https?://') { $Endpoint.TrimEnd('/') } else { "https://$($Endpoint.TrimEnd('/'))" }
     }
     Write-Host "HARD_DEADLINE=$($script:HardDeadline.ToString('o'))" -ForegroundColor Cyan
+    Write-Host "MAX_RUNTIME=20m (hard ceiling; terminal evidence exits earlier)" -ForegroundColor DarkCyan
     Write-Host "ENDPOINT=$script:Endpoint" -ForegroundColor Cyan
     Write-Host "`n========== MEASURED TUNER ==========" -ForegroundColor Green
 
