@@ -297,10 +297,10 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
-  # 성능 우선 ceiling: Managed 1대 + default 최대 4대. limit은 노드를 선생성하지 않는다.
+  # 성능 우선 ceiling: Managed 1대 + default 최대 6대. limit은 노드를 선생성하지 않는다.
   # 시작은 Managed 1대 공유를 유지하고 실제 HPA 수요가 있을 때만 Karpenter가 확장한다.
   limits:
-    cpu: "8"
+    cpu: "12"
     memory: 1000Gi
   disruption:
     consolidationPolicy: WhenEmptyOrUnderutilized
@@ -620,7 +620,7 @@ spec:
     kind: Deployment
     name: user
   minReplicas: 2
-  maxReplicas: 40
+  maxReplicas: 80
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0
@@ -661,7 +661,7 @@ spec:
     kind: Deployment
     name: product
   minReplicas: 2
-  maxReplicas: 40
+  maxReplicas: 60
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0
