@@ -401,6 +401,8 @@ function Reset-IdleStateForLoad {
     Write-Host '[준비] 이전 run replica/CPU backlog를 scoring load floor로 정리' -ForegroundColor Cyan
     $fastConsolidation = @{ spec = @{ disruption = @{ consolidateAfter = '0s'; budgets = @(@{ nodes = '100%' }) } } } | ConvertTo-Json -Compress -Depth 8
     $normalConsolidation = @{ spec = @{ disruption = @{ consolidateAfter = '1m'; budgets = @(@{ nodes = '10%' }) } } } | ConvertTo-Json -Compress -Depth 8
+    $fastRestartStrategy = @{ spec = @{ strategy = @{ type = 'RollingUpdate'; rollingUpdate = @{ maxSurge = 0; maxUnavailable = '100%' } } } } | ConvertTo-Json -Compress -Depth 8
+    $normalRestartStrategy = @{ spec = @{ strategy = @{ type = 'RollingUpdate'; rollingUpdate = @{ maxSurge = 1; maxUnavailable = 0 } } } } | ConvertTo-Json -Compress -Depth 8
     try {
         Invoke-Kubectl @('patch', 'nodepool', $StressNodePool, '--type=merge', '-p', $fastConsolidation) | Out-Null
         foreach ($app in $MutationOrder) {
@@ -412,6 +414,7 @@ function Reset-IdleStateForLoad {
         # 중지된 이전 stress 요청은 클라이언트가 사라져도 바이너리 내부 CPU 작업으로 남을 수 있다.
         # workflow가 no-load를 확인한 PrepareForLoad 경로에서만 Pod를 교체해 backlog를 제거한다.
         Write-Host '[준비] stress Pod 교체로 이전 run CPU backlog 제거' -ForegroundColor Cyan
+        Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=merge', '-p', $fastRestartStrategy) | Out-Null
         Invoke-Kubectl @('-n', $Namespace, 'rollout', 'restart', 'deployment/stress') | Out-Null
 
         $deadline = [datetime]::UtcNow.AddSeconds(180)
@@ -456,6 +459,7 @@ function Reset-IdleStateForLoad {
         }
         Write-Host '[준비] scoring floor/3-node Ready, HPA max/scale-down 복구 완료' -ForegroundColor Green
     } finally {
+        Invoke-Kubectl @('-n', $Namespace, 'patch', 'deployment', 'stress', '--type=merge', '-p', $normalRestartStrategy) -AllowFailure | Out-Null
         Invoke-Kubectl @('patch', 'nodepool', $StressNodePool, '--type=merge', '-p', $normalConsolidation) -AllowFailure | Out-Null
     }
 }
