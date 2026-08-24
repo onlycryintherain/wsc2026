@@ -297,14 +297,14 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
-  # Managed 1대 + default 1대 + stress 4대 = 최대 6대.
-  # Min replica는 건드리지 않고 저부하 빈 노드를 빠르게 회수한다.
+  # 성능 우선 ceiling: Managed 1대 + default 최대 4대. limit은 노드를 선생성하지 않는다.
+  # 시작은 Managed 1대 공유를 유지하고 실제 HPA 수요가 있을 때만 Karpenter가 확장한다.
   limits:
-    cpu: "2"
+    cpu: "8"
     memory: 1000Gi
   disruption:
     consolidationPolicy: WhenEmptyOrUnderutilized
-    consolidateAfter: 1m
+    consolidateAfter: 10m
 NODEPOOL
 # 38점 기준: stress는 별도 NodePool + taint로 격리한다.
 # default NodePool은 user/product만 수용하고 stress NodePool만 workload-class=stress를 제공한다.
@@ -341,14 +341,13 @@ spec:
         kind: EC2NodeClass
         name: default
       expireAfter: 720h
-  # 대규모 트래픽에서 성능을 우선하되 총 worker ceiling 6을 넘지 않는 전용 4대분.
-  # 저부하에서는 1분 후 회수되어 managed 1 + stress 1 topology floor로 복귀한다.
+  # 대규모 트래픽에서 stress 전용 최대 4대분을 허용하고 spike 사이에는 10분 유지한다.
   limits:
     cpu: "8"
     memory: 1000Gi
   disruption:
     consolidationPolicy: WhenEmptyOrUnderutilized
-    consolidateAfter: 1m
+    consolidateAfter: 10m
 STRESS_NODEPOOL
 
 # NodePool에 taint가 있으면(스트레스 격리) aws-node/kube-proxy가 그 노드에
@@ -630,7 +629,7 @@ spec:
     kind: Deployment
     name: user
   minReplicas: 2
-  maxReplicas: 20
+  maxReplicas: 40
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0
@@ -671,7 +670,7 @@ spec:
     kind: Deployment
     name: product
   minReplicas: 2
-  maxReplicas: 20
+  maxReplicas: 40
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0

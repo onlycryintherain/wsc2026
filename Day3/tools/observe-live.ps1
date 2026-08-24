@@ -21,9 +21,9 @@ param(
     [string]$Namespace = 'app',
     [string]$Region = 'ap-northeast-2',
     [ValidateRange(5, 60)][int]$IntervalSeconds = 10,
-    [ValidateRange(30, 300)][int]$DecisionWindowSeconds = 60,
-    [ValidateRange(60, 600)][int]$ScaleDownStabilizationSeconds = 300,
-    [ValidateRange(120, 1800)][int]$IdleRestoreSeconds = 300,
+    [ValidateRange(30, 300)][int]$DecisionWindowSeconds = 30,
+    [ValidateRange(60, 600)][int]$ScaleDownStabilizationSeconds = 600,
+    [ValidateRange(120, 1800)][int]$IdleRestoreSeconds = 600,
     [switch]$ObserveOnly,
     [switch]$Once,
     [switch]$SelfTest
@@ -33,13 +33,13 @@ $ErrorActionPreference = 'Stop'
 $ExpectedAccountId = '586639730662'
 $ManagedApps = @('user', 'product', 'stress')
 $MutationOrder = @('stress', 'user', 'product')
-$WarmFloor = @{ user = 2; product = 2; stress = 2 }
+$WarmFloor = @{ user = 4; product = 4; stress = 4 }
 $MaxSafetyCap = @{ user = 40; product = 40; stress = 12 }
-$MaxIncreaseRatio = 1.25
+$MaxIncreaseRatio = 2.0
 $NodePoolApps = @{ default = @('user', 'product'); stress = @('stress') }
 $NodePoolSafetyCapNodes = @{ default = 4; stress = 4 }
 $FallbackNodeCpu = 2
-$ActiveConsolidateAfter = '5m'
+$ActiveConsolidateAfter = '10m'
 $ActivityCpuM = @{ user = 15.0; product = 15.0; stress = 250.0 }
 $HotCpuM = @{ user = 50.0; product = 50.0; stress = 500.0 }
 $script:History = @()
@@ -435,7 +435,7 @@ function Get-NodePoolRecommendation([string]$Pool) {
     } elseif ($pressureSamples.Count -ge $minimumPressureSamples) {
         $cpuPerNode = [int][math]::Max(1, $latest.CpuPerNode)
         $safetyCapCpu = [int]$NodePoolSafetyCapNodes[$Pool] * $cpuPerNode
-        $targetLimit = [int][math]::Min($safetyCapCpu, $latest.LimitCpu + $cpuPerNode)
+        $targetLimit = $safetyCapCpu
         $targetConsolidate = $ActiveConsolidateAfter
         $reason = if ($targetLimit -gt $latest.LimitCpu) { 'NODEPOOL_PRESSURE' } else { 'NODEPOOL_AT_CAP' }
     } elseif ($idle) {
@@ -588,7 +588,7 @@ function Invoke-SelfTest {
     if ([math]::Abs((Convert-CpuToMillicores '1970000000n') - 1970.0) -gt 0.001) { $failures.Add('nanocore 변환') }
     if ([math]::Abs((Convert-CpuToMillicores '250m') - 250.0) -gt 0.001) { $failures.Add('millicore 변환') }
     if ((Get-Percentile ([double[]]@(1, 2, 3, 4, 100)) 95) -ne 100) { $failures.Add('P95 계산') }
-    if ($WarmFloor.stress -gt 2 -or $WarmFloor.user -gt 2 -or $WarmFloor.product -gt 2) { $failures.Add('warm cap 안전선') }
+    if ($WarmFloor.stress -gt 4 -or $WarmFloor.user -gt 4 -or $WarmFloor.product -gt 4) { $failures.Add('warm cap 안전선') }
     $script:Baseline['stress'] = [pscustomobject]@{ Min = 1; ScaleDownSeconds = 0; Max = 12 }
     $pressure = [pscustomobject]@{
         Ready = 2; Pending = 0; Current = 2; Desired = 6; Min = 1; Max = 12
@@ -602,8 +602,8 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ stress = $pressure } }
     )
     $recommendation = Get-Recommendation 'stress'
-    if ($recommendation.TargetMin -ne 2) { $failures.Add('stress warm min 추천') }
-    if ($recommendation.TargetScaleDown -ne 300) { $failures.Add('scale-down 안정화 추천') }
+    if ($recommendation.TargetMin -ne 4) { $failures.Add('stress warm min 추천') }
+    if ($recommendation.TargetScaleDown -ne 600) { $failures.Add('scale-down 안정화 추천') }
     $script:Baseline['user'] = [pscustomobject]@{ Min = 2; ScaleDownSeconds = 0; Max = 20 }
     $ceiling = [pscustomobject]@{
         Ready = 20; Pending = 0; Current = 20; Desired = 20; Min = 2; Max = 20
@@ -616,7 +616,7 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $ceiling } }
     )
     $maxRecommendation = Get-Recommendation 'user'
-    if ($maxRecommendation.Reason -ne 'HPA_MAX_PRESSURE' -or $maxRecommendation.TargetMax -ne 25) { $failures.Add('HPA max bounded +25% 추천') }
+    if ($maxRecommendation.Reason -ne 'HPA_MAX_PRESSURE' -or $maxRecommendation.TargetMax -ne 40) { $failures.Add('HPA max performance expansion') }
     $ceiling.Pending = 1
     $blockedRecommendation = Get-Recommendation 'user'
     if ($blockedRecommendation.TargetMax -ne 20) { $failures.Add('Pending 중 HPA max 확장 차단') }
@@ -629,13 +629,13 @@ function Invoke-SelfTest {
         [pscustomobject]@{ TimestampUtc = $now.ToString('o'); Apps = @{ user = $ceiling; product = $ceiling }; NodePools = @{ default = $poolAtLimit }; NotReadyNodes = 0 }
     )
     $poolRecommendation = Get-NodePoolRecommendation 'default'
-    if ($poolRecommendation.TargetLimitCpu -ne 4 -or $poolRecommendation.TargetConsolidateAfter -ne '5m') { $failures.Add('NodePool 한 노드 bounded 확장') }
+    if ($poolRecommendation.TargetLimitCpu -ne 8 -or $poolRecommendation.TargetConsolidateAfter -ne '10m') { $failures.Add('NodePool performance ceiling 확장') }
     $script:History[0].NotReadyNodes = 1
     $script:History[1].NotReadyNodes = 1
     if ((Get-NodePoolRecommendation 'default').TargetLimitCpu -ne 2) { $failures.Add('NotReady 중 NodePool 중복 확장 차단') }
     $idleMetric = $ceiling.PSObject.Copy()
     $idleMetric.Pending = 0; $idleMetric.Requests = 0; $idleMetric.CpuTotalM = 0; $idleMetric.Current = 2; $idleMetric.Desired = 2; $idleMetric.Min = 2
-    $expandedPool = [pscustomobject]@{ LimitCpu = 8; UsedCpu = 2; Nodes = 1; CpuPerNode = 2; ConsolidateAfter = '5m' }
+    $expandedPool = [pscustomobject]@{ LimitCpu = 8; UsedCpu = 2; Nodes = 1; CpuPerNode = 2; ConsolidateAfter = '10m' }
     $script:History = @(
         [pscustomobject]@{ TimestampUtc = $now.AddSeconds(-($IdleRestoreSeconds - $IntervalSeconds)).ToString('o'); Apps = @{ user = $idleMetric; product = $idleMetric }; NodePools = @{ default = $expandedPool }; NotReadyNodes = 0 },
         [pscustomobject]@{ TimestampUtc = $now.AddSeconds(-5).ToString('o'); Apps = @{ user = $idleMetric; product = $idleMetric }; NodePools = @{ default = $expandedPool }; NotReadyNodes = 0 },
