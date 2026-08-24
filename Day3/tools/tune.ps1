@@ -580,6 +580,19 @@ function Get-AllSamples($Evaluation) {
     return @($Evaluation.Runs | ForEach-Object { @($_.Samples) })
 }
 
+function Get-PendingSummary($Sample) {
+    $pending=@($Sample.Pending)
+    $byApp=@($pending | Group-Object App | ForEach-Object { "$($_.Name)=$($_.Count)" })
+    return "pending=$($pending.Count)$(if($byApp.Count){' ('+($byApp -join ',')+')'}else{''}) readyNodes=$($Sample.Node.ReadyCount)"
+}
+
+function Get-NodePoolLimitSummary($Sample) {
+    $names=[System.Collections.Generic.HashSet[string]]::new()
+    foreach($match in [regex]::Matches([string]$Sample.Scheduling.Reasons,'nodepool\s+"([^"]+)"')) { [void]$names.Add($match.Groups[1].Value) }
+    $pools=if($names.Count){(@($names) | Sort-Object)-join','}else{'unknown'}
+    return "$(Get-PendingSummary $Sample) nodepools=$pools hard CPU/resource limit reached"
+}
+
 function Get-InfrastructureStop($Evaluation) {
     $samples = @(Get-AllSamples $Evaluation)
     if (-not $Evaluation.Valid -or -not $samples.Count) { return [pscustomobject]@{Type='MEASUREMENT_INVALID';Reason='measurement or samples missing'} }
@@ -591,16 +604,16 @@ function Get-InfrastructureStop($Evaluation) {
     })
     if ($usableMetrics.Count -lt [math]::Ceiling($samples.Count/2.0)) { return [pscustomobject]@{Type='METRICS_UNAVAILABLE';Reason="usable=$($usableMetrics.Count)/$($samples.Count)"} }
     $latest = $samples[-1]
-    if ($latest.Scheduling.CniError -and @($latest.Pending).Count) { return [pscustomobject]@{Type='CNI_UNRESOLVED';Reason=$latest.Scheduling.Reasons} }
-    if ($latest.Scheduling.PdbConstraint) { return [pscustomobject]@{Type='PDB_CONSTRAINT';Reason=$latest.Scheduling.Reasons} }
-    if ($latest.Scheduling.NodePoolLimit -and @($latest.Pending).Count) { return [pscustomobject]@{Type='NODEPOOL_LIMIT';Reason=$latest.Scheduling.Reasons} }
+    if ($latest.Scheduling.CniError -and @($latest.Pending).Count) { return [pscustomobject]@{Type='CNI_UNRESOLVED';Reason="$(Get-PendingSummary $latest) unresolved CNI allocation failure"} }
+    if ($latest.Scheduling.PdbConstraint) { return [pscustomobject]@{Type='PDB_CONSTRAINT';Reason="$(Get-PendingSummary $latest) disruption budget constraint"} }
+    if ($latest.Scheduling.NodePoolLimit -and @($latest.Pending).Count) { return [pscustomobject]@{Type='NODEPOOL_LIMIT';Reason=(Get-NodePoolLimitSummary $latest)} }
     $threshold = [math]::Max(2, [math]::Ceiling($samples.Count*0.30))
     $cpuPending = @($samples | Where-Object { $_.Scheduling.InsufficientCpu }).Count
     $memoryPending = @($samples | Where-Object { $_.Scheduling.InsufficientMemory }).Count
     $placementPending = @($samples | Where-Object { $_.Scheduling.FailedScheduling }).Count
-    if ($cpuPending -ge $threshold) { return [pscustomobject]@{Type='NODE_CPU_CAPACITY';Reason="samples=$cpuPending/$($samples.Count)"} }
-    if ($memoryPending -ge $threshold) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Reason="samples=$memoryPending/$($samples.Count)"} }
-    if ($placementPending -ge $threshold) { return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Reason="samples=$placementPending/$($samples.Count)"} }
+    if ($cpuPending -ge $threshold) { return [pscustomobject]@{Type='NODE_CPU_CAPACITY';Reason="samples=$cpuPending/$($samples.Count) $(Get-PendingSummary $latest)"} }
+    if ($memoryPending -ge $threshold) { return [pscustomobject]@{Type='NODE_MEMORY_CAPACITY';Reason="samples=$memoryPending/$($samples.Count) $(Get-PendingSummary $latest)"} }
+    if ($placementPending -ge $threshold) { return [pscustomobject]@{Type='SCHEDULER_PLACEMENT';Reason="samples=$placementPending/$($samples.Count) $(Get-PendingSummary $latest)"} }
     return $null
 }
 
@@ -1012,7 +1025,8 @@ try {
     $originalConfig = Get-LiveConfig 'IMMUTABLE_BASE'
     Show-Config $originalConfig 'Live BASE snapshot'
     $result = Invoke-TuningLifecycle $originalConfig
-    Show-Config $result.BestConfig 'Final measured BEST'
+    $bestLabel=if($result.Final){'Final measured BEST'}else{'Measured BEST (FINAL skipped)'}
+    Show-Config $result.BestConfig $bestLabel
     Write-Host "STOP_REASON=$($result.StopReason)" -ForegroundColor Cyan
     Write-Host "RESULT_DIR=$OutputDir" -ForegroundColor Cyan
     $runFailed = $false

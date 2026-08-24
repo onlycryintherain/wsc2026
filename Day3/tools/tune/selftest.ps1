@@ -221,6 +221,7 @@ Assert-Test '18b explicit NodePool limit stops and skips FINAL' {
     $eval=New-TestEvaluation $config stress 0 0 0 @($sample,$sample,$sample)
     $stop=Get-InfrastructureStop $eval
     if($stop.Type-ne'NODEPOOL_LIMIT'){throw ($stop|ConvertTo-Json -Compress)}
+    if($stop.Reason-ne'pending=1 (stress=1) readyNodes=2 nodepools=stress hard CPU/resource limit reached'){throw "unbounded reason: $($stop.Reason)"}
     if(-not$source.Contains('if ($skipFinalReason)')-or-not$source.Contains('FINAL_SKIPPED: $skipFinalReason')){throw 'terminal invalid measurement can still run FINAL'}
 }
 
